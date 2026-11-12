@@ -1814,6 +1814,16 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             await _sopModule.EnsureHandPoseServiceReadyAsync();
             Console.WriteLine($"[MainViewModel] 手部服务已就绪, 模式: {_sopModule.DetectionMode}");
 
+            // 3.5 模型缺失时明确提示（否则表现是"检测不到任何目标"，很难自查）
+            if (!_sopModule.IsModelLoaded)
+            {
+                MessageBox.Show(
+                    "SOP 物体检测模型未加载：找不到 ONNX 模型文件。\n\n" +
+                    "请把模型放到 models/ 或 yolo_models/（文件名需与配方 model.path 一致），\n" +
+                    "启动时也会在 logs/startup.log 记录实际查找的目录。",
+                    "SOP 模型缺失", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
+
             // 4. 加载工作流（优先从YAML，否则使用空工作流）
             Status = "正在启动检测...";
             DebugLog($"[StartSOP] 正在加载工作流...");

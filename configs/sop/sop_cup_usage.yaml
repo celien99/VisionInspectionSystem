@@ -1,12 +1,8 @@
 # 水杯使用场景 SOP 配置
 # 场景：拿起水杯 -> 用杯子喝水 -> 放回原位
 #
-# ⚠️ 生效路径说明（重要）：
-#   本文件源码位于 src/UI/VisionInspection.UI/configs/sop/ ，由 csproj 的
-#   CopyToOutputDirectory=PreserveNewest 复制到 bin/Debug/net8.0-windows/configs/sop/ ，
-#   程序运行时读的是【输出目录】里的副本。
-#   根目录 configs/sop/ 下的同名副本仅供在编辑器里查看，程序【不读】它，
-#   改根目录那份不会生效（这是之前踩过的坑）。
+# 生效路径：仓库根 configs/sop/ 是唯一来源（运行时由 AppPaths 解析；
+#   publish 时整目录随 exe 输出）。不要再维护 src/UI/VisionInspection.UI/configs/ 副本。
 #
 # ⚠️ 标定提醒（务必用「🎯 标定区域」工具按真机画面设置，否则步骤不会推进）：
 #   - cup_table        ：拿起水杯的位置（手从此区离开即视为拿起）

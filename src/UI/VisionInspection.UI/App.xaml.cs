@@ -21,6 +21,15 @@ public partial class App : Application
 
         try
         {
+            // 环境自检：把实际使用的配置/配方/模型目录写进 logs/startup.log。
+            // 排查"界面读不到配方""检测不到目标"时，先看这一行。
+            try
+            {
+                File.AppendAllText(AppPaths.Log("startup.log"),
+                    $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {AppPaths.Describe()}{Environment.NewLine}");
+            }
+            catch { /* 自检失败不影响启动 */ }
+
             // 初始化用户管理器
             var dbPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "data", "users.db");
             var dbDir = Path.GetDirectoryName(dbPath)!;

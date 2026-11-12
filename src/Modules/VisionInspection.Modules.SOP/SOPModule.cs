@@ -79,6 +79,9 @@ public class SOPModule : IDetectionModule
 
     public string Name => "SOPModule";
     public ModuleState State { get; private set; } = ModuleState.Uninitialized;
+
+    /// <summary>物体检测模型是否已成功加载（false = 找不到/加载失败，检测将永远返回 0 个目标）。</summary>
+    public bool IsModelLoaded => _yolo != null;
     public SOPStateMachine? StateMachine => _stateMachine;
     public SOPWorkflow? CurrentWorkflow => _currentWorkflow;
 

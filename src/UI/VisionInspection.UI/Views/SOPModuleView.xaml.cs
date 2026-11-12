@@ -266,16 +266,17 @@ namespace VisionInspection.UI.Views
         }
 
         /// <summary>
-        /// 初始化示例步骤（回退方案）
+        /// 配方不可用时的占位提示。
+        /// 原先这里塞的是"检测车辆 / 车牌识别 / 安全验证 / 触发PLC"四条示例步骤，
+        /// 配方加载失败时会显示它们，看起来像系统在做车牌检测，纯误导，已删除。
         /// </summary>
-        private void InitializeSampleSteps()
+        private void ShowNoRecipeHint(string reason)
         {
-            AddStep("1", "检测车辆", "使用YOLO模型检测画面中是否存在车辆", "🔍", "detect_vehicle");
-            AddStep("2", "车牌识别", "检测到车辆后，识别车牌号码", "📄", "recognize_plate");
-            AddStep("3", "安全验证", "验证车牌是否在白名单中", "✓", "safety_verify");
-            AddStep("4", "触发PLC", "验证通过，触发PLC开门", "🔌", "trigger_plc");
-
+            _currentYamlPath = "";
+            _steps.Clear();
+            AddStep("!", "未加载任何 SOP 配方", reason, "⚠️", "no_recipe");
             UpdateStepDisplay();
+            AddLog(reason);
         }
 
         /// <summary>
@@ -292,16 +293,17 @@ namespace VisionInspection.UI.Views
                     LoadStepsFromYaml(yamlPath);
                     _currentYamlPath = yamlPath;
                     SaveLastRecipePath(yamlPath);
-                    AddLog($"已加载工作流: {System.IO.Path.GetFileName(yamlPath)}");
+                    AddLog($"已加载配方: {System.IO.Path.GetFileName(yamlPath)}");
                     return;
                 }
                 catch (Exception ex)
                 {
-                    AddLog($"YAML加载失败: {ex.Message}，使用默认示例步骤");
+                    ShowNoRecipeHint($"配方解析失败：{ex.Message}（文件: {yamlPath}）");
+                    return;
                 }
             }
 
-            InitializeSampleSteps();
+            ShowNoRecipeHint($"未找到任何配方。已查找目录：{RecipeFile.SopDir}");
         }
 
         /// <summary>

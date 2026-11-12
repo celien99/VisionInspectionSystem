@@ -86,7 +86,28 @@ CPU 构建下界面的「GPU/CPU」开关不会生效（日志会说明），检
 
 - `configs/sop_config.json`：SOP 模块配置（模型路径、阈值、手部后端、GPU）。
 - `configs/sop/*.yaml`：SOP 配方；界面「SOP → 产品配方」下拉框选择，选择结果记在 `configs/last_recipe.json`。
-- 模型文件放置于 `models/`（体积较大，默认不纳入版本库，详见 `.gitignore`）。
+- 模型文件不纳入版本库（详见 `.gitignore`），需自行放置：
+
+| 用途 | 位置 | 说明 |
+|---|---|---|
+| 物体检测 | `yolo_models/*.onnx` | 配方 `model.path` 指向它（如 `yolo_models/yolov8s.onnx`） |
+| MediaPipe 手掌 | `models/palm_detection_full_Nx3x192x192_post.onnx` | 手部检测第一阶段 |
+| MediaPipe 关键点 | `models/hand_landmark_sparse_Nx3x224x224.onnx` | 第二阶段 21 点 |
+| YOLO-pose（可选） | `models/yolov8s-pose.onnx` | `HandDetectionBackend=YoloPose` 时用 |
+
+> 配方写 `yolo_models/x.onnx` 而文件放在 `models/x.onnx` 也能找到（按文件名兜底）。
+
+### 排障第一步：看 `logs/startup.log`
+
+程序启动会写一行环境自检：
+
+```
+Root=... | configs=<实际使用的配置目录> | sop=<配方目录> | recipes=<找到几个> | models=[...] | VISION_HOME=-
+```
+
+- `recipes=0` → 界面「产品配方」会是空的（以前会回退显示"检测车辆/车牌识别"示例，已删除）
+- `models=[无 models/ 目录]` → 没有任何模型，检测必然 0 目标
+- `configs` 指向 `bin\...\configs`（旧构建残留）→ 删掉 `bin`、`obj` 重新构建，或设 `VISION_HOME` 指向仓库根
 
 ## 模型文件放置说明
 

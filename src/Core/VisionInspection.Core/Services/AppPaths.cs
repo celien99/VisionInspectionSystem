@@ -84,12 +84,22 @@ public static class AppPaths
         if (Path.IsPathRooted(path))
             return File.Exists(path) || Directory.Exists(path) ? path : null;
 
+        var fileName = Path.GetFileName(path);
+
         foreach (var root in SearchRoots())
         {
             foreach (var sub in ModelSubdirs)
             {
                 var candidate = Path.Combine(root, sub, path);
                 if (File.Exists(candidate) || Directory.Exists(candidate)) return candidate;
+
+                // 配方里常写 "yolo_models/x.onnx"，但模型实际放在 models/ —— 按文件名再兜一次
+                if (!string.IsNullOrEmpty(fileName) &&
+                    !string.Equals(fileName, path, StringComparison.Ordinal))
+                {
+                    var byName = Path.Combine(root, sub, fileName);
+                    if (File.Exists(byName)) return byName;
+                }
             }
 
             var plain = Path.Combine(root, path);
@@ -108,6 +118,40 @@ public static class AppPaths
             if (File.Exists(candidate)) return candidate;
         }
         return null;
+    }
+
+    /// <summary>
+    /// 一行式环境自检：实际使用的配置目录、配方数量、模型目录。
+    /// 启动时写进 logs/startup.log —— 排查"读不到配方/模型"时先看这一行。
+    /// </summary>
+    public static string Describe()
+    {
+        var configsDir = ResolveConfigDir();
+        var sopDir = Path.Combine(configsDir, "sop");
+
+        int recipes = 0;
+        try
+        {
+            if (Directory.Exists(sopDir))
+                recipes = Directory.GetFiles(sopDir, "*.y*ml").Length;
+        }
+        catch { /* 忽略 */ }
+
+        var modelDirs = new List<string>();
+        foreach (var sub in ModelSubdirs)
+        {
+            var dir = Path.Combine(Root, sub);
+            try
+            {
+                if (Directory.Exists(dir))
+                    modelDirs.Add($"{dir}(onnx={Directory.GetFiles(dir, "*.onnx").Length})");
+            }
+            catch { /* 忽略 */ }
+        }
+
+        return $"Root={Root} | configs={configsDir} | sop={sopDir} | recipes={recipes} | " +
+               $"models=[{(modelDirs.Count > 0 ? string.Join(", ", modelDirs) : "无 models/ 目录")}] | " +
+               $"VISION_HOME={(Environment.GetEnvironmentVariable("VISION_HOME") ?? "-")}";
     }
 
     /// <summary>查找外部可执行文件（如 ffmpeg）：程序目录 → 子目录 → PATH。</summary>
