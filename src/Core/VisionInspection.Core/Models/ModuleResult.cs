@@ -57,32 +57,3 @@ public class CaptureFrame
     public DateTime Timestamp { get; set; }
     public int FrameNumber { get; set; }
 }
-
-/// <summary>
-/// 可视化叠加层
-/// </summary>
-public class VisualOverlay
-{
-    public List<OverlayItem> Items { get; set; } = new();
-}
-
-/// <summary>
-/// 叠加项
-/// </summary>
-public class OverlayItem
-{
-    public OverlayType Type { get; set; }
-    public SKRect Bounds { get; set; }
-    public SKColor Color { get; set; }
-    public string Label { get; set; } = "";
-    public float Confidence { get; set; }
-}
-
-public enum OverlayType
-{
-    Rectangle,
-    Circle,
-    Polygon,
-    Text,
-    Line
-}

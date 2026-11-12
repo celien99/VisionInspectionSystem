@@ -307,78 +307,13 @@ namespace VisionInspection.UI.Views
         /// <summary>
         /// 查找默认YAML文件
         /// </summary>
-        private static string? FindDefaultYamlFile()
-        {
-            string[] searchDirs = { "configs/sop", "configs" };
+        private static string? FindDefaultYamlFile() => RecipeFile.ListAll().FirstOrDefault();
 
-            foreach (var dir in searchDirs)
-            {
-                if (!Directory.Exists(dir)) continue;
+        /// <summary>读取上次加载的配方（统一由 RecipeFile 记忆，存相对 configs/sop 的路径）。</summary>
+        private static string? GetLastRecipePath() => RecipeFile.LoadLast();
 
-                var yamlFiles = Directory.GetFiles(dir, "*.yaml");
-                if (yamlFiles.Length > 0)
-                    return yamlFiles[0];
-            }
-
-            return null;
-        }
-
-        /// <summary>
-        /// 上次加载配方的持久化文件路径（位于运行时基目录 configs/ 下，不随源码分发）。
-        /// </summary>
-        private static string LastRecipeConfigPath =>
-            System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "configs", "last_recipe.json");
-
-        /// <summary>
-        /// 读取上次加载的产品配方路径。以相对基目录的方式存储，兼容不同部署路径；
-        /// 文件不存在或指向的文件已删除时返回 null（回退到默认第一个配方）。
-        /// </summary>
-        private static string? GetLastRecipePath()
-        {
-            try
-            {
-                var p = LastRecipeConfigPath;
-                if (!System.IO.File.Exists(p)) return null;
-                var json = System.IO.File.ReadAllText(p);
-                var m = Regex.Match(json, "\"last_recipe\"\\s*:\\s*\"([^\"]+)\"");
-                if (!m.Success) return null;
-                var rel = m.Groups[1].Value;
-                var full = System.IO.Path.IsPathRooted(rel)
-                    ? rel
-                    : System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, rel);
-                return System.IO.File.Exists(full) ? full : null;
-            }
-            catch
-            {
-                return null;
-            }
-        }
-
-        /// <summary>
-        /// 持久化上次加载的产品配方路径（相对基目录），供下次启动默认加载。
-        /// 写入失败不影响主流程。
-        /// </summary>
-        private static void SaveLastRecipePath(string fullPath)
-        {
-            try
-            {
-                var baseDir = AppDomain.CurrentDomain.BaseDirectory;
-                string rel;
-                if (fullPath.StartsWith(baseDir, StringComparison.OrdinalIgnoreCase))
-                    rel = fullPath.Substring(baseDir.Length)
-                        .TrimStart(System.IO.Path.DirectorySeparatorChar, System.IO.Path.AltDirectorySeparatorChar);
-                else
-                    rel = fullPath;
-                var dir = System.IO.Path.GetDirectoryName(LastRecipeConfigPath)!;
-                System.IO.Directory.CreateDirectory(dir);
-                System.IO.File.WriteAllText(LastRecipeConfigPath,
-                    "{\"last_recipe\":\"" + rel.Replace("\\", "/") + "\"}");
-            }
-            catch
-            {
-                // 持久化失败不影响主流程
-            }
-        }
+        /// <summary>持久化上次加载的配方，供下次启动默认加载。</summary>
+        private static void SaveLastRecipePath(string fullPath) => RecipeFile.SaveLast(fullPath);
 
         /// <summary>
         /// 扫描 configs/sop 下的所有配方 YAML，填充产品配方下拉框。
@@ -388,15 +323,7 @@ namespace VisionInspection.UI.Views
         {
             RecipeComboBox.Items.Clear();
 
-            string[] searchDirs = { "configs/sop", "configs" };
-            var found = new List<string>();
-            foreach (var dir in searchDirs)
-            {
-                if (!Directory.Exists(dir)) continue;
-                found.AddRange(Directory.GetFiles(dir, "*.yaml"));
-                found.AddRange(Directory.GetFiles(dir, "*.yml"));
-            }
-            found = found.Distinct().OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToList();
+            var found = RecipeFile.ListAll();
 
             foreach (var f in found)
             {
@@ -631,9 +558,8 @@ namespace VisionInspection.UI.Views
 
             try
             {
-                var sopDir = System.IO.Path.Combine("configs", "sop");
-                if (!System.IO.Directory.Exists(sopDir))
-                    System.IO.Directory.CreateDirectory(sopDir);
+                var sopDir = RecipeFile.SopDir;
+                System.IO.Directory.CreateDirectory(sopDir);
 
                 var fileName = BuildRecipeFileName(sopDir, productName);
                 var fullPath = System.IO.Path.Combine(sopDir, fileName);

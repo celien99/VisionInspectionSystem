@@ -1,0 +1,22 @@
+<Project>
+
+  <!--
+    ============================================================================
+    YOLO 执行提供程序（EP）选择
+    ============================================================================
+    YoloDotNet v4 规定：一个工程**只能引用一个** EP 包 —— EP.Cpu 依赖
+    Microsoft.ML.OnnxRuntime（CPU 版），EP.Cuda 依赖 Microsoft.ML.OnnxRuntime.Gpu，
+    两者带同名的原生 onnxruntime.dll，同时引用会互相覆盖。
+
+      · 默认 CPU：任何 Windows 机器 clone 下来直接能跑（无需 CUDA）
+      · NVIDIA 机器：dotnet build -p:YoloEp=Cuda
+                     （需自行安装 CUDA Toolkit 12.x + cuDNN 9.x）
+
+    选择结果转成编译常量 YOLO_EP_CUDA，C# 侧只在 YoloExecutionProviders 里判断一次。
+  -->
+  <PropertyGroup>
+    <YoloEp Condition="'$(YoloEp)' == ''">Cpu</YoloEp>
+    <DefineConstants Condition="'$(YoloEp)' == 'Cuda'">$(DefineConstants);YOLO_EP_CUDA</DefineConstants>
+  </PropertyGroup>
+
+</Project>

@@ -1,3 +1,4 @@
+using VisionInspection.Core.Services;
 using System;
 using System.IO;
 using System.Text.Json;
@@ -21,7 +22,7 @@ namespace VisionInspection.UI.Services
 
         private SopCaptureConfigManager()
         {
-            _configPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "configs", "sop_capture.json");
+            _configPath = AppPaths.Config("sop_capture.json");
             Load();
         }
 

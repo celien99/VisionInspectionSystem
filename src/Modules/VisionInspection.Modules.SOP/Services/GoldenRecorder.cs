@@ -5,7 +5,7 @@ using System.Text.Json;
 using SkiaSharp;
 using VisionInspection.Core.Models;
 using VisionInspection.Modules.SOP.Models;
-using YoloDotNet.Models;
+using VisionInspection.Core.Services;
 
 namespace VisionInspection.Modules.SOP.Services;
 
@@ -157,7 +157,7 @@ public sealed class GoldenRecorder : IDisposable
     /// </summary>
     public void RecordFrame(
         CaptureFrame? frame,
-        IReadOnlyList<ObjectDetection> detections,
+        IReadOnlyList<DetectedObject> detections,
         HandPoseEstimationResult? handResult,
         SOPStateMachineSnapshot snapshot)
     {
@@ -230,18 +230,25 @@ public sealed class GoldenRecorder : IDisposable
         }
     }
 
-    /// <summary>YOLO 结果列表会被下一帧复用（实例级 List），必须立即拷贝。</summary>
-    private static List<ObjectDetection> CopyDetections(IReadOnlyList<ObjectDetection> src)
+    /// <summary>
+    /// 深拷贝检测结果，交给后台写盘线程。
+    /// DetectedObject 虽是本系统自己的类型，但列表本身仍会被下一次推理替换，拷贝一份最省心。
+    /// </summary>
+    private static List<DetectedObject> CopyDetections(IReadOnlyList<DetectedObject> src)
     {
-        var list = new List<ObjectDetection>(src.Count);
+        var list = new List<DetectedObject>(src.Count);
         foreach (var d in src)
         {
-            list.Add(new ObjectDetection
+            list.Add(new DetectedObject
             {
-                Label = d.Label,
+                ClassId = d.ClassId,
+                ClassName = d.ClassName,
                 Confidence = d.Confidence,
                 BoundingBox = d.BoundingBox,
-                Id = d.Id
+                PixelBoundingBox = d.PixelBoundingBox,
+                Mask = d.Mask,
+                MaskBox = d.MaskBox,
+                KeyPoints = d.KeyPoints
             });
         }
         return list;
@@ -335,13 +342,15 @@ public sealed class GoldenRecorder : IDisposable
         {
             var d = rec.Detections[i];
             if (i > 0) sb.Append(',');
-            sb.Append("{\"label\":").Append(JsonSerializer.Serialize(d.Label?.Name ?? "?"))
+            // track_id：推理层暂不输出跟踪 ID，固定 -1（与原实现中 Id 为空时一致），
+            // 对拍工具按 label+box 比对，不依赖该字段。
+            sb.Append("{\"label\":").Append(JsonSerializer.Serialize(d.ClassName))
               .Append(",\"conf\":").Append(Math.Round(d.Confidence, 4))
-              .Append(",\"track_id\":").Append(d.Id ?? -1)
-              .Append(",\"box\":[").Append(d.BoundingBox.Left).Append(',')
-              .Append(d.BoundingBox.Top).Append(',')
-              .Append(d.BoundingBox.Right).Append(',')
-              .Append(d.BoundingBox.Bottom).Append("]}");
+              .Append(",\"track_id\":").Append(-1)
+              .Append(",\"box\":[").Append(d.PixelBoundingBox.Left).Append(',')
+              .Append(d.PixelBoundingBox.Top).Append(',')
+              .Append(d.PixelBoundingBox.Right).Append(',')
+              .Append(d.PixelBoundingBox.Bottom).Append("]}");
         }
         sb.Append("],\"hands\":[");
         for (int i = 0; i < rec.Hands.Count; i++)
@@ -513,7 +522,7 @@ internal sealed class FrameRecord
     public int Width, Height;
     /// <summary>已在检测线程内编码好的 JPEG 字节。后台线程绝不触碰 SKBitmap（会被相机 Dispose）。</summary>
     public byte[]? JpegBytes;
-    public List<ObjectDetection> Detections = new();
+    public List<DetectedObject> Detections = new();
     public List<HandPose> Hands = new();
     public SOPStateMachineSnapshot Snapshot = new();
 }

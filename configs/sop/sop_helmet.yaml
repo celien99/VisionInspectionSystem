@@ -5,10 +5,8 @@
 # 本配方与手机/水杯等"步骤型任务"完全独立：不包含任何作业步骤（steps），
 # 仅做持续安全帽监控，在「产品配方」下拉框中显示为独立任务「安全帽监控」。
 #
-# ⚠️ 生效路径（重要）：
-#   本文件源码位于 src/UI/VisionInspection.UI/configs/sop/ ，由 csproj 复制到
-#   bin/.../configs/sop/ ，程序运行时读的是【输出目录】里的副本；
-#   根目录 configs/sop/ 下的同名副本仅供编辑器查看，程序【不读】。
+# 生效路径：仓库根 configs/sop/ 是唯一来源（运行时由 AppPaths 解析；
+#   publish 时整目录随 exe 输出）。不要再维护 src/UI/.../configs/ 副本。
 #
 # ⚠️ 使用前必须：
 #   1) 用「🎯 标定区域」按真机画面重框 monitor_zone 区域（坐标请以实际画面为准）；

@@ -1,9 +1,8 @@
 using SkiaSharp;
+using VisionInspection.Core.Services;
+using VisionInspection.Modules.Detection;
 using VisionInspection.Modules.SOP.Models;
 using YoloDotNet;
-using YoloDotNet.Enums;
-using YoloDotNet.ExecutionProvider.Cpu;
-using YoloDotNet.ExecutionProvider.Cuda;
 using YoloDotNet.Models;
 using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
@@ -45,21 +44,15 @@ public class YoloPoseHandEstimationService : IHandPoseEstimationService, IDispos
             lock (_lockObject)
             {
                 // 初始化YOLOv8-pose
-                var options = new YoloOptions
-                {
-                    ExecutionProvider = config.UseGpu 
-                        ? new CudaExecutionProvider(poseModelPath, 0)
-                        : new CpuExecutionProvider(poseModelPath),
-                    ImageResize = ImageResize.Proportional,
-                    SamplingOptions = new(SKFilterMode.Nearest, SKMipmapMode.None)
-                };
-
+                var options = YoloExecutionProviders.CreateOptions(poseModelPath, config.UseGpu);
                 _yolo = new Yolo(options);
                 Console.WriteLine($"[YoloPoseHand] YOLOv8-pose模型加载成功: {poseModelPath}");
 
                 // 初始化MediaPipe Landmark模型
                 var sessionOptions = new SessionOptions();
-                if (config.UseGpu)
+                // 只有 CUDA 构建才追加 CUDA EP：CPU 包里该调用会在建会话时抛异常，
+                // 导致整条手部链路初始化失败（原先没有这个判断）。
+                if (config.UseGpu && YoloExecutionProviders.IsCudaBuild)
                 {
                     sessionOptions.AppendExecutionProvider_CUDA(0);
                 }
@@ -69,72 +62,29 @@ public class YoloPoseHandEstimationService : IHandPoseEstimationService, IDispos
         });
     }
 
-    private async Task<string> FindPoseModelAsync(HandPoseEstimationConfig config)
+    private static Task<string> FindPoseModelAsync(HandPoseEstimationConfig config)
     {
-        var modelPath = config.PalmModelPath;
-        
-        if (string.IsNullOrEmpty(modelPath) || 
-            !File.Exists(modelPath) || 
-            modelPath.Contains("palm_detection") || 
-            modelPath.Contains("hand_landmark"))
-        {
-            var baseDir = AppDomain.CurrentDomain.BaseDirectory;
-            var possiblePaths = new[]
-            {
-                Path.Combine(baseDir, "yolo_models", "yolov8s-pose.onnx"),
-                Path.Combine(baseDir, "yolo_models", "yolov11s-pose.onnx"),
-                Path.Combine(baseDir, "Models", "yolov8s-pose.onnx"),
-                Path.Combine(baseDir, "Models", "yolov11s-pose.onnx"),
-                Path.Combine(baseDir, "..", "yolo_models", "yolov8s-pose.onnx"),
-                Path.Combine(baseDir, "..", "yolo_models", "yolov11s-pose.onnx"),
-                Path.Combine(baseDir, "..", "..", "yolo_models", "yolov8s-pose.onnx"),
-                Path.Combine(baseDir, "..", "..", "yolo_models", "yolov11s-pose.onnx"),
-            };
-            
-            modelPath = possiblePaths.FirstOrDefault(File.Exists) ?? "";
-            
-            if (string.IsNullOrEmpty(modelPath))
-            {
-                throw new FileNotFoundException("未找到YOLOv8-pose模型文件");
-            }
-        }
-        
-        return modelPath;
+        var configured = config.PalmModelPath;
+        if (!string.IsNullOrEmpty(configured) && File.Exists(configured)
+            && !configured.Contains("palm_detection") && !configured.Contains("hand_landmark"))
+            return Task.FromResult(configured);
+
+        // 统一走 AppPaths（程序目录 → models/、yolo_models/ → 向上找仓库根 → 工作目录）
+        var modelPath = AppPaths.ResolveModel("yolov8s-pose.onnx")
+                        ?? AppPaths.ResolveModel("yolov11s-pose.onnx")
+                        ?? throw new FileNotFoundException("未找到 YOLOv8-pose 模型文件（请放到 models/ 目录）");
+
+        return Task.FromResult(modelPath);
     }
 
-    private async Task<string> FindLandmarkModelAsync(HandPoseEstimationConfig config)
+    private static Task<string> FindLandmarkModelAsync(HandPoseEstimationConfig config)
     {
-        var baseDir = AppDomain.CurrentDomain.BaseDirectory;
-        var possiblePaths = new[]
-        {
-            // 相对于执行目录的路径
-            Path.Combine(baseDir, "models", "hand_landmark_sparse_Nx3x224x224.onnx"),
-            Path.Combine(baseDir, "Models", "hand_landmark_sparse_Nx3x224x224.onnx"),
-            Path.Combine(baseDir, "..", "models", "hand_landmark_sparse_Nx3x224x224.onnx"),
-            Path.Combine(baseDir, "..", "..", "models", "hand_landmark_sparse_Nx3x224x224.onnx"),
-            Path.Combine(baseDir, "..", "..", "..", "models", "hand_landmark_sparse_Nx3x224x224.onnx"),
-            // 相对于项目源代码的路径（开发环境）
-            Path.Combine(baseDir, "..", "..", "..", "VisionInspectionSystem", "src", "UI", "VisionInspection.UI", "models", "hand_landmark_sparse_Nx3x224x224.onnx"),
-            Path.Combine(baseDir, "..", "..", "VisionInspectionSystem", "src", "UI", "VisionInspection.UI", "models", "hand_landmark_sparse_Nx3x224x224.onnx"),
-            // 绝对路径（从项目根目录）
-            Path.Combine(baseDir, "VisionInspectionSystem", "src", "UI", "VisionInspection.UI", "models", "hand_landmark_sparse_Nx3x224x224.onnx"),
-        };
-        
-        var modelPath = possiblePaths.FirstOrDefault(File.Exists);
-        
-        if (string.IsNullOrEmpty(modelPath))
-        {
-            // 记录查找过的路径以便调试
-            Console.WriteLine("[YoloPoseHand] 查找模型文件失败，已尝试以下路径:");
-            foreach (var path in possiblePaths)
-            {
-                Console.WriteLine($"  - {path} (存在: {File.Exists(path)})");
-            }
-            throw new FileNotFoundException("未找到MediaPipe Landmark模型文件 (hand_landmark_sparse_Nx3x224x224.onnx)");
-        }
+        var modelPath = AppPaths.ResolveModel("hand_landmark_sparse_Nx3x224x224.onnx")
+                        ?? throw new FileNotFoundException(
+                            "未找到 MediaPipe Landmark 模型文件 hand_landmark_sparse_Nx3x224x224.onnx（请放到 models/ 目录）");
 
-        Console.WriteLine($"[YoloPoseHand] 找到Landmark模型: {modelPath}");
-        return modelPath;
+        Console.WriteLine($"[YoloPoseHand] Landmark 模型: {modelPath}");
+        return Task.FromResult(modelPath);
     }
 
     private static int _callCount = 0;

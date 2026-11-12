@@ -320,52 +320,8 @@ public class HandPoseEstimationConfig
 }
 
 /// <summary>
-/// 手部骨架连接线定义（用于绘制骨架线）
-/// </summary>
-public static class HandSkeletonConnections
-{
-    /// <summary>
-    /// 骨架连接线列表（每对表示一条线连接的两个关键点）
-    /// </summary>
-    public static readonly (HandKeypointType Start, HandKeypointType End)[] Connections = new[]
-    {
-        // 手腕到各手指根部
-        (HandKeypointType.Wrist, HandKeypointType.ThumbCMC),
-        (HandKeypointType.Wrist, HandKeypointType.IndexFingerMCP),
-        (HandKeypointType.Wrist, HandKeypointType.MiddleFingerMCP),
-        (HandKeypointType.Wrist, HandKeypointType.RingFingerMCP),
-        (HandKeypointType.Wrist, HandKeypointType.PinkyMCP),
-
-        // 拇指
-        (HandKeypointType.ThumbCMC, HandKeypointType.ThumbMCP),
-        (HandKeypointType.ThumbMCP, HandKeypointType.ThumbIP),
-        (HandKeypointType.ThumbIP, HandKeypointType.ThumbTip),
-
-        // 食指
-        (HandKeypointType.IndexFingerMCP, HandKeypointType.IndexFingerPIP),
-        (HandKeypointType.IndexFingerPIP, HandKeypointType.IndexFingerDIP),
-        (HandKeypointType.IndexFingerDIP, HandKeypointType.IndexFingerTip),
-
-        // 中指
-        (HandKeypointType.MiddleFingerMCP, HandKeypointType.MiddleFingerPIP),
-        (HandKeypointType.MiddleFingerPIP, HandKeypointType.MiddleFingerDIP),
-        (HandKeypointType.MiddleFingerDIP, HandKeypointType.MiddleFingerTip),
-
-        // 无名指
-        (HandKeypointType.RingFingerMCP, HandKeypointType.RingFingerPIP),
-        (HandKeypointType.RingFingerPIP, HandKeypointType.RingFingerDIP),
-        (HandKeypointType.RingFingerDIP, HandKeypointType.RingFingerTip),
-
-        // 小指
-        (HandKeypointType.PinkyMCP, HandKeypointType.PinkyPIP),
-        (HandKeypointType.PinkyPIP, HandKeypointType.PinkyDIP),
-        (HandKeypointType.PinkyDIP, HandKeypointType.PinkyTip)
-    };
-}
-
-/// <summary>
 /// 手部检测后端枚举。
-/// Auto=维持原有优先级(MediaPipe→YOLO-hand→YOLO-pose→DWPose)；其余为强制指定方案。
+/// Auto=MediaPipe 优先、失败回落 YOLO-pose；其余为强制指定方案。
 /// </summary>
 public enum HandDetectionBackend
 {

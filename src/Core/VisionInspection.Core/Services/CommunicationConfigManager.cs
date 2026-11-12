@@ -30,12 +30,8 @@ public class CommunicationConfigManager
 
     private CommunicationConfigManager()
     {
-        var appDirectory = AppDomain.CurrentDomain.BaseDirectory;
-        var configDirectory = Path.Combine(appDirectory, "configs");
-        if (!Directory.Exists(configDirectory))
-        {
-            Directory.CreateDirectory(configDirectory);
-        }
+        var configDirectory = AppPaths.ResolveConfigDir();
+        Directory.CreateDirectory(configDirectory);
         _configFilePath = Path.Combine(configDirectory, "communication_config.json");
     }
 

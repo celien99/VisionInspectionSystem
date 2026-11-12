@@ -1,3 +1,4 @@
+using VisionInspection.Core.Services;
 using Microsoft.Win32;
 using System;
 using System.Collections.Generic;
@@ -94,20 +95,7 @@ namespace VisionInspection.UI.Views
         // ==================== YAML 文件列表 ====================
 
         /// <summary>获取 SOP 配方目录（与 TryGetSopDirectory 一致，附带文件系统真实路径兜底）</summary>
-        private string? GetSopDirectory()
-        {
-            var dir = TryGetSopDirectory();
-            if (!string.IsNullOrEmpty(dir)) return dir;
-
-            // 兜底：当前工作目录下查找 configs/sop
-            try
-            {
-                var cwdDir = Path.GetFullPath(Path.Combine(Environment.CurrentDirectory, "configs", "sop"));
-                if (Directory.Exists(cwdDir)) return cwdDir;
-            }
-            catch { /* 忽略 */ }
-            return null;
-        }
+        private string? GetSopDirectory() => TryGetSopDirectory();
 
         /// <summary>扫描 SOP 目录下所有 yaml/yml 文件，填充到 ComboBox</summary>
         private void RefreshYamlFilesList()
@@ -275,17 +263,7 @@ namespace VisionInspection.UI.Views
         }
 
         private string? TryGetSopDirectory()
-        {
-            try
-            {
-                var dir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "configs", "sop");
-                if (Directory.Exists(dir)) return dir;
-                var srcDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "..", "..", "configs", "sop");
-                if (Directory.Exists(srcDir)) return Path.GetFullPath(srcDir);
-            }
-            catch { /* 忽略，让对话框用默认目录 */ }
-            return null;
-        }
+            => Directory.Exists(RecipeFile.SopDir) ? RecipeFile.SopDir : null;
 
         // ==================== 步骤列表 ====================
 

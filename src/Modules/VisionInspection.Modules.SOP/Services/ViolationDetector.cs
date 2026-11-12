@@ -1,6 +1,6 @@
 using SkiaSharp;
 using VisionInspection.Modules.SOP.Models;
-using YoloDotNet.Models;
+using VisionInspection.Core.Services;
 
 namespace VisionInspection.Modules.SOP.Services;
 
@@ -36,7 +36,7 @@ public class ViolationDetector
     /// <summary>
     /// 检测违规
     /// </summary>
-    public List<ViolationRecord> DetectViolations(SOPStep currentStep, List<ObjectDetection> detections, HandPoseEstimationResult? handResult, DateTime timestamp)
+    public List<ViolationRecord> DetectViolations(SOPStep currentStep, List<DetectedObject> detections, HandPoseEstimationResult? handResult, DateTime timestamp)
     {
         var violations = new List<ViolationRecord>();
 
@@ -118,7 +118,7 @@ public class ViolationDetector
     /// <summary>
     /// 检测禁止对象
     /// </summary>
-    private ViolationRecord? DetectForbiddenObject(SOPStep step, List<ObjectDetection> detections, DateTime timestamp)
+    private ViolationRecord? DetectForbiddenObject(SOPStep step, List<DetectedObject> detections, DateTime timestamp)
     {
         var forbiddenClasses = step.ViolationRules
             .Where(r => r.Type == ViolationType.ForbiddenObject)
@@ -135,7 +135,7 @@ public class ViolationDetector
         foreach (var forbiddenClass in forbiddenClasses)
         {
             var detected = detections
-                .Where(d => (d.Label?.Name ?? "").Equals(forbiddenClass, StringComparison.OrdinalIgnoreCase))
+                .Where(d => d.ClassName.Equals(forbiddenClass, StringComparison.OrdinalIgnoreCase))
                 .Where(d => d.Confidence >= 0.5f)
                 .ToList();
 
@@ -159,7 +159,7 @@ public class ViolationDetector
     /// <summary>
     /// 检测对象被移除
     /// </summary>
-    private ViolationRecord? DetectObjectRemoved(SOPStep step, List<ObjectDetection> detections, DateTime timestamp)
+    private ViolationRecord? DetectObjectRemoved(SOPStep step, List<DetectedObject> detections, DateTime timestamp)
     {
         var mustKeepClasses = step.ViolationRules
             .Where(r => r.Type == ViolationType.ObjectRemoved)
@@ -183,7 +183,7 @@ public class ViolationDetector
             if (wasPresent)
             {
                 var currentlyPresent = detections.Any(d =>
-                    (d.Label?.Name ?? "").Equals(mustKeepClass, StringComparison.OrdinalIgnoreCase) &&
+                    d.ClassName.Equals(mustKeepClass, StringComparison.OrdinalIgnoreCase) &&
                     d.Confidence >= 0.5f);
 
                 if (!currentlyPresent)
@@ -209,7 +209,7 @@ public class ViolationDetector
     /// 这是通用的数据驱动规则——每个配方在 YAML 中声明自己的必放物料，切换产品即复用同一引擎。
     /// 防误报：若画面中完全没有任何必放物料出现，视为"成品尚未入框"，暂不判定漏放。
     /// </summary>
-    private ViolationRecord? DetectMissingRequiredObject(SOPStep step, List<ObjectDetection> detections, DateTime timestamp)
+    private ViolationRecord? DetectMissingRequiredObject(SOPStep step, List<DetectedObject> detections, DateTime timestamp)
     {
         var reqRules = step.ViolationRules
             .Where(r => r.Type == ViolationType.MissingRequiredObject)
@@ -248,7 +248,7 @@ public class ViolationDetector
 
         // 防误报：画面中完全未出现任何必放物料时，视为成品尚未入框，不判漏放
         var anyPresentAnywhere = detections.Any(d =>
-            required.Any(r => (d.Label?.Name ?? "").Equals(r.Class, StringComparison.OrdinalIgnoreCase)
+            required.Any(r => d.ClassName.Equals(r.Class, StringComparison.OrdinalIgnoreCase)
                               && d.Confidence >= r.MinConf));
         if (!anyPresentAnywhere) return null;
 
@@ -257,13 +257,13 @@ public class ViolationDetector
         foreach (var (cls, zone, minc) in required)
         {
             var matches = detections
-                .Where(d => (d.Label?.Name ?? "").Equals(cls, StringComparison.OrdinalIgnoreCase))
+                .Where(d => d.ClassName.Equals(cls, StringComparison.OrdinalIgnoreCase))
                 .Where(d => d.Confidence >= minc);
 
             if (!string.IsNullOrEmpty(zone))
             {
                 var z = GetZoneDefinition(zone);
-                if (z != null) matches = matches.Where(d => IsInZone(d.BoundingBox, z));
+                if (z != null) matches = matches.Where(d => IsInZone(d.PixelBoundingBox, z));
             }
 
             if (!matches.Any())
@@ -287,7 +287,7 @@ public class ViolationDetector
     /// <summary>
     /// 检测区域入侵
     /// </summary>
-    private ViolationRecord? DetectZoneIntrusion(SOPStep step, List<ObjectDetection> detections, DateTime timestamp)
+    private ViolationRecord? DetectZoneIntrusion(SOPStep step, List<DetectedObject> detections, DateTime timestamp)
     {
         var zoneRules = step.ViolationRules.Where(r => r.Type == ViolationType.ZoneIntrusion).ToList();
 
@@ -309,9 +309,9 @@ public class ViolationDetector
             foreach (var forbiddenClass in forbiddenClasses)
             {
                 var intrusions = detections
-                    .Where(d => (d.Label?.Name ?? "").Equals(forbiddenClass, StringComparison.OrdinalIgnoreCase))
+                    .Where(d => d.ClassName.Equals(forbiddenClass, StringComparison.OrdinalIgnoreCase))
                     .Where(d => d.Confidence >= 0.5f)
-                    .Where(d => IsInZone(d.BoundingBox, zone))
+                    .Where(d => IsInZone(d.PixelBoundingBox, zone))
                     .ToList();
 
                 if (intrusions.Count > 0)
@@ -335,7 +335,7 @@ public class ViolationDetector
     /// 检测跳步：若"下一个"步骤（按 StepId 顺序）的条件已经满足，而当前步骤尚未通过，
     /// 说明当前步骤被跳过。只检查下一步，避免把更后面的 time_elapsed 等条件误报为跳步。
     /// </summary>
-    private ViolationRecord? DetectSkipStep(SOPStep step, List<ObjectDetection> detections, HandPoseEstimationResult? handResult, DateTime timestamp)
+    private ViolationRecord? DetectSkipStep(SOPStep step, List<DetectedObject> detections, HandPoseEstimationResult? handResult, DateTime timestamp)
     {
         if (_stateMachine.Workflow?.Settings.EnableSkipDetection != true)
             return null;

@@ -6,10 +6,6 @@ using System.Threading;
 using System.Threading.Tasks;
 using VisionInspection.Core.Services;
 using YoloDotNet;
-using YoloDotNet.Enums;
-using YoloDotNet.ExecutionProvider.Cuda;
-using YoloDotNet.ExecutionProvider.Cpu;
-using YoloDotNet.Models;
 using YoloDotNet.Video;
 
 namespace VisionInspection.Modules.Detection
@@ -80,14 +76,8 @@ namespace VisionInspection.Modules.Detection
                         }
 
                         // 创建YOLO实例
-                        var options = new YoloOptions
-                        {
-                            ExecutionProvider = modelInfo.UseGpu
-                                ? new CudaExecutionProvider(modelInfo.ModelPath, modelInfo.GpuId)
-                                : new CpuExecutionProvider(modelInfo.ModelPath),
-                            ImageResize = ImageResize.Proportional,
-                            SamplingOptions = new(SKFilterMode.Nearest, SKMipmapMode.None)
-                        };
+                        var options = YoloExecutionProviders.CreateOptions(
+                            modelInfo.ModelPath, modelInfo.UseGpu, modelInfo.GpuId);
 
                         System.Diagnostics.Debug.WriteLine($"[YoloDetectionService] 执行设备: {(modelInfo.UseGpu ? $"CUDA (GPU {modelInfo.GpuId})" : "CPU")}");
 
@@ -386,9 +376,9 @@ namespace VisionInspection.Modules.Detection
 
                 // 设置环境变量，确保YoloDotNet能找到FFmpeg
                 var currentPath = Environment.GetEnvironmentVariable("PATH") ?? "";
-                if (!currentPath.Contains(ffmpegPath))
+                if (!string.IsNullOrEmpty(ffmpegPath) && !currentPath.Contains(ffmpegPath))
                 {
-                    Environment.SetEnvironmentVariable("PATH", $"{ffmpegPath};{currentPath}");
+                    Environment.SetEnvironmentVariable("PATH", $"{ffmpegPath}{Path.PathSeparator}{currentPath}");
                 }
 
                 // 创建视频选项
@@ -433,54 +423,24 @@ namespace VisionInspection.Modules.Detection
         }
 
         /// <summary>
-        /// 获取FFmpeg路径
+        /// 获取 FFmpeg 所在目录。查找顺序：
+        /// 环境变量 VISION_FFMPEG_DIR → 程序目录/ffmpeg/bin → 系统 PATH。
+        /// （原先写死了 4 个 E:\ / C:\ 绝对路径，换机器必然失效）
         /// </summary>
         private string? GetFFmpegPath()
         {
-            // 首先检查常见路径
-            var commonPaths = new[]
+            var envDir = Environment.GetEnvironmentVariable("VISION_FFMPEG_DIR");
+            if (!string.IsNullOrWhiteSpace(envDir))
             {
-                @"E:\yolo\YoloDotNet-master\VisionInspectionSystem\ffmpeg\bin",
-                @"C:\ffmpeg\bin",
-                @"C:\Program Files\ffmpeg\bin",
-                @"C:\Program Files (x86)\ffmpeg\bin"
-            };
-
-            foreach (var path in commonPaths)
-            {
-                var ffmpegPath = System.IO.Path.Combine(path, "ffmpeg.exe");
-                var ffprobePath = System.IO.Path.Combine(path, "ffprobe.exe");
-
-                if (System.IO.File.Exists(ffmpegPath) && System.IO.File.Exists(ffprobePath))
-                {
-                    return path;
-                }
+                var exeName = OperatingSystem.IsWindows() ? "ffmpeg.exe" : "ffmpeg";
+                if (File.Exists(Path.Combine(envDir, exeName))) return envDir;
             }
 
-            // 尝试从PATH环境变量中查找
-            try
-            {
-                using var ffmpegProcess = new System.Diagnostics.Process();
-                ffmpegProcess.StartInfo.FileName = "ffmpeg";
-                ffmpegProcess.StartInfo.Arguments = "-version";
-                ffmpegProcess.StartInfo.UseShellExecute = false;
-                ffmpegProcess.StartInfo.RedirectStandardOutput = true;
-                ffmpegProcess.StartInfo.CreateNoWindow = true;
-                ffmpegProcess.Start();
-                ffmpegProcess.WaitForExit(2000);
+            var ffmpeg = AppPaths.FindExecutable("ffmpeg", "ffmpeg/bin", "bin", "");
+            if (ffmpeg == null) return null;
 
-                if (ffmpegProcess.ExitCode == 0)
-                {
-                    // 从PATH中找到，返回空字符串表示使用系统PATH
-                    return "";
-                }
-            }
-            catch
-            {
-                // 未找到
-            }
-
-            return null;
+            var dir = Path.GetDirectoryName(ffmpeg);
+            return string.IsNullOrEmpty(dir) ? "" : dir;
         }
 
         /// <summary>

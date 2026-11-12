@@ -18,7 +18,6 @@
     <PackageReference Include="Microsoft.Extensions.Configuration" Version="8.0.0" />
     <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="8.0.0" />
     <PackageReference Include="HandyControl" Version="3.4.0" />
-    <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.23.0" />
     <PackageReference Include="OpenCvSharp4" Version="4.10.0.20241108" />
     <PackageReference Include="OpenCvSharp4.runtime.win" Version="4.10.0.20241108" />
     <PackageReference Include="OpenCvSharp4.Extensions" Version="4.10.0.20241108" />
@@ -39,64 +38,55 @@
     <ProjectReference Include="..\VisionInspection.Converters\VisionInspection.Converters.csproj" />
   </ItemGroup>
 
-  <!-- 海康相机SDK引用 -->
+  <!--
+    海康相机 SDK（托管封装 DLL）。原先是绝对路径 E:\yolo\...\MvCameraControl.Net.dll，
+    换机器即编译失败；改为仓库内 libs/，随程序输出。
+  -->
   <ItemGroup>
     <Reference Include="MvCameraControl.Net">
-      <HintPath>E:\yolo\YoloDotNet-master\VisionInspectionSystem\libs\MvCameraControl.Net.dll</HintPath>
+      <HintPath>$(MSBuildThisFileDirectory)..\..\..\libs\MvCameraControl.Net.dll</HintPath>
       <Private>true</Private>
+      <Visible>false</Visible>
     </Reference>
-  </ItemGroup>
-
-  <!-- 确保SDK DLL复制到输出目录 -->
-  <ItemGroup>
-    <None Include="E:\yolo\YoloDotNet-master\VisionInspectionSystem\libs\MvCameraControl.Net.dll">
+    <None Include="$(MSBuildThisFileDirectory)..\..\..\libs\MvCameraControl.Net.dll" Link="MvCameraControl.Net.dll" Condition="Exists('$(MSBuildThisFileDirectory)..\..\..\libs\MvCameraControl.Net.dll')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
   </ItemGroup>
 
-  <!-- SOP配置文件：用通配符包含 configs/sop 下所有 yaml，以后新增 SOP 不用改 csproj -->
+  <!--
+    模型文件：仓库根 models/ 与 yolo_models/ 都是运行时可选（体积大、不进版本库）。
+    这里只在文件存在时才复制，避免 clone 后直接编译失败。
+  -->
   <ItemGroup>
-    <None Update="configs\sop_config.json">
+    <None Include="..\..\..\models\palm_detection_full_Nx3x192x192_post.onnx" Link="models\palm_detection_full_Nx3x192x192_post.onnx" Condition="Exists('..\..\..\models\palm_detection_full_Nx3x192x192_post.onnx')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
-    <None Update="configs\sop\regions\*.json">
+    <None Include="..\..\..\models\hand_landmark_sparse_Nx3x224x224.onnx" Link="models\hand_landmark_sparse_Nx3x224x224.onnx" Condition="Exists('..\..\..\models\hand_landmark_sparse_Nx3x224x224.onnx')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
-    <None Update="configs\sop\*.yaml">
+    <None Include="..\..\..\models\yolov8s-pose.onnx" Link="yolo_models\yolov8s-pose.onnx" Condition="Exists('..\..\..\models\yolov8s-pose.onnx')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Include="..\..\..\models\yolov11s-pose.onnx" Link="yolo_models\yolov11s-pose.onnx" Condition="Exists('..\..\..\models\yolov11s-pose.onnx')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
   </ItemGroup>
 
-  <!-- MediaPipe手部检测模型文件：从项目根 models\ 复制到输出目录 models\ -->
+  <!--
+    configs/ 只在 publish 时随包输出（放到 exe 同目录），开发期不复制到 bin：
+    运行时统一由 Core 的 AppPaths 解析（程序根 → 向上找仓库根），
+    避免"输出目录里有一份旧副本、改了源码配置却不生效"的坑。
+  -->
   <ItemGroup>
-    <None Include="..\..\..\models\palm_detection_full_Nx3x192x192_post.onnx">
-      <Link>models\palm_detection_full_Nx3x192x192_post.onnx</Link>
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </None>
-    <None Include="..\..\..\models\hand_landmark_sparse_Nx3x224x224.onnx">
-      <Link>models\hand_landmark_sparse_Nx3x224x224.onnx</Link>
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </None>
-  </ItemGroup>
-
-  <!-- YOLOv8-pose模型文件（用于手部检测） -->
-  <ItemGroup>
-    <None Include="..\..\..\..\Models\yolov8s-pose.onnx">
-      <Link>Models\yolov8s-pose.onnx</Link>
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </None>
-    <None Include="..\..\..\..\Models\yolov11s-pose.onnx">
-      <Link>Models\yolov11s-pose.onnx</Link>
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </None>
+    <None Include="..\..\..\configs\**\*" LinkBase="configs" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 
   <!-- SOP 音频反馈文件（ok.wav / ng.wav）：复制到输出目录，运行时由 MainViewModel 定位播放 -->
   <ItemGroup>
-    <None Include="..\..\..\ok.wav">
+    <None Include="..\..\..\ok.wav" Condition="Exists('..\..\..\ok.wav')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
-    <None Include="..\..\..\ng.wav">
+    <None Include="..\..\..\ng.wav" Condition="Exists('..\..\..\ng.wav')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
   </ItemGroup>

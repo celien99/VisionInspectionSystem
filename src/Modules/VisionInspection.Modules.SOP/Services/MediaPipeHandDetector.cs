@@ -64,7 +64,7 @@ public class MediaPipeHandDetector : IDisposable
             try
             {
                 System.IO.File.AppendAllText(
-                    "sop_module_debug.log",
+                    VisionInspection.Core.Services.AppPaths.Log("sop_module_debug.log"),
                     $"[{DateTime.Now:HH:mm:ss.fff}] [MediaPipe] {message}{Environment.NewLine}");
             }
             catch { /* 日志失败不影响检测 */ }

@@ -1,7 +1,7 @@
+using VisionInspection.Core.Services;
 using System.Diagnostics;
 using SkiaSharp;
 using VisionInspection.Modules.SOP.Models;
-using YoloDotNet.Models;
 
 namespace VisionInspection.Modules.SOP.Services;
 
@@ -14,7 +14,7 @@ public class StepConditionEvaluator
     private readonly Dictionary<string, ZoneDefinition> _zones;
 
     // 调试日志：与 SOPModule.DebugLog 写同一文件 sop_module_debug.log，方便一次性查看
-    private const string DebugLogFile = "sop_module_debug.log";
+    private static readonly string DebugLogFile = AppPaths.Log("sop_module_debug.log");
     private static readonly object _dbgLock = new();
     private static void Dbg(string msg)
     {
@@ -55,7 +55,7 @@ public class StepConditionEvaluator
     /// <summary>
     /// 评估步骤的所有条件（物体 + 手部姿态）
     /// </summary>
-    public ConditionEvaluationResult EvaluateConditions(SOPStep step, List<ObjectDetection> detections, HandPoseEstimationResult? handResult = null, bool ignoreFromRegion = false)
+    public ConditionEvaluationResult EvaluateConditions(SOPStep step, List<DetectedObject> detections, HandPoseEstimationResult? handResult = null, bool ignoreFromRegion = false)
     {
         // 先更新手部跨帧跟踪状态（用于稳定/移动判断）
         UpdateHandTracks(handResult);
@@ -97,7 +97,7 @@ public class StepConditionEvaluator
             string detSummary = detections.Count == 0
                 ? "none"
                 : string.Join("|", detections.Select(d =>
-                    $"{d.Label?.Name ?? "?"}({d.Confidence:F2},[{d.BoundingBox.Left:F0},{d.BoundingBox.Top:F0}-{d.BoundingBox.Right:F0},{d.BoundingBox.Bottom:F0}])"));
+                    $"{d.ClassName}({d.Confidence:F2},[{d.PixelBoundingBox.Left:F0},{d.PixelBoundingBox.Top:F0}-{d.PixelBoundingBox.Right:F0},{d.PixelBoundingBox.Bottom:F0}])"));
             Dbg($"step='{step.StepName}' hands={handSummary} dets={detSummary}");
         }
 
@@ -133,7 +133,7 @@ public class StepConditionEvaluator
         };
     }
 
-    private ConditionCheckResult CheckCondition(StepCondition condition, List<ObjectDetection> detections, HandPoseEstimationResult? handResult, bool ignoreFromRegion = false)
+    private ConditionCheckResult CheckCondition(StepCondition condition, List<DetectedObject> detections, HandPoseEstimationResult? handResult, bool ignoreFromRegion = false)
     {
         // 手部动作条件分支
         if (condition.Type == ConditionType.HandInRegion ||
@@ -284,11 +284,11 @@ public class StepConditionEvaluator
     /// 物体没有稳定 TrackId，按标签聚合即可（同一场景通常只有一种物料）。
     /// 判定标准与 CheckObjectInZone 的 IsInZone 一致：bbox 与区域相交即记为访问过。
     /// </summary>
-    private void UpdateObjectRegions(List<ObjectDetection> detections)
+    private void UpdateObjectRegions(List<DetectedObject> detections)
     {
         foreach (var det in detections)
         {
-            var label = det.Label?.Name;
+            var label = det.ClassName;
             if (string.IsNullOrEmpty(label)) continue;
             if (!_objectVisitedRegions.TryGetValue(label, out var set))
             {
@@ -298,7 +298,7 @@ public class StepConditionEvaluator
             foreach (var zone in _zones.Values)
             {
                 var zoneRect = new SKRectI((int)zone.X, (int)zone.Y, (int)(zone.X + zone.Width), (int)(zone.Y + zone.Height));
-                if (det.BoundingBox.IntersectsWith(zoneRect))
+                if (det.PixelBoundingBox.IntersectsWith(zoneRect))
                 {
                     set.Add(zone.ZoneId);
                 }
@@ -325,7 +325,7 @@ public class StepConditionEvaluator
         return chosen;
     }
 
-    private ConditionCheckResult CheckHandCondition(StepCondition condition, List<ObjectDetection> detections, HandPoseEstimationResult? handResult, bool ignoreFromRegion = false)
+    private ConditionCheckResult CheckHandCondition(StepCondition condition, List<DetectedObject> detections, HandPoseEstimationResult? handResult, bool ignoreFromRegion = false)
     {
         var hand = SelectHand(condition, handResult);
         if (hand == null)
@@ -428,11 +428,11 @@ public class StepConditionEvaluator
 
                 // ⭐ 目标物体辅助判定：手正拿着 target_object（适用于"拿起/放下"最直接的语义）
                 bool handHoldingTarget = false;
-                ObjectDetection? targetObjDebug = null;
+                DetectedObject? targetObjDebug = null;
                 if (!string.IsNullOrEmpty(condition.TargetObject))
                 {
                     var allCandidates = detections
-                        .Where(d => (d.Label?.Name ?? "").Equals(condition.TargetObject, StringComparison.OrdinalIgnoreCase))
+                        .Where(d => d.ClassName.Equals(condition.TargetObject, StringComparison.OrdinalIgnoreCase))
                         .ToList();
                     var targetObj = allCandidates
                         .Where(d => d.Confidence >= condition.MinConfidence)
@@ -452,7 +452,7 @@ public class StepConditionEvaluator
                         handHoldingTarget = IsHandHoldingObject(hand, targetObj, out var intersectDetail);
                         Dbg(
                             $"  target_obj '{condition.TargetObject}' conf={targetObj.Confidence:F2} " +
-                            $"bbox=[{targetObj.BoundingBox.Left:F0},{targetObj.BoundingBox.Top:F0}-{targetObj.BoundingBox.Right:F0},{targetObj.BoundingBox.Bottom:F0}] " +
+                            $"bbox=[{targetObj.PixelBoundingBox.Left:F0},{targetObj.PixelBoundingBox.Top:F0}-{targetObj.PixelBoundingBox.Right:F0},{targetObj.PixelBoundingBox.Bottom:F0}] " +
                             $"handHolding={handHoldingTarget} {intersectDetail}");
                     }
                     else if (allCandidates.Count == 0)
@@ -467,14 +467,14 @@ public class StepConditionEvaluator
                     if (!string.IsNullOrEmpty(condition.TargetObject))
                     {
                         var targetObj = detections
-                            .Where(d => (d.Label?.Name ?? "").Equals(condition.TargetObject, StringComparison.OrdinalIgnoreCase))
+                            .Where(d => d.ClassName.Equals(condition.TargetObject, StringComparison.OrdinalIgnoreCase))
                             .Where(d => d.Confidence >= condition.MinConfidence)
                             .OrderByDescending(d => d.Confidence)
                             .FirstOrDefault();
 
                         if (targetObj != null)
                         {
-                            bool objInTo = toRect != SKRect.Empty && IsInZone(targetObj.BoundingBox, zoneTo!);
+                            bool objInTo = toRect != SKRect.Empty && IsInZone(targetObj.PixelBoundingBox, zoneTo!);
                             // 若指定了起始区域，要求手曾访问过起始区域，才能算“从该区域放到目标区域”。
                             // 否则会出现：杯子本来就在目标区域（如拿起前已在桌面），被误判为“已经放下”。
                             if (objInTo && (!hasFrom || visitedFrom))
@@ -518,12 +518,12 @@ public class StepConditionEvaluator
                     if (!string.IsNullOrEmpty(condition.TargetObject))
                     {
                         var objNow = detections
-                            .Where(d => (d.Label?.Name ?? "").Equals(condition.TargetObject, StringComparison.OrdinalIgnoreCase))
+                            .Where(d => d.ClassName.Equals(condition.TargetObject, StringComparison.OrdinalIgnoreCase))
                             .Where(d => d.Confidence >= condition.MinConfidence)
                             .OrderByDescending(d => d.Confidence)
                             .FirstOrDefault();
                         if (objNow != null && zoneFrom != null)
-                            objInFromNow = IsInZone(objNow.BoundingBox, zoneFrom);
+                            objInFromNow = IsInZone(objNow.PixelBoundingBox, zoneFrom);
                     }
 
                     Dbg($"  [pickup] from='{fromRegion}' objInFromNow={objInFromNow} inFrom={inFrom} handHolding={handHoldingTarget}");
@@ -569,7 +569,7 @@ public class StepConditionEvaluator
     /// <summary>
     /// 手部靠近目标物体（手-物交互判断）：手的包围盒与目标检测框（外扩 margin）相交
     /// </summary>
-    private ConditionCheckResult CheckHandNearObject(StepCondition condition, List<ObjectDetection> detections, HandPoseEstimationResult? handResult)
+    private ConditionCheckResult CheckHandNearObject(StepCondition condition, List<DetectedObject> detections, HandPoseEstimationResult? handResult)
     {
         var hand = SelectHand(condition, handResult);
         if (hand == null)
@@ -580,10 +580,10 @@ public class StepConditionEvaluator
 
         foreach (var det in detections)
         {
-            if (!string.Equals(det.Label?.Name, condition.TargetObject, StringComparison.OrdinalIgnoreCase)) continue;
+            if (!string.Equals(det.ClassName, condition.TargetObject, StringComparison.OrdinalIgnoreCase)) continue;
             if (det.Confidence < condition.MinConfidence) continue;
 
-            var box = det.BoundingBox;
+            var box = det.PixelBoundingBox;
             var expanded = new SKRect(box.Left - margin, box.Top - margin, box.Right + margin, box.Bottom + margin);
             if (expanded.IntersectsWith(hand.BoundingBox))
                 return new ConditionCheckResult { IsMet = true, Message = $"手部靠近 '{condition.TargetObject}'" };
@@ -597,7 +597,7 @@ public class StepConditionEvaluator
     /// <summary>
     /// 判断手是否正拿着目标物体：手框与物体框相交，或手的中心落在物体框内。
     /// </summary>
-    private static bool IsHandHoldingObject(HandPose hand, ObjectDetection targetObj)
+    private static bool IsHandHoldingObject(HandPose hand, DetectedObject targetObj)
     {
         return IsHandHoldingObject(hand, targetObj, out _);
     }
@@ -605,9 +605,9 @@ public class StepConditionEvaluator
     /// <summary>
     /// 重载：附加返回每条子判断的明细，供调试日志使用。
     /// </summary>
-    private static bool IsHandHoldingObject(HandPose hand, ObjectDetection targetObj, out string detail)
+    private static bool IsHandHoldingObject(HandPose hand, DetectedObject targetObj, out string detail)
     {
-        var objBox = targetObj.BoundingBox;
+        var objBox = targetObj.PixelBoundingBox;
         if (objBox.IsEmpty)
         {
             detail = "(物体 BBox 为空)";
@@ -649,10 +649,10 @@ public class StepConditionEvaluator
     /// <summary>
     /// 检查目标是否存在
     /// </summary>
-    private ConditionCheckResult CheckObjectPresent(StepCondition condition, List<ObjectDetection> detections)
+    private ConditionCheckResult CheckObjectPresent(StepCondition condition, List<DetectedObject> detections)
     {
         var matchingObjects = detections
-            .Where(d => (d.Label?.Name ?? "").Equals(condition.TargetObject, StringComparison.OrdinalIgnoreCase))
+            .Where(d => d.ClassName.Equals(condition.TargetObject, StringComparison.OrdinalIgnoreCase))
             .Where(d => d.Confidence >= condition.MinConfidence)
             .ToList();
 
@@ -677,7 +677,7 @@ public class StepConditionEvaluator
     /// <summary>
     /// 检查目标是否在指定区域内
     /// </summary>
-    private ConditionCheckResult CheckObjectInZone(StepCondition condition, List<ObjectDetection> detections)
+    private ConditionCheckResult CheckObjectInZone(StepCondition condition, List<DetectedObject> detections)
     {
         if (string.IsNullOrEmpty(condition.ZoneId))
         {
@@ -699,9 +699,9 @@ public class StepConditionEvaluator
         }
 
         var matchingObjects = detections
-            .Where(d => (d.Label?.Name ?? "").Equals(condition.TargetObject, StringComparison.OrdinalIgnoreCase))
+            .Where(d => d.ClassName.Equals(condition.TargetObject, StringComparison.OrdinalIgnoreCase))
             .Where(d => d.Confidence >= condition.MinConfidence)
-            .Where(d => IsInZone(d.BoundingBox, zone))
+            .Where(d => IsInZone(d.PixelBoundingBox, zone))
             .ToList();
 
         if (matchingObjects.Count == 0)
@@ -759,17 +759,17 @@ public class StepConditionEvaluator
         {
             IsMet = true,
             Message = $"目标 '{condition.TargetObject}' 已稳定（跟踪 {mostStable.FrameCount} 帧）",
-            MatchedObjects = new List<ObjectDetection>() // 这里需要转换
+            MatchedObjects = new List<DetectedObject>() // 这里需要转换
         };
     }
 
     /// <summary>
     /// 检查目标是否不存在
     /// </summary>
-    private ConditionCheckResult CheckObjectAbsent(StepCondition condition, List<ObjectDetection> detections)
+    private ConditionCheckResult CheckObjectAbsent(StepCondition condition, List<DetectedObject> detections)
     {
         var matchingObjects = detections
-            .Where(d => (d.Label?.Name ?? "").Equals(condition.TargetObject, StringComparison.OrdinalIgnoreCase))
+            .Where(d => d.ClassName.Equals(condition.TargetObject, StringComparison.OrdinalIgnoreCase))
             .Where(d => d.Confidence >= condition.MinConfidence)
             .ToList();
 
@@ -878,8 +878,7 @@ public class ConditionCheckResult
 {
     public bool IsMet { get; set; }
     public string Message { get; set; } = "";
-    public List<ObjectDetection> MatchedObjects { get; set; } = new();
-    public List<HumanPose> MatchedPoses { get; set; } = new();
+    public List<DetectedObject> MatchedObjects { get; set; } = new();
 }
 
 

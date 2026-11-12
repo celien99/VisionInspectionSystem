@@ -44,6 +44,14 @@ models/*.onnx
 models/*.pt
 models/*.weights
 
+# 运行时状态文件（程序自动生成，不进版本库）
+configs/last_recipe.json
+configs/camera_config.json
+configs/communication_config.json
+configs/sop_capture.json
+configs/data_acquisition.json
+configs/golden_recorder.json
+
 # Configs with sensitive data
 configs/system.local.json
 configs/*.local.json

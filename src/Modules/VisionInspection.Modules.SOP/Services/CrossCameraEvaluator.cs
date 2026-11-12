@@ -1,6 +1,6 @@
 using SkiaSharp;
 using VisionInspection.Modules.SOP.Models;
-using YoloDotNet.Models;
+using VisionInspection.Core.Services;
 
 namespace VisionInspection.Modules.SOP.Services;
 
@@ -17,7 +17,7 @@ public sealed class CrossCameraEvaluator
     /// 评估所有跨相机规则，返回首个命中的规则（含冷却过滤）。
     /// </summary>
     public CrossCameraRuleHit? Evaluate(
-        IReadOnlyDictionary<string, List<ObjectDetection>> perCameraDetections,
+        IReadOnlyDictionary<string, List<DetectedObject>> perCameraDetections,
         IReadOnlyList<ZoneDefinition> regions,
         SOPCrossCameraConfig cfg,
         DateTime now)
@@ -79,13 +79,13 @@ public sealed class CrossCameraEvaluator
     /// <summary>
     /// 命中判定：区域内存在 ≥ MinConfidence 的指定类别（检测框中心落入区域矩形）
     /// </summary>
-    private static bool EvaluateCondition(List<ObjectDetection> dets, SOPCrossCameraCondition cond, ZoneDefinition zone)
+    private static bool EvaluateCondition(List<DetectedObject> dets, SOPCrossCameraCondition cond, ZoneDefinition zone)
     {
         var rect = new SKRect(zone.X, zone.Y, zone.X + zone.Width, zone.Y + zone.Height);
         return dets.Any(d =>
             d.Confidence >= cond.MinConfidence &&
-            string.Equals(d.Label?.Name, cond.ObjectClass, StringComparison.OrdinalIgnoreCase) &&
-            rect.Contains(d.BoundingBox.MidX, d.BoundingBox.MidY));
+            string.Equals(d.ClassName, cond.ObjectClass, StringComparison.OrdinalIgnoreCase) &&
+            rect.Contains(d.PixelBoundingBox.MidX, d.PixelBoundingBox.MidY));
     }
 
     /// <summary>

@@ -1,0 +1,16 @@
+{
+  "SOPModule": {
+    "ModelPath": "models/sop_yolov8.onnx",
+    "UseGpu": false,
+    "GpuId": 0,
+    "ConfidenceThreshold": 0.6,
+    "IouThreshold": 0.45,
+    "HandDetectionBackend": "MediaPipe",
+    "HandPoseEstimation": {
+      "ModelPath": "models",
+      "ConfidenceThreshold": 0.3,
+      "MaxNumHands": 2,
+      "UseGpu": false
+    }
+  }
+}

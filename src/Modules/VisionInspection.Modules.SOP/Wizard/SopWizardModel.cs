@@ -180,21 +180,6 @@ public static class SopPresetValidator
 }
 
 /// <summary>
-/// 常用 COCO 物体类别（仅作参考；向导第①步的物体预设优先）
-/// </summary>
-public static class SopCocoClasses
-{
-    public static readonly List<string> Common = new()
-    {
-        "person", "cup", "bottle", "book", "cell phone", "laptop",
-        "keyboard", "mouse", "remote", "scissors", "toothbrush",
-        "banana", "apple", "sandwich", "bowl", "fork", "knife", "spoon",
-        "chair", "couch", "tv", "tie", "backpack", "umbrella", "handbag",
-        "wine glass", "fork", "knife", "spoon", "bowl"
-    };
-}
-
-/// <summary>
 /// 动作模板目录（覆盖引擎全部 11 种 method，按大白话分组）
 /// </summary>
 public static class SopActionCatalog

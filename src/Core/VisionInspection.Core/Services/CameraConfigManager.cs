@@ -33,16 +33,9 @@ namespace VisionInspection.Core.Services
 
         private CameraConfigManager()
         {
-            // 配置文件路径：程序运行目录下的 configs/camera_config.json
-            var appDirectory = AppDomain.CurrentDomain.BaseDirectory;
-            var configDirectory = Path.Combine(appDirectory, "configs");
-            
-            // 确保配置目录存在
-            if (!Directory.Exists(configDirectory))
-            {
-                Directory.CreateDirectory(configDirectory);
-            }
-            
+            // 配置文件路径统一由 AppPaths 解析（程序根 → 仓库根）
+            var configDirectory = AppPaths.ResolveConfigDir();
+            Directory.CreateDirectory(configDirectory);
             _configFilePath = Path.Combine(configDirectory, "camera_config.json");
         }
 

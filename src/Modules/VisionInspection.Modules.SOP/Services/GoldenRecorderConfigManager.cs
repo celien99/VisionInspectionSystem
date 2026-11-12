@@ -1,3 +1,4 @@
+using VisionInspection.Core.Services;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -12,8 +13,7 @@ public static class GoldenRecorderConfigManager
     private static readonly object _lock = new();
     private static GoldenRecorderConfig? _cached;
 
-    private static string ConfigPath => System.IO.Path.Combine(
-        AppContext.BaseDirectory, "configs", "golden_recorder.json");
+    private static string ConfigPath => AppPaths.Config("golden_recorder.json");
 
     public static GoldenRecorderConfig Load()
     {

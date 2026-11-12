@@ -20,11 +20,6 @@ public interface IDetectionModule : IDisposable
     ModuleState State { get; }
 
     /// <summary>
-    /// 模块元数据（用于UI展示）
-    /// </summary>
-    ModuleMetadata Metadata { get; }
-
-    /// <summary>
     /// 初始化模块
     /// </summary>
     Task InitializeAsync(IConfiguration config, ICameraService cameraService);
@@ -38,11 +33,6 @@ public interface IDetectionModule : IDisposable
     /// 关闭模块
     /// </summary>
     Task ShutdownAsync();
-
-    /// <summary>
-    /// 获取可视化结果（用于UI叠加显示）
-    /// </summary>
-    VisualOverlay GetVisualOverlay();
 }
 
 /// <summary>
@@ -55,17 +45,4 @@ public enum ModuleState
     Ready,
     Processing,
     Error
-}
-
-/// <summary>
-/// 模块元数据
-/// </summary>
-public class ModuleMetadata
-{
-    public string DisplayName { get; set; } = "";
-    public string Description { get; set; } = "";
-    public string Version { get; set; } = "1.0.0";
-    public string Author { get; set; } = "";
-    public List<string> RequiredCameras { get; set; } = new();
-    public Dictionary<string, string> ConfigSchema { get; set; } = new();
 }

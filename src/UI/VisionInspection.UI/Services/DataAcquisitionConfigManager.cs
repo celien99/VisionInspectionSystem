@@ -1,3 +1,4 @@
+using VisionInspection.Core.Services;
 using System;
 using System.IO;
 using System.Text.Json;
@@ -22,7 +23,7 @@ namespace VisionInspection.UI.Services
 
         private DataAcquisitionConfigManager()
         {
-            _configPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "configs", "data_acquisition.json");
+            _configPath = AppPaths.Config("data_acquisition.json");
             Load();
         }
 

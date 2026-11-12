@@ -6,11 +6,31 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
+  <!--
+    推理层唯一依赖 YoloDotNet 的工程。
+    v4 起 YoloDotNet 拆成「核心包 + 执行提供程序包」，API 与仓库原先引用的本地 master 分支一致：
+      YoloOptions / RunObjectDetection / RunPoseEstimation / InitializeVideo ...
+
+    EP 只能二选一（见仓库根 Directory.Build.props）：
+      dotnet build               → CPU（默认，开箱即用）
+      dotnet build -p:YoloEp=Cuda → CUDA（需 CUDA 12.x + cuDNN 9.x）
+    OnnxRuntime 由 EP 包传递引入，不要在别处再单独引用 Microsoft.ML.OnnxRuntime，否则原生 DLL 冲突。
+  -->
+  <ItemGroup>
+    <PackageReference Include="SkiaSharp" Version="3.119.1" />
+    <PackageReference Include="YoloDotNet" Version="4.2.0" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(YoloEp)' == 'Cuda'">
+    <PackageReference Include="YoloDotNet.ExecutionProvider.Cuda" Version="1.1.0" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(YoloEp)' != 'Cuda'">
+    <PackageReference Include="YoloDotNet.ExecutionProvider.Cpu" Version="1.1.0" />
+  </ItemGroup>
+
   <ItemGroup>
     <ProjectReference Include="..\..\Core\VisionInspection.Core\VisionInspection.Core.csproj" />
-    <ProjectReference Include="..\..\..\..\YoloDotNet\YoloDotNet.csproj" />
-    <ProjectReference Include="..\..\..\..\YoloDotNet.ExecutionProvider.Cuda\YoloDotNet.ExecutionProvider.Cuda.csproj" />
-    <ProjectReference Include="..\..\..\..\YoloDotNet.ExecutionProvider.Cpu\YoloDotNet.ExecutionProvider.Cpu.csproj" />
   </ItemGroup>
 
 </Project>

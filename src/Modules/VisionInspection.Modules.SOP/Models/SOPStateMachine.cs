@@ -1,8 +1,8 @@
+using VisionInspection.Core.Services;
 using System.Diagnostics;
 using SkiaSharp;
 using VisionInspection.Core.Models;
 using VisionInspection.Modules.SOP.Services;
-using YoloDotNet.Models;
 
 namespace VisionInspection.Modules.SOP.Models;
 
@@ -74,7 +74,7 @@ public class SOPStateMachine
         StepChanged?.Invoke(this, new StepChangedEventArgs(0, CurrentStepId, workflow.Steps.FirstOrDefault(s => s.StepId == CurrentStepId)?.StepName ?? ""));
     }
 
-    public void ProcessFrame(List<ObjectDetection> detections, HandPoseEstimationResult? handResult, DateTime timestamp)
+    public void ProcessFrame(List<DetectedObject> detections, HandPoseEstimationResult? handResult, DateTime timestamp)
     {
         if (_workflow == null || CurrentState != SOPExecutionState.Running)
             return;
@@ -116,7 +116,7 @@ public class SOPStateMachine
     /// 失败时写一行调试到文件，帮助定位 hand_action 不通过的真实原因。
     /// 只在条件未通过时打印，频率 ≈ 一行/帧 × 步骤数，不会爆量。
     /// </summary>
-    private static void EmitFailureDebug(SOPStep step, ConditionEvaluationResult evaluation, List<ObjectDetection> detections, HandPoseEstimationResult? handResult)
+    private static void EmitFailureDebug(SOPStep step, ConditionEvaluationResult evaluation, List<DetectedObject> detections, HandPoseEstimationResult? handResult)
     {
         try
         {
@@ -128,32 +128,16 @@ public class SOPStateMachine
             string detSummary = detections.Count == 0
                 ? "none"
                 : string.Join("|", detections.Select(d =>
-                    $"{d.Label?.Name ?? "?"}({d.Confidence:F2})"));
+                    $"{d.ClassName}({d.Confidence:F2})"));
             string condSummary = evaluation.FailedCondition == null
                 ? "?"
                 : $"{evaluation.FailedCondition.Type}(target='{evaluation.FailedCondition.TargetObject}',minConf={evaluation.FailedCondition.MinConfidence:F2},params=[{string.Join(",", evaluation.FailedCondition.Parameters.Select(kv => $"{kv.Key}={kv.Value}"))}])";
             var line = $"[{DateTime.Now:HH:mm:ss.fff}] [SOP-Fail] step='{step.StepName}' cond={condSummary} | reason={evaluation.Message} | dets={detSummary} | hands={handSummary}";
             Console.WriteLine(line);
             Debug.WriteLine(line);
-            File.AppendAllText("sop_module_debug.log", line + Environment.NewLine);
+            File.AppendAllText(AppPaths.Log("sop_module_debug.log"), line + Environment.NewLine);
         }
         catch { }
-    }
-
-    public void Pause()
-    {
-        if (CurrentState == SOPExecutionState.Running)
-        {
-            ChangeState(SOPExecutionState.Paused);
-        }
-    }
-
-    public void Resume()
-    {
-        if (CurrentState == SOPExecutionState.Paused)
-        {
-            ChangeState(SOPExecutionState.Running);
-        }
     }
 
     public void Reset()
@@ -177,17 +161,9 @@ public class SOPStateMachine
         CurrentStepId = 0;
     }
 
-    public void ForceCompleteStep()
-    {
-        if (_workflow != null && CurrentState == SOPExecutionState.Running)
-        {
-            CompleteCurrentStep(DateTime.Now);
-        }
-    }
-
     private int _nextTrackId = 0;
 
-    private void UpdateTrackedObjects(List<ObjectDetection> detections, DateTime timestamp)
+    private void UpdateTrackedObjects(List<DetectedObject> detections, DateTime timestamp)
     {
         var matchedKeys = new HashSet<string>();
         var matchedDetections = new HashSet<int>();
@@ -196,7 +172,7 @@ public class SOPStateMachine
         for (int i = 0; i < detections.Count; i++)
         {
             var detection = detections[i];
-            var labelName = detection.Label?.Name ?? "unknown";
+            var labelName = detection.ClassName;
 
             string? bestKey = null;
             float bestIOU = 0.3f; // IOU 阈值，低于此值视为新对象
@@ -206,7 +182,7 @@ public class SOPStateMachine
                 if (matchedKeys.Contains(key)) continue;
                 if (!tracked.ClassName.Equals(labelName, StringComparison.OrdinalIgnoreCase)) continue;
 
-                float iou = CalculateIOU(tracked.BoundingBox, detection.BoundingBox);
+                float iou = CalculateIOU(tracked.BoundingBox, detection.PixelBoundingBox);
                 if (iou > bestIOU)
                 {
                     bestIOU = iou;
@@ -217,7 +193,7 @@ public class SOPStateMachine
             if (bestKey != null)
             {
                 // 匹配成功，更新位置
-                _trackedObjects[bestKey].Update(detection.BoundingBox, timestamp);
+                _trackedObjects[bestKey].Update(detection.PixelBoundingBox, timestamp);
                 matchedKeys.Add(bestKey);
                 matchedDetections.Add(i);
             }
@@ -229,9 +205,9 @@ public class SOPStateMachine
             if (matchedDetections.Contains(i)) continue;
 
             var detection = detections[i];
-            var labelName = detection.Label?.Name ?? "unknown";
+            var labelName = detection.ClassName;
             var newKey = $"{labelName}_{_nextTrackId++}";
-            _trackedObjects[newKey] = new TrackedObject(labelName, detection.BoundingBox, timestamp);
+            _trackedObjects[newKey] = new TrackedObject(labelName, detection.PixelBoundingBox, timestamp);
         }
 
         // 清理过期跟踪（2秒未更新的对象视为离开画面）
@@ -325,24 +301,6 @@ public class SOPStateMachine
     private void RecordViolation(ViolationRecord violation)
     {
         _violations.Add(violation);
-    }
-
-    /// <summary>
-    /// 尝试完成当前步骤（公开方法供外部调用）
-    /// </summary>
-    public void TryCompleteCurrentStep(DateTime timestamp)
-    {
-        if (CurrentState != SOPExecutionState.Running) return;
-        CompleteCurrentStep(timestamp);
-    }
-
-    /// <summary>
-    /// 报告违规（公开方法供外部调用）
-    /// </summary>
-    public void ReportViolation(ViolationRecord violation)
-    {
-        RecordViolation(violation);
-        ViolationDetected?.Invoke(this, new ViolationEventArgs(violation));
     }
 
     private void ChangeState(SOPExecutionState newState)

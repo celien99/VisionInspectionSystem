@@ -20,7 +20,6 @@ using VisionInspection.Modules.SOP;
 using VisionInspection.Modules.SOP.Models;
 using VisionInspection.Modules.SOP.Services;
 using VisionInspection.UI.Services;
-using YoloDotNet.Models;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
@@ -52,7 +51,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         float SmoothAlpha, float SkeletonConfidenceThreshold)? _savedSOPDetectionConfig;
 
     private static readonly object _logLock = new();
-    private const string _debugLogPath = "sop_frame_debug.log";
+    private static readonly string _debugLogPath = AppPaths.Log("sop_frame_debug.log");
 
     private void DebugLog(string message)
     {
@@ -123,7 +122,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     private readonly Dictionary<string, SKBitmap> _lastInferenceFrames = new();
 
     /// <summary>每路相机最近一次的检测结果（供对应画面叠加渲染）</summary>
-    private readonly Dictionary<string, List<ObjectDetection>> _perCameraLastResults = new();
+    private readonly Dictionary<string, List<DetectedObject>> _perCameraLastResults = new();
 
     /// <summary>跨相机协同规则评估器</summary>
     private readonly CrossCameraEvaluator _crossEvaluator = new();
@@ -312,7 +311,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
                 // ① 该相机的检测框
                 if (_perCameraLastResults.TryGetValue(e.CameraId, out var cachedDets) && cachedDets.Count > 0)
                 {
-                    DrawObjectDetectionBoxes(canvas, cachedDets);
+                    DrawDetectedObjects(canvas, cachedDets, 18f);
                 }
 
                 // ② 手部骨架：画到产生手部结果的相机画面上（跟随当前步骤相机）
@@ -453,45 +452,6 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         CameraModelText = models.Count > 0 ? $"📷 {string.Join(" | ", models)}" : "";
     }
 
-    /// <summary>
-    /// 绘制通用检测框（供多相机画面叠加：label + 置信度，颜色按置信度分级）
-    /// </summary>
-    private static void DrawObjectDetectionBoxes(SKCanvas canvas, List<ObjectDetection> detections)
-    {
-        foreach (var det in detections)
-        {
-            var label = det.Label?.Name ?? "?";
-            var conf = (float)det.Confidence;
-            var box = det.BoundingBox;
-
-            var color = conf > 0.7 ? SKColors.LimeGreen : conf > 0.5 ? SKColors.Yellow : SKColors.Orange;
-
-            using var boxPaint = new SKPaint
-            {
-                Color = color,
-                StrokeWidth = 3,
-                IsAntialias = true,
-                Style = SKPaintStyle.Stroke
-            };
-            canvas.DrawRect(box, boxPaint);
-
-            var labelText = $"{label} {conf * 100:F0}%";
-            using var textPaint = new SKPaint
-            {
-                Color = SKColors.White,
-                TextSize = 18,
-                IsAntialias = true,
-                FakeBoldText = true
-            };
-            using var bgPaint = new SKPaint { Color = color.WithAlpha(200), Style = SKPaintStyle.Fill };
-
-            var textBounds = new SKRect();
-            textPaint.MeasureText(labelText, ref textBounds);
-            canvas.DrawRect(box.Left, box.Top - textBounds.Height - 6, textBounds.Width + 8, textBounds.Height + 6, bgPaint);
-            canvas.DrawText(labelText, box.Left + 4, box.Top - 4, textPaint);
-        }
-    }
-    
     /// <summary>
     /// 启动推理工作线程（多相机批量：每 tick 收集各相机最新帧一次性推理）
     /// </summary>
@@ -925,22 +885,8 @@ public partial class MainViewModel : ViewModelBase, IDisposable
                     CurrentStep = sopResult.StepResults.CurrentStep;
                     TotalSteps = sopResult.StepResults.TotalSteps;
 
-                    // 更新检测结果列表
-                    DetectionResults = sopResult.Detections
-                        .Select(d => new DetectedObject
-                        {
-                            ClassName = d.Label?.Name ?? "unknown",
-                            Confidence = (float)d.Confidence,
-                            BoundingBox = new float[]
-                            {
-                                d.BoundingBox.Left,
-                                d.BoundingBox.Top,
-                                d.BoundingBox.Width,
-                                d.BoundingBox.Height
-                            },
-                            PixelBoundingBox = d.BoundingBox
-                        })
-                        .ToList();
+                    // 更新检测结果列表（SOP 输出已是领域类型，拷一份防止后续被替换）
+                    DetectionResults = sopResult.Detections.ToList();
 
                     HighConfidenceCount = DetectionResults.Count(o => o.Confidence >= 0.5);
 
@@ -1058,17 +1004,17 @@ public partial class MainViewModel : ViewModelBase, IDisposable
                 !string.IsNullOrEmpty(name) && names.Contains(name, StringComparer.OrdinalIgnoreCase);
 
             var persons = sopResult.Detections
-                .Where(d => d.Confidence >= cfg.MinConfidence && IsClass(d.Label?.Name, personNames))
+                .Where(d => d.Confidence >= cfg.MinConfidence && IsClass(d.ClassName, personNames))
                 .ToList();
             var helmets = sopResult.Detections
-                .Where(d => d.Confidence >= cfg.MinConfidence && IsClass(d.Label?.Name, helmetNames))
+                .Where(d => d.Confidence >= cfg.MinConfidence && IsClass(d.ClassName, helmetNames))
                 .ToList();
 
             bool violation = false;
             string detail = "";
             foreach (var person in persons)
             {
-                var pBox = person.BoundingBox;
+                var pBox = person.PixelBoundingBox;
                 var centerX = pBox.MidX;
                 var centerY = pBox.MidY;
 
@@ -1086,7 +1032,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
 
                     var hasHelmet = helmets.Any(h =>
                     {
-                        var hBox = h.BoundingBox;
+                        var hBox = h.PixelBoundingBox;
                         return new SKRect(hBox.Left, hBox.Top, hBox.Right, hBox.Bottom)
                             .IntersectsWith(headRect);
                     });
@@ -1094,7 +1040,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
                     if (!hasHelmet)
                     {
                         violation = true;
-                        detail = $"区域[{zone.Name}] 出现未戴安全帽的人(person={person.Label?.Name}, conf={person.Confidence:F2})";
+                        detail = $"区域[{zone.Name}] 出现未戴安全帽的人(person={person.ClassName}, conf={person.Confidence:F2})";
                         break;
                     }
                 }
@@ -1683,7 +1629,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     {
         try
         {
-            const string path = "configs/sop_config.json";
+            var path = AppPaths.Config("sop_config.json");
             if (!File.Exists(path)) return;
             var text = File.ReadAllText(path);
             var node = JsonNode.Parse(text);
@@ -1710,7 +1656,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     [RelayCommand]
     public async Task InitializeSOPModuleAsync()
     {
-        var logFile = "sop_init_debug.log";
+        var logFile = AppPaths.Log("sop_init_debug.log");
         try
         {
             File.AppendAllText(logFile, $"{DateTime.Now:HH:mm:ss.fff} [MainViewModel] 开始初始化SOP模块...\n");
@@ -1718,73 +1664,30 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             IsBusy = true;
             Status = "初始化SOP模块...";
 
-            // 检查配置文件是否存在
-            string configPath = "configs/sop_config.json";
+            // 配置文件位置交给 AppPaths（程序根 → 仓库根，从 bin 启动也能找到 configs/）
+            var configPath = AppPaths.Config("sop_config.json");
             if (!File.Exists(configPath))
             {
-                File.AppendAllText(logFile, $"{DateTime.Now:HH:mm:ss.fff} [MainViewModel] 配置文件不存在，使用默认配置\n");
-                
-                // 尝试使用备选配置（内存配置）
-                Status = "使用默认配置初始化SOP模块...";
-                var defaultConfig = new ConfigurationBuilder()
-                    .AddInMemoryCollection(new Dictionary<string, string?>
-                    {
-                        ["SOPModule:ModelPath"] = "yolo_models/yolov8s.onnx",
-                        ["SOPModule:UseGpu"] = "false",
-                        ["SOPModule:ConfidenceThreshold"] = "0.6",
-                        ["SOPModule:IouThreshold"] = "0.45",
-                        ["SOPModule:PoseEstimation:Enabled"] = "true",
-                        ["SOPModule:PoseEstimation:ModelPath"] = "yolo_models/yolov8s-pose.onnx",
-                        ["SOPModule:HandPoseEstimation:ModelPath"] = "models",
-                        ["SOPModule:HandPoseEstimation:ConfidenceThreshold"] = "0.5",
-                        ["SOPModule:HandPoseEstimation:MaxNumHands"] = "2",
-                        ["SOPModule:HandPoseEstimation:UseGpu"] = "true"
-                    })
-                    .Build();
+                File.AppendAllText(logFile, $"{DateTime.Now:HH:mm:ss.fff} [MainViewModel] 未找到 {configPath}，使用代码内默认值\n");
+                Status = "未找到 sop_config.json，使用默认配置";
+            }
 
-                File.AppendAllText(logFile, $"{DateTime.Now:HH:mm:ss.fff} [MainViewModel] 创建SOPModule实例...\n");
-                _sopModule = new SOPModule();
-                
-                File.AppendAllText(logFile, $"{DateTime.Now:HH:mm:ss.fff} [MainViewModel] 调用InitializeAsync...\n");
-                await _sopModule.InitializeAsync(defaultConfig, _cameraManager.CurrentCameraService!);
-                File.AppendAllText(logFile, $"{DateTime.Now:HH:mm:ss.fff} [MainViewModel] InitializeAsync完成，State={_sopModule.State}\n");
-                AttachSopModuleEvents(_sopModule);
-                _sopModule.CurrentOperator = _currentOperator;
+            _sopModule = new SOPModule();
+            await _sopModule.InitializeAsync(BuildSopConfig(), _cameraManager.CurrentCameraService!);
+            AttachSopModuleEvents(_sopModule);
+            _sopModule.CurrentOperator = _currentOperator;
+
+            // 配方：优先上次使用的（configs/last_recipe.json）；没有就等操作员在「SOP」页选择。
+            // 原先这里写死加载 sop_phone_usage.yaml + phone_usage_regions.json，换产品必须改代码。
+            var recipe = RecipeFile.LoadLast();
+            if (recipe != null)
+            {
+                Status = $"加载配方 {Path.GetFileNameWithoutExtension(recipe)}...";
+                _sopModule.StartWorkflowFromYaml(recipe);
             }
             else
             {
-                // 使用配置文件，但添加手部检测配置
-                var config = new ConfigurationBuilder()
-                    .AddJsonFile(configPath, optional: true)
-                    .AddInMemoryCollection(new Dictionary<string, string?>
-                    {
-                        ["SOPModule:HandPoseEstimation:ModelPath"] = "models",
-                        ["SOPModule:HandPoseEstimation:ConfidenceThreshold"] = "0.5",
-                        ["SOPModule:HandPoseEstimation:MaxNumHands"] = "2",
-                        ["SOPModule:HandPoseEstimation:UseGpu"] = "true"
-                    })
-                    .Build();
-
-                _sopModule = new SOPModule();
-                await _sopModule.InitializeAsync(config, _cameraManager.CurrentCameraService!);
-                AttachSopModuleEvents(_sopModule);
-                _sopModule.CurrentOperator = _currentOperator;
-            }
-
-            // 加载区域配置（如果存在）
-            string regionConfigPath = "configs/sop/regions/phone_usage_regions.json";
-            if (File.Exists(regionConfigPath))
-            {
-                Status = "加载区域配置...";
-                // 区域配置会在SOPDetectionStarter中加载，这里仅检查存在性
-            }
-
-            // 加载SOP流程配置（如果存在）
-            string workflowPath = "configs/sop/sop_phone_usage.yaml";
-            if (File.Exists(workflowPath))
-            {
-                Status = "加载SOP流程配置...";
-                _sopModule.StartWorkflowFromYaml(workflowPath);
+                Status = "SOP模块已就绪，请在「SOP」页选择产品配方";
             }
 
             SopStatus = "SOP模块初始化成功";
@@ -1807,6 +1710,15 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             IsBusy = false;
         }
     }
+
+    /// <summary>
+    /// 构建 SOP 模块配置：唯一来源是 configs/sop_config.json（缺失时为空配置，
+    /// 由 <see cref="SOPModule"/> 内部默认值兜底）。UI 不再用 AddInMemoryCollection 覆盖手部参数。
+    /// </summary>
+    private static IConfigurationRoot BuildSopConfig()
+        => new ConfigurationBuilder()
+            .AddJsonFile(AppPaths.Config("sop_config.json"), optional: true)
+            .Build();
 
     [RelayCommand]
     public async Task RunSOPDetectionAsync()
@@ -1894,20 +1806,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             // 2. 初始化 SOP 模块（如果还没初始化）
             if (_sopModule == null)
             {
-                var config = new ConfigurationBuilder()
-                    .AddInMemoryCollection(new Dictionary<string, string?>
-                    {
-                        ["SOPModule:ModelPath"] = "yolo_models/yolov8s.onnx",
-                        ["SOPModule:UseGpu"] = "true",
-                        ["SOPModule:ConfidenceThreshold"] = "0.6",
-                        ["SOPModule:IouThreshold"] = "0.45",
-                        ["SOPModule:PoseEstimation:Enabled"] = "true",
-                        ["SOPModule:HandPoseEstimation:ModelPath"] = "models",
-                        ["SOPModule:HandPoseEstimation:ConfidenceThreshold"] = "0.5",
-                        ["SOPModule:HandPoseEstimation:MaxNumHands"] = "2",
-                        ["SOPModule:HandPoseEstimation:UseGpu"] = "true"
-                    })
-                    .Build();
+                var config = BuildSopConfig();
 
                 _sopModule = new SOPModule();
                 await _sopModule.InitializeAsync(config, _cameraManager.CurrentCameraService!);
@@ -2199,36 +2098,12 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
-    /// 定位 ok.wav / ng.wav：优先程序运行目录，其次从程序目录向上逐层查找
-    /// （音频文件一般放在项目根目录，运行时工作目录可能是 bin/Debug/...）。
+    /// 定位 ok.wav / ng.wav：构建时已复制到输出目录；开发期由 AppPaths 从程序目录向上找到仓库根。
     /// </summary>
     private void EnsureSopAudioPaths()
     {
-        if (_okWavPath != null && _ngWavPath != null) return;
-
-        var roots = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-        {
-            AppContext.BaseDirectory,
-            AppDomain.CurrentDomain.BaseDirectory,
-            Directory.GetCurrentDirectory()
-        };
-
-        foreach (var root in roots)
-        {
-            var dir = root;
-            for (int i = 0; i < 8 && !string.IsNullOrEmpty(dir); i++)
-            {
-                TryResolveAudio(ref _okWavPath, Path.Combine(dir, "ok.wav"));
-                TryResolveAudio(ref _ngWavPath, Path.Combine(dir, "ng.wav"));
-                if (_okWavPath != null && _ngWavPath != null) return;
-                dir = Path.GetDirectoryName(dir);
-            }
-        }
-    }
-
-    private static void TryResolveAudio(ref string? store, string path)
-    {
-        if (store == null && File.Exists(path)) store = path;
+        _okWavPath ??= AppPaths.FindFile("ok.wav");
+        _ngWavPath ??= AppPaths.FindFile("ng.wav");
     }
 
     /// <summary>
@@ -2770,8 +2645,8 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     }
 
     /// <summary>
-    /// 把 YoloDotNet 的位打包像素掩膜解包为彩色半透明 SKBitmap（尺寸 = 边界框宽高）。
-    /// 位序与 YoloDotNet 一致：byteIndex = i&gt;&gt;3, bitIndex = i &amp; 7。
+    /// 把位打包的像素掩膜解包为彩色半透明 SKBitmap（尺寸 = 边界框宽高）。
+    /// 位序：byteIndex = i&gt;&gt;3, bitIndex = i &amp; 7（沿用原 YoloDotNet 输出格式）。
     /// </summary>
     private unsafe SKBitmap UnpackSegmentationMask(byte[] packed, int w, int h, SKColor color)
     {

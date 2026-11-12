@@ -16,20 +16,7 @@ public static class SopRegionLibrary
     /// <summary>
     /// 从运行时基目录向上遍历，定位 configs/sop 目录（与模型搜索同理，兼容调试/发布不同深度）
     /// </summary>
-    public static string? ResolveSopDir()
-    {
-        var baseDir = AppDomain.CurrentDomain.BaseDirectory;
-        var cur = baseDir;
-        for (int i = 0; i < 8; i++)
-        {
-            var cand = Path.Combine(cur, "configs", "sop");
-            if (Directory.Exists(cand)) return cand;
-            var parent = Path.GetDirectoryName(cur);
-            if (parent == null) break;
-            cur = parent;
-        }
-        return Path.Combine(baseDir, "configs", "sop");
-    }
+    public static string? ResolveSopDir() => VisionInspection.Core.Services.RecipeFile.SopDir;
 
     /// <summary>
     /// 列出 configs/sop 下所有 SOP 文件（作为"区域来源"候选）

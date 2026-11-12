@@ -1,6 +1,5 @@
 using SkiaSharp;
 using VisionInspection.Core.Services;
-using YoloDotNet.Models;
 using KeyPoint = VisionInspection.Core.Services.KeyPoint;
 
 namespace VisionInspection.UI.Services;
@@ -70,22 +69,6 @@ public class DetectionTrackSmoother
     }
 
     /// <summary>
-    /// 用新一帧检测结果更新轨迹（SOP 路径，输入 YoloDotNet 的 ObjectDetection）。<b>仅在推理产生新结果时调用</b>。
-    /// </summary>
-    /// <param name="newDetections">本帧 YOLO 原始检测结果</param>
-    /// <param name="minConfidence">低于此置信度的检测直接丢弃</param>
-    public void Update(List<ObjectDetection> newDetections, double minConfidence = 0.3)
-    {
-        var news = newDetections
-            .Where(d => d.Confidence >= minConfidence && !d.BoundingBox.IsEmpty)
-            .Select(d => (label: d.Label?.Name ?? "unknown",
-                          box: new SKRect(d.BoundingBox.Left, d.BoundingBox.Top, d.BoundingBox.Right, d.BoundingBox.Bottom),
-                          conf: (double)d.Confidence, raw: (object)d))
-            .ToList();
-        UpdateInternal(news);
-    }
-
-    /// <summary>
     /// 用新一帧检测结果更新轨迹（实时检测路径，输入自定义 DetectedObject；保留关键点/掩膜并平滑关键点）。<b>仅在推理产生新结果时调用</b>。
     /// </summary>
     /// <param name="newDetections">本帧 YOLO 原始检测结果</param>
@@ -94,7 +77,7 @@ public class DetectionTrackSmoother
     {
         var news = newDetections
             .Where(d => d.Confidence >= minConfidence && d.PixelBoundingBox.Width > 0 && d.PixelBoundingBox.Height > 0)
-            .Select(d => (label: d.ClassName ?? "unknown",
+            .Select(d => (label: string.IsNullOrEmpty(d.ClassName) ? "unknown" : d.ClassName,
                           box: new SKRect(d.PixelBoundingBox.Left, d.PixelBoundingBox.Top, d.PixelBoundingBox.Right, d.PixelBoundingBox.Bottom),
                           conf: (double)d.Confidence,
                           raw: (object)d))
