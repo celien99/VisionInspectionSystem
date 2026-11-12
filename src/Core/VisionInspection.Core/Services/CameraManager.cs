@@ -420,24 +420,6 @@ namespace VisionInspection.Core.Services
         }
 
         /// <summary>
-        /// 连接相机（旧 API：主槽位）
-        /// </summary>
-        public async Task<bool> ConnectAsync(CameraInfo camera)
-        {
-            var slot = GetSlot(PrimaryCameraId);
-            if (slot?.Service == null) return false;
-
-            slot.CameraInfo = camera;
-            var ok = await slot.Service.ConnectAsync(camera);
-            if (ok)
-            {
-                slot.IsConnected = true;
-                NotifySlotStatus(slot);
-            }
-            return ok;
-        }
-
-        /// <summary>
         /// 断开相机连接（旧 API：主槽位）
         /// </summary>
         public void Disconnect()

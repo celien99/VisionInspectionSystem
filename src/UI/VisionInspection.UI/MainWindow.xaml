@@ -59,6 +59,7 @@
             </MenuItem>
             
             <MenuItem Header="SOP">
+                <MenuItem Header="🔍 对当前画面判定一次" Command="{Binding RunSOPDetectionCommand}"/>
                 <MenuItem Header="▶️ 启动SOP实时检测" Command="{Binding StartSOPDetectionCommand}"/>
                 <MenuItem Header="⏹️ 停止SOP检测" Command="{Binding StopSOPDetectionCommand}"/>
                 <MenuItem Header="🔄 重置SOP工作流" Command="{Binding ResetSOPWorkflowCommand}"/>

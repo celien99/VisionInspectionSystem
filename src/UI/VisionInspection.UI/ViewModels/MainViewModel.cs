@@ -277,7 +277,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         if (System.Windows.Application.Current == null || _isDisposed)
             return;
 
-        var skBitmap = ConvertCameraImageToSKBitmap(e.ImageData);
+        var skBitmap = CameraFrameConverter.ToSKBitmap(e.ImageData);
         if (skBitmap == null) return;
 
         bool isPrimary = string.Equals(e.CameraId, CameraManager.PrimaryCameraId, StringComparison.OrdinalIgnoreCase);
@@ -1474,88 +1474,6 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         });
     }
     
-    /// <summary>
-    /// 将相机图像数据转换为 SKBitmap
-    /// </summary>
-    private SKBitmap? ConvertCameraImageToSKBitmap(CameraImageData imageData)
-    {
-        try
-        {
-            if (imageData?.Data == null || imageData.Data.Length == 0)
-                return null;
-
-            var info = new SKImageInfo(
-                imageData.Width, 
-                imageData.Height, 
-                SKColorType.Bgra8888);
-            
-            var bitmap = new SKBitmap(info);
-            
-            if (imageData.IsColor && imageData.Channels == 3)
-            {
-                // RGB24 -> BGRA32 转换
-                ConvertRgb24ToBgra32(imageData.Data, bitmap, imageData.Width, imageData.Height);
-            }
-            else
-            {
-                // 灰度图像，需要转换为 BGRA
-                ConvertGray8ToBgra32(imageData.Data, bitmap, imageData.Width, imageData.Height);
-            }
-            
-            return bitmap;
-        }
-        catch (Exception ex)
-        {
-            System.Diagnostics.Debug.WriteLine($"转换图像到SKBitmap异常：{ex.Message}");
-            return null;
-        }
-    }
-
-    /// <summary>
-    /// 将 RGB24 数据转换为 BGRA32
-    /// </summary>
-    private unsafe void ConvertRgb24ToBgra32(byte[] rgbData, SKBitmap bitmap, int width, int height)
-    {
-        byte* ptr = (byte*)bitmap.GetPixels().ToPointer();
-        for (int y = 0; y < height; y++)
-        {
-            for (int x = 0; x < width; x++)
-            {
-                int srcIndex = (y * width + x) * 3;
-                int dstIndex = (y * width + x) * 4;
-                
-                // RGB -> BGRA
-                ptr[dstIndex] = rgbData[srcIndex + 2];     // B
-                ptr[dstIndex + 1] = rgbData[srcIndex + 1]; // G
-                ptr[dstIndex + 2] = rgbData[srcIndex];     // R
-                ptr[dstIndex + 3] = 255;                   // A
-            }
-        }
-    }
-
-    /// <summary>
-    /// 将 Gray8 数据转换为 BGRA32
-    /// </summary>
-    private unsafe void ConvertGray8ToBgra32(byte[] grayData, SKBitmap bitmap, int width, int height)
-    {
-        byte* ptr = (byte*)bitmap.GetPixels().ToPointer();
-        for (int y = 0; y < height; y++)
-        {
-            for (int x = 0; x < width; x++)
-            {
-                int srcIndex = y * width + x;
-                int dstIndex = srcIndex * 4;
-                byte gray = grayData[srcIndex];
-                
-                // Gray -> BGRA
-                ptr[dstIndex] = gray;     // B
-                ptr[dstIndex + 1] = gray; // G
-                ptr[dstIndex + 2] = gray; // R
-                ptr[dstIndex + 3] = 255;  // A
-            }
-        }
-    }
-
     private void OnDetectionError(object? sender, string e)
     {
         _lastDetectionError = e;
@@ -1720,52 +1638,73 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             .AddJsonFile(AppPaths.Config("sop_config.json"), optional: true)
             .Build();
 
+    /// <summary>
+    /// 对当前相机画面执行一次 SOP 判定（单次，不启动连续检测）。
+    /// <para>
+    /// 帧来源 = 各已连接相机槽位的最新帧；没有相机帧时明确提示，不再用合成图伪造结果。
+    /// 原实现里既调用了不带 ExtInfo 的 <c>ConnectAsync</c>（海康必失败），又用
+    /// <c>CreateTestImage()</c> 画了几个图形去跑判定，容易让人误以为相机在工作。
+    /// </para>
+    /// </summary>
     [RelayCommand]
     public async Task RunSOPDetectionAsync()
     {
+        if (_sopModule == null)
+        {
+            Status = "SOP模块未初始化";
+            return;
+        }
+
+        var frames = new Dictionary<string, CaptureFrame>();
+        var grabbed = new List<SKBitmap>();
+
         try
         {
             IsBusy = true;
             Status = "运行SOP检测...";
 
-            if (_sopModule == null)
+            foreach (var slot in _cameraManager.Slots.Where(s => s.IsConnected))
             {
-                Status = "SOP模块未初始化";
+                var bitmap = slot.LatestImageData is { } imageData
+                    ? CameraFrameConverter.ToSKBitmap(imageData)
+                    : null;
+                if (bitmap == null) continue;
+
+                grabbed.Add(bitmap);
+                frames[slot.CameraId] = new CaptureFrame
+                {
+                    CameraId = slot.CameraId,
+                    Image = bitmap,
+                    Timestamp = DateTime.Now,
+                    FrameNumber = _frameCount++
+                };
+            }
+
+            if (frames.Count == 0)
+            {
+                Status = "没有可用的相机画面：请先在「相机」窗口连接相机并开始采集";
                 return;
             }
 
-            // 连接相机
-            await _cameraManager.ConnectAsync(new CameraInfo { Id = "main_camera", Name = "主相机" });
-
-            // 捕获图像
-            var frames = new Dictionary<string, CaptureFrame>();
-            // 使用模拟图像进行测试
-            var testImage = CreateTestImage();
-            frames["main_camera"] = new CaptureFrame
-            {
-                CameraId = "main_camera",
-                Image = testImage,
-                Timestamp = DateTime.Now,
-                FrameNumber = 0
-            };
-
-            // 执行检测
             var result = await _sopModule.ProcessAsync(frames);
+            if (!result.Success)
+            {
+                // 常见：工作流未启动（"SOP未在运行状态"）、没有主相机帧
+                Status = $"SOP判定未执行：{result.ErrorMessage}";
+                return;
+            }
+
             if (result is SOPModuleResult sopResult)
             {
                 SopStatus = sopResult.StepResults.Message;
                 CurrentStep = sopResult.StepResults.CurrentStep;
                 TotalSteps = sopResult.StepResults.TotalSteps;
-
-                // 显示检测结果
-                if (frames.TryGetValue("main_camera", out var mainFrame))
-                {
-                    CurrentImage = mainFrame.Image;
-                    RoiEditorViewModel.CurrentImage = mainFrame.Image;
-                }
+                // 单次判定也要更新结果列表，否则界面看不出跑过
+                DetectionResults = sopResult.Detections.ToList();
+                HighConfidenceCount = DetectionResults.Count(o => o.Confidence >= 0.5);
             }
 
-            Status = "SOP检测完成";
+            Status = $"SOP检测完成（{frames.Count} 路相机）";
         }
         catch (Exception ex)
         {
@@ -1773,6 +1712,9 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         }
         finally
         {
+            // 帧只在本方法内使用：ProcessAsync 为同步完成（返回 Task.FromResult），
+            // 且录制器已在检测线程内编码拷贝，这里可以安全释放
+            foreach (var bmp in grabbed) bmp.Dispose();
             IsBusy = false;
         }
     }
@@ -2303,38 +2245,6 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     {
         RoiEditorViewModel.ClearAllROIsCommand.Execute(null);
         Status = "ROI已清空";
-    }
-
-    /// <summary>
-    /// 创建测试图像
-    /// </summary>
-    private SKBitmap CreateTestImage()
-    {
-        var bitmap = new SKBitmap(640, 480);
-        using var canvas = new SKCanvas(bitmap);
-        canvas.Clear(SKColors.White);
-
-        // 绘制一些测试内容
-        using var paint = new SKPaint
-        {
-            Color = SKColors.Blue,
-            StrokeWidth = 2,
-            IsAntialias = true
-        };
-
-        // 绘制矩形
-        canvas.DrawRect(100, 100, 200, 150, paint);
-
-        // 绘制圆形
-        paint.Color = SKColors.Red;
-        canvas.DrawCircle(400, 300, 80, paint);
-
-        // 绘制文本
-        paint.Color = SKColors.Black;
-        paint.TextSize = 24;
-        canvas.DrawText("SOP Test Image", 50, 50, paint);
-
-        return bitmap;
     }
 
     #region YOLO检测功能
