@@ -38,6 +38,11 @@ public class SOPModule : IDetectionModule
     private IHandPoseEstimationService? _handPoseService;
     private HandPoseEstimationResult? _lastHandPoseResult;
 
+    // 手部服务初始化失败后的重试退避：原实现每帧都重试一次（模型缺失时会反复做
+    // 文件存在性检查 + 写日志），是"检测一开就卡"的一个来源。
+    private DateTime _lastHandInitAttempt = DateTime.MinValue;
+    private const int HandInitRetrySeconds = 10;
+
     // 手部检测后端选择：Auto=MediaPipe→YOLO-pose 兜底；MediaPipe/YoloPose=强制
     // MediaPipe 为默认后端（握拳/横向手泛化好、无需额外大模型）。
     private HandDetectionBackend _handBackend = HandDetectionBackend.MediaPipe;
@@ -64,13 +69,18 @@ public class SOPModule : IDetectionModule
         Console.WriteLine(logLine);
         Debug.WriteLine(logLine);
 
-        lock (_sopLogLock)
+        // 逐帧日志限流：每秒最多 10 行写文件（Console/Debug 不限），
+        // 避免每帧多次 open/write/close 拖慢相机回调与推理线程
+        if (LogThrottle.Allow("sop_module", 10))
         {
-            try
+            lock (_sopLogLock)
             {
-                File.AppendAllText(_sopDebugLogPath, logLine + Environment.NewLine);
+                try
+                {
+                    File.AppendAllText(_sopDebugLogPath, logLine + Environment.NewLine);
+                }
+                catch { }
             }
-            catch { }
         }
     }
 
@@ -243,7 +253,16 @@ public class SOPModule : IDetectionModule
                     ModelPath = handPoseSection["ModelPath"] ?? "models",
                     ConfidenceThreshold = float.TryParse(handPoseSection["ConfidenceThreshold"], out var handConf) ? handConf : 0.5f,
                     MaxNumHands = int.TryParse(handPoseSection["MaxNumHands"], out var maxHands) ? maxHands : 2,
-                    UseGpu = bool.TryParse(handPoseSection["UseGpu"], out var handGpu) ? handGpu : true
+                    UseGpu = bool.TryParse(handPoseSection["UseGpu"], out var handGpu) ? handGpu : true,
+
+                    // 性能相关（原代码没读这几个键，配置里写了也不生效）：
+                    // InferenceInterval = 每 N 帧才推理一次，中间帧复用上一帧结果
+                    InferenceInterval = int.TryParse(handPoseSection["InferenceInterval"], out var handInterval) ? Math.Max(1, handInterval) : 1,
+                    // RotationAugmentation = 正方向检测不到时旋转 90° 再推理（最多 4 次推理，很贵）
+                    RotationAugmentation = bool.TryParse(handPoseSection["RotationAugmentation"], out var handRotate) ? handRotate : true,
+                    DetectionConfidenceThreshold = float.TryParse(handPoseSection["DetectionConfidenceThreshold"], out var handDetConf) ? handDetConf : 0.20f,
+                    SmoothWindowSize = int.TryParse(handPoseSection["SmoothWindowSize"], out var handSmoothWin) ? handSmoothWin : 1,
+                    SkeletonConfidenceThreshold = float.TryParse(handPoseSection["SkeletonConfidenceThreshold"], out var handSkelConf) ? handSkelConf : 0.3f
                 };
             }
 
@@ -920,9 +939,13 @@ public class SOPModule : IDetectionModule
     /// </summary>
     private HandPoseEstimationResult? RunHandPoseDetection(CaptureFrame frame, SOPModuleResult result, DateTime timestamp, string cameraId = "main_camera")
     {
-        // 确保服务已初始化
+        // 确保服务已初始化；失败后 10 秒内不再重试（避免每帧反复查模型文件 + 刷日志）
         if (_handPoseService == null || !_handPoseService.IsInitialized)
         {
+            if ((DateTime.Now - _lastHandInitAttempt).TotalSeconds < HandInitRetrySeconds)
+                return null;
+
+            _lastHandInitAttempt = DateTime.Now;
             try
             {
                 InitializeHandPoseEstimationAsync().GetAwaiter().GetResult();

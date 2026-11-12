@@ -10,7 +10,10 @@
       "ModelPath": "models",
       "ConfidenceThreshold": 0.3,
       "MaxNumHands": 2,
-      "UseGpu": false
+      "UseGpu": false,
+      "InferenceInterval": 2,
+      "RotationAugmentation": false,
+      "DetectionConfidenceThreshold": 0.2
     }
   }
 }

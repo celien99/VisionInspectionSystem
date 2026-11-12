@@ -61,13 +61,16 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         Console.WriteLine(logLine);
         System.Diagnostics.Debug.WriteLine(logLine);
 
-        lock (_logLock)
+        if (LogThrottle.Allow("main_vm", 10))
         {
-            try
+            lock (_logLock)
             {
-                File.AppendAllText(_debugLogPath, logLine + Environment.NewLine);
+                try
+                {
+                    File.AppendAllText(_debugLogPath, logLine + Environment.NewLine);
+                }
+                catch { }
             }
-            catch { }
         }
     }
 

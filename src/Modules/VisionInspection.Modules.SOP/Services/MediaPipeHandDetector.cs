@@ -55,16 +55,22 @@ public class MediaPipeHandDetector : IDisposable
     private readonly bool _detectRightHand;              // 是否检测右手（UI 可配置）
 
     // 日志（控制台 + 文件，便于排查"手部检测是否执行"）
+    // 注意：路径必须静态缓存——原实现在每次调用时都做 AppPaths.Log()（含 CreateDirectory），
+    // 而本类每帧会调用十几次，等于每帧十几次磁盘调用。
     private static readonly object _fileLogLock = new();
+    private static readonly string _logFile = VisionInspection.Core.Services.AppPaths.Log("sop_module_debug.log");
     private static void DebugLog(string message)
     {
         System.Diagnostics.Debug.WriteLine($"[MediaPipe] {message}");
+
+        if (!VisionInspection.Core.Services.LogThrottle.Allow("mediapipe", 10)) return;
+
         lock (_fileLogLock)
         {
             try
             {
                 System.IO.File.AppendAllText(
-                    VisionInspection.Core.Services.AppPaths.Log("sop_module_debug.log"),
+                    _logFile,
                     $"[{DateTime.Now:HH:mm:ss.fff}] [MediaPipe] {message}{Environment.NewLine}");
             }
             catch { /* 日志失败不影响检测 */ }

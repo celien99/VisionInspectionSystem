@@ -21,9 +21,12 @@ public class StepConditionEvaluator
         var line = $"[{DateTime.Now:HH:mm:ss.fff}] [StepConditionEvaluator] {msg}";
         Console.WriteLine(line);
         Debug.WriteLine(line);
-        lock (_dbgLock)
+        if (LogThrottle.Allow("sop_condition", 10))
         {
-            try { File.AppendAllText(DebugLogFile, line + Environment.NewLine); } catch { }
+            lock (_dbgLock)
+            {
+                try { File.AppendAllText(DebugLogFile, line + Environment.NewLine); } catch { }
+            }
         }
     }
 
