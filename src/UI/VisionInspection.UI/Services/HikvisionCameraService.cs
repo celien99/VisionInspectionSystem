@@ -253,6 +253,12 @@ namespace VisionInspection.UI.Services
 
                 try
                 {
+                    // 内部缓存节点数：默认 1 个时，回调偶尔抖动一下就直接丢帧（表现为"画面顿一下"）。
+                    // 设成 2：多一层缓冲，显著减少偶发丢帧，延迟只增加约 1 帧。
+                    int nodeRet = _camera.MV_CC_SetImageNodeNum_NET(2);
+                    if (nodeRet != MyCamera.MV_OK)
+                        System.Diagnostics.Debug.WriteLine($"[Hikvision] 设置缓存节点数失败: 0x{nodeRet:X}");
+
                     // 注册图像回调
                     _imageCallback = new MyCamera.cbOutputExdelegate(ImageCallbackFunc);
                     int nRet = _camera.MV_CC_RegisterImageCallBackEx_NET(_imageCallback, IntPtr.Zero);
@@ -475,6 +481,16 @@ namespace VisionInspection.UI.Services
 
                 // 设置增益为保存的值
                 _camera.MV_CC_SetFloatValue_NET("Gain", config.Gain);
+
+                // 限帧：相机默认往往跑满帧率（60fps+），而预览上限只有 25fps、SOP 判定 15~25fps，
+                // 多出来的帧只会放大"转码 + 6MB 拷贝 + GC"的压力，是掉帧的常见来源。
+                // 帧率取 camera_config.json 的 FrameRate（默认 30），设置失败不影响连接。
+                var fps = config.FrameRate > 0 ? config.FrameRate : 30f;
+                _camera.MV_CC_SetBoolValue_NET("AcquisitionFrameRateEnable", true);
+                int fpsRet = _camera.MV_CC_SetFloatValue_NET("AcquisitionFrameRate", fps);
+                System.Diagnostics.Debug.WriteLine(fpsRet == MyCamera.MV_OK
+                    ? $"[Hikvision] 采集帧率限制: {fps}fps"
+                    : $"[Hikvision] 设置采集帧率失败: 0x{fpsRet:X}（相机可能不支持限帧）");
             }
             catch (Exception ex)
             {

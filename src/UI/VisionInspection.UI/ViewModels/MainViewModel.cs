@@ -245,6 +245,15 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     private CancellationTokenSource? _inferenceCts;
     private Task? _inferenceWorkerTask;
 
+    // ===== 预览管线 =====
+    // 相机 SDK 回调线程只入队；位图转换/叠加/UI 派发在独立线程按 PreviewMaxFps 执行。
+    private const int PreviewMaxFps = 25;
+    private readonly Channel<CameraFrameEventArgs> _previewQueue = Channel.CreateBounded<CameraFrameEventArgs>(
+        new BoundedChannelOptions(1) { FullMode = BoundedChannelFullMode.DropOldest });
+    private CancellationTokenSource? _previewCts;
+    private Task? _previewWorkerTask;
+    private DateTime _lastPreviewPushedAt = DateTime.MinValue;
+
     public MainViewModel()
     {
         _roiManager = new ROIManager();
@@ -260,6 +269,9 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         _cameraManager.FrameGrabbed += OnCameraFrameGrabbed;
         _cameraManager.SlotStatusChanged += OnCameraSlotStatusChanged;
         _cameraManager.ConnectionStatusChanged += OnCameraConnectionStatusChanged;
+
+        // 预览渲染线程：与相机回调线程解耦，按上限帧率消费
+        StartPreviewWorker();
     }
 
     /// <summary>
@@ -271,10 +283,27 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     }
     
     /// <summary>
-    /// 多相机帧到达回调：按 CameraId 分发给对应画面，SOP 运行时每路克隆入推理通道。
-    /// 主相机（main_camera）额外更新 ROI 编辑画面与实时检测。
+    /// 相机帧到达回调（<b>SDK 回调线程</b>）：只把帧塞进容量 1 的预览队列，立即返回。
+    /// <para>
+    /// 原实现在这里同步做 1080p 的 RGB24→BGRA 逐像素转换（~5~10ms）、8MB 位图分配、
+    /// 叠加绘制和 UI 派发 —— 全部压在相机 SDK 回调线程上，回调一慢就开始丢帧，
+    /// 表现就是"不跑推理也掉帧"。现在转换/渲染在 <see cref="StartPreviewWorker"/> 的
+    /// 独立线程按上限帧率执行，超出的帧连转换都不做，直接丢。
+    /// </para>
     /// </summary>
     private void OnCameraFrameGrabbed(object? sender, CameraFrameEventArgs e)
+    {
+        if (System.Windows.Application.Current == null || _isDisposed) return;
+
+        // 容量 1 + DropOldest：永远只保留最新帧，积压不会拖慢采集
+        _previewQueue.Writer.TryWrite(e);
+    }
+
+    /// <summary>
+    /// 预览渲染（在预览线程执行）：位图转换 + 叠加缓存结果 + 派发 UI + 触发实时检测。
+    /// 内容与原 OnCameraFrameGrabbed 一致，只是不再占用相机回调线程。
+    /// </summary>
+    private void RenderPreview(CameraFrameEventArgs e)
     {
         // 检查应用程序是否仍在运行
         if (System.Windows.Application.Current == null || _isDisposed)
@@ -386,6 +415,37 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         {
             _ = PerformRealTimeDetectionAsync(skBitmap);
         }
+    }
+
+    /// <summary>
+    /// 启动预览渲染线程：按 <see cref="PreviewMaxFps"/> 上限消费帧，其余帧直接丢弃。
+    /// </summary>
+    private void StartPreviewWorker()
+    {
+        _previewCts = new CancellationTokenSource();
+        var token = _previewCts.Token;
+
+        _previewWorkerTask = Task.Run(async () =>
+        {
+            while (!token.IsCancellationRequested)
+            {
+                CameraFrameEventArgs frame;
+                try
+                {
+                    frame = await _previewQueue.Reader.ReadAsync(token);
+                }
+                catch (OperationCanceledException) { break; }
+                catch { continue; }
+
+                var now = DateTime.UtcNow;
+                if ((now - _lastPreviewPushedAt).TotalMilliseconds < 1000.0 / PreviewMaxFps)
+                    continue;   // 超频帧：连位图转换都不做
+
+                _lastPreviewPushedAt = now;
+                try { RenderPreview(frame); }
+                catch (Exception ex) { DebugLog($"[Preview] 渲染异常: {ex.Message}"); }
+            }
+        }, token);
     }
 
     /// <summary>
@@ -2974,6 +3034,18 @@ public partial class MainViewModel : ViewModelBase, IDisposable
                 _sopModule.StepChanged -= OnSOPStepChanged;
                 _sopModule.ViolationDetected -= OnSOPViolationDetected;
                 _sopModule.WorkflowCompleted -= OnSOPWorkflowCompleted;
+            }
+
+            // ⭐ 先停预览线程（它还会派发 UI 更新），再停相机
+            try
+            {
+                _previewCts?.Cancel();
+                _previewQueue.Writer.TryComplete();
+                _previewWorkerTask?.Wait(TimeSpan.FromSeconds(2));
+            }
+            catch (Exception)
+            {
+                // 忽略取消失败
             }
 
             // ⭐ 先停止相机抓取，避免持续产生新帧
