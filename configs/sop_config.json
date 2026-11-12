@@ -1,6 +1,6 @@
 {
   "SOPModule": {
-    "ModelPath": "models/sop_yolov8.onnx",
+    "ModelPath": "yolo_models/yolov8s.onnx",
     "UseGpu": false,
     "GpuId": 0,
     "ConfidenceThreshold": 0.6,

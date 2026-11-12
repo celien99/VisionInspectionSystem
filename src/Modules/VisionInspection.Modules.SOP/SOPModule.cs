@@ -1260,7 +1260,7 @@ public enum SOPDetectionMode
 /// </summary>
 public class SOPModuleConfig
 {
-    public string ModelPath { get; set; } = "models/sop_yolov8.onnx";
+    public string ModelPath { get; set; } = "yolo_models/yolov8s.onnx";
     public bool UseGpu { get; set; } = true;
 
     /// <summary>CUDA 设备序号（多卡机器用；来自配置或配方 model.gpu_id）。</summary>
