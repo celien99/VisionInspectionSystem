@@ -138,10 +138,16 @@
                                 <ColumnDefinition Width="80"/>
                             </Grid.ColumnDefinitions>
                             <TextBlock Grid.Column="0" Text="曝光时间" VerticalAlignment="Center"/>
-                            <Slider Grid.Column="1" x:Name="ExposureSlider" Minimum="100" Maximum="100000" Value="10000"
+                            <!-- 0~1000 是"对数位置"，不是微秒：曝光本质是对数刻度，
+                                 线性滑块在 20μs~10s 范围里拖 1% 就是几百毫秒，根本没法用。
+                                 实际曝光值由 code-behind 的 ExposureFromPosition() 映射。 -->
+                            <Slider Grid.Column="1" x:Name="ExposureSlider" Minimum="0" Maximum="1000" Value="600"
+                                    SmallChange="10" LargeChange="100"
                                     VerticalAlignment="Center" Margin="10,0" IsEnabled="False"
-                                    ValueChanged="ExposureSlider_ValueChanged"/>
-                            <TextBlock Grid.Column="2" x:Name="ExposureValueText" Text="10000 μs" VerticalAlignment="Center" HorizontalAlignment="Right"/>
+                                    ValueChanged="ExposureSlider_ValueChanged"
+                                    ToolTip="拖动调整曝光；↑/↓ 微调 10 格（约 1.1 倍）"/>
+                            <TextBlock Grid.Column="2" x:Name="ExposureValueText" Text="—" Width="80" TextAlignment="Right"
+                                       VerticalAlignment="Center" HorizontalAlignment="Right"/>
                         </Grid>
 
                         <!-- 增益 -->

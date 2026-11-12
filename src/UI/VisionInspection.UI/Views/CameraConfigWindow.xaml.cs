@@ -51,6 +51,92 @@ namespace VisionInspection.UI.Views
         private BitmapSource? _pendingFrame;
         private readonly object _frameLock = new object();
 
+        // ===== 曝光滑块（对数刻度）=====
+        // 曝光时间跨度极大（海康常见 20μs ~ 10s，50 万倍），线性滑块拖 1% 就是几百毫秒，
+        // 所以滑块位置 0~1000 表示"对数值"，实际微秒数 = min * (max/min)^(pos/1000)。
+        private const double ExposureSliderTicks = 1000.0;
+        private const double ExposureFloorUs = 20.0;       // 相机最小曝光兜底
+        private const double ExposureCeilingUs = 1_000_000; // 上限 1s：产线再长只会糊 + 明显掉帧
+        private double _exposureMinUs = ExposureFloorUs;
+        private double _exposureMaxUs = ExposureCeilingUs;
+
+        // 拖动时只在停手后下发一次，避免每个像素都发 SDK 命令 + 写配置文件
+        private DispatcherTimer? _exposureApplyTimer;
+        private double _pendingExposureUs;
+        private bool _suppressExposureChanged;
+
+        private double CurrentExposureUs => ExposureFromPosition(ExposureSlider.Value);
+
+        /// <summary>滑块位置(0~1000) → 曝光微秒数（对数映射）。</summary>
+        private double ExposureFromPosition(double position)
+        {
+            var min = Math.Max(_exposureMinUs, ExposureFloorUs);
+            var max = Math.Min(_exposureMaxUs, ExposureCeilingUs);
+            if (max <= min) return min;
+
+            var t = Math.Clamp(position / ExposureSliderTicks, 0, 1);
+            return min * Math.Pow(max / min, t);
+        }
+
+        /// <summary>曝光微秒数 → 滑块位置(0~1000)。</summary>
+        private double PositionFromExposure(double exposureUs)
+        {
+            var min = Math.Max(_exposureMinUs, ExposureFloorUs);
+            var max = Math.Min(_exposureMaxUs, ExposureCeilingUs);
+            if (max <= min) return 0;
+
+            var clamped = Math.Clamp(exposureUs, min, max);
+            return ExposureSliderTicks * Math.Log(clamped / min) / Math.Log(max / min);
+        }
+
+        /// <summary>程序设置滑块值（不触发下发/保存）。</summary>
+        private void SetExposureSliderFromUs(double exposureUs)
+        {
+            _suppressExposureChanged = true;
+            try
+            {
+                ExposureSlider.Value = PositionFromExposure(exposureUs);
+            }
+            finally
+            {
+                _suppressExposureChanged = false;
+            }
+            UpdateExposureText(exposureUs);
+        }
+
+        private void UpdateExposureText(double exposureUs)
+        {
+            if (ExposureValueText == null) return;
+            ExposureValueText.Text = exposureUs >= 1000
+                ? $"{exposureUs / 1000.0:0.##} ms"
+                : $"{exposureUs:F0} μs";
+        }
+
+        /// <summary>
+        /// 防抖下发：拖动过程中只刷新数值显示，停手 120ms 后才真正调 SDK + 落配置。
+        /// </summary>
+        private void QueueExposureApply(double exposureUs)
+        {
+            _pendingExposureUs = exposureUs;
+
+            if (_exposureApplyTimer == null)
+            {
+                _exposureApplyTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(120) };
+                _exposureApplyTimer.Tick += async (_, _) =>
+                {
+                    _exposureApplyTimer!.Stop();
+                    if (_cameraManager?.IsConnected != true) return;
+
+                    var us = _pendingExposureUs;
+                    await _cameraManager.SetExposureTimeAsync((float)us);
+                    _configManager.UpdateCameraParameters((float)us, (float)GainSlider.Value);
+                };
+            }
+
+            _exposureApplyTimer.Stop();
+            _exposureApplyTimer.Start();
+        }
+
         public CameraConfigWindow()
         {
             InitializeComponent();
@@ -181,7 +267,7 @@ namespace VisionInspection.UI.Views
                     await LoadCameraParameterRangesAsync();
                     var currentExposure = await _cameraManager.GetExposureTimeAsync();
                     var currentGain = await _cameraManager.GetGainAsync();
-                    if (currentExposure > 0) ExposureSlider.Value = currentExposure;
+                    if (currentExposure > 0) SetExposureSliderFromUs(currentExposure);
                     if (currentGain > 0) GainSlider.Value = currentGain;
                 }
 
@@ -240,19 +326,23 @@ namespace VisionInspection.UI.Views
         {
             try
             {
-                // 设置Slider的范围为保存的值
-                ExposureSlider.Minimum = _cameraConfig.ExposureTimeMin;
-                ExposureSlider.Maximum = _cameraConfig.ExposureTimeMax;
+                // 曝光用对数滑块：范围来自配置（旧配置可能是 20~10000000，这里统一收敛）
+                _exposureMinUs = Math.Max(_cameraConfig.ExposureTimeMin, ExposureFloorUs);
+                var savedMax = _cameraConfig.ExposureTimeMax > 0
+                    ? _cameraConfig.ExposureTimeMax
+                    : ExposureCeilingUs;
+                _exposureMaxUs = Math.Clamp(savedMax, _exposureMinUs * 2, ExposureCeilingUs);
+
+                ExposureSlider.Minimum = 0;
+                ExposureSlider.Maximum = ExposureSliderTicks;
+
                 GainSlider.Minimum = _cameraConfig.GainMin;
                 GainSlider.Maximum = _cameraConfig.GainMax;
-                
+
                 // 设置当前值为保存的值（仅作为初始显示）
-                ExposureSlider.Value = _cameraConfig.ExposureTime;
+                SetExposureSliderFromUs(_cameraConfig.ExposureTime);
                 GainSlider.Value = _cameraConfig.Gain;
-                
-                // 更新显示文本
-                if (ExposureValueText != null)
-                    ExposureValueText.Text = $"{_cameraConfig.ExposureTime:F0} μs";
+
                 if (GainValueText != null)
                     GainValueText.Text = $"{_cameraConfig.Gain:F1} dB";
             }
@@ -663,7 +753,7 @@ namespace VisionInspection.UI.Views
                         await LoadCameraParameterRangesAsync();
                         var currentExposure = await _cameraManager.GetExposureTimeAsync();
                         var currentGain = await _cameraManager.GetGainAsync();
-                        ExposureSlider.Value = currentExposure;
+                        SetExposureSliderFromUs(currentExposure);
                         GainSlider.Value = currentGain;
                         _configManager.UpdateCameraParameters(currentExposure, currentGain);
                     }
@@ -695,20 +785,21 @@ namespace VisionInspection.UI.Views
                 // 获取曝光时间范围
                 var exposureRange = await _cameraManager.GetExposureTimeRangeAsync();
                 
-                // 验证范围是否有效
+                // 曝光：相机范围收敛到 [20μs, 1s]，滑块固定 0~1000（对数位置）
                 if (exposureRange.Min > 0 && exposureRange.Max > exposureRange.Min)
                 {
-                    ExposureSlider.Minimum = exposureRange.Min;
-                    ExposureSlider.Maximum = exposureRange.Max;
-                    Debug.WriteLine($"曝光范围: {exposureRange.Min} - {exposureRange.Max}");
+                    _exposureMinUs = Math.Max(exposureRange.Min, ExposureFloorUs);
+                    _exposureMaxUs = Math.Clamp(exposureRange.Max, _exposureMinUs * 2, ExposureCeilingUs);
+                    Debug.WriteLine($"曝光范围: 相机 {exposureRange.Min}~{exposureRange.Max}μs → 使用 {_exposureMinUs}~{_exposureMaxUs}μs");
                 }
                 else
                 {
-                    // 使用默认值
-                    ExposureSlider.Minimum = 20;
-                    ExposureSlider.Maximum = 10000000;
-                    Debug.WriteLine($"曝光范围无效，使用默认值: {ExposureSlider.Minimum} - {ExposureSlider.Maximum}");
+                    _exposureMinUs = ExposureFloorUs;
+                    _exposureMaxUs = ExposureCeilingUs;
+                    Debug.WriteLine($"曝光范围无效，使用默认值: {_exposureMinUs}~{_exposureMaxUs}μs");
                 }
+                ExposureSlider.Minimum = 0;
+                ExposureSlider.Maximum = ExposureSliderTicks;
 
                 // 获取增益范围
                 var gainRange = await _cameraManager.GetGainRangeAsync();
@@ -730,17 +821,19 @@ namespace VisionInspection.UI.Views
                 
                 // 保存参数范围到配置
                 _configManager.UpdateParameterRanges(
-                    (float)ExposureSlider.Minimum, 
-                    (float)ExposureSlider.Maximum,
-                    (float)GainSlider.Minimum, 
+                    (float)_exposureMinUs,
+                    (float)_exposureMaxUs,
+                    (float)GainSlider.Minimum,
                     (float)GainSlider.Maximum);
             }
             catch (Exception ex)
             {
                 Debug.WriteLine($"加载参数范围异常：{ex.Message}");
                 // 使用默认范围
-                ExposureSlider.Minimum = 20;
-                ExposureSlider.Maximum = 10000000;
+                _exposureMinUs = ExposureFloorUs;
+                _exposureMaxUs = ExposureCeilingUs;
+                ExposureSlider.Minimum = 0;
+                ExposureSlider.Maximum = ExposureSliderTicks;
                 GainSlider.Minimum = 0;
                 GainSlider.Maximum = 20;
             }
@@ -800,16 +893,17 @@ namespace VisionInspection.UI.Views
         /// <summary>
         /// 曝光时间改变 - 实时调整
         /// </summary>
-        private async void ExposureSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+        private void ExposureSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
         {
-            if (_cameraManager?.IsConnected == true && ExposureValueText != null)
+            if (_suppressExposureChanged || ExposureValueText == null) return;
+
+            // 滑块位置是 0~1000 的对数刻度，先换算成微秒
+            var exposureUs = ExposureFromPosition(e.NewValue);
+            UpdateExposureText(exposureUs);
+
+            if (_cameraManager?.IsConnected == true)
             {
-                float value = (float)e.NewValue;
-                ExposureValueText.Text = $"{value:F0} μs";
-                await _cameraManager.SetExposureTimeAsync(value);
-                
-                // 保存当前曝光值到配置
-                _configManager.UpdateCameraParameters(value, (float)GainSlider.Value);
+                QueueExposureApply(exposureUs);
             }
         }
 
@@ -824,8 +918,8 @@ namespace VisionInspection.UI.Views
                 GainValueText.Text = $"{value:F1} dB";
                 await _cameraManager.SetGainAsync(value);
                 
-                // 保存当前增益值到配置
-                _configManager.UpdateCameraParameters((float)ExposureSlider.Value, value);
+                // 保存当前增益值到配置（曝光取对数换算后的真实微秒数，不能直接用滑块位置）
+                _configManager.UpdateCameraParameters((float)CurrentExposureUs, value);
             }
         }
 
@@ -838,10 +932,10 @@ namespace VisionInspection.UI.Views
             {
                 // 保存当前所有配置
                 var config = _configManager.LoadConfig();
-                config.ExposureTime = (float)ExposureSlider.Value;
+                config.ExposureTime = (float)CurrentExposureUs;
                 config.Gain = (float)GainSlider.Value;
-                config.ExposureTimeMin = (float)ExposureSlider.Minimum;
-                config.ExposureTimeMax = (float)ExposureSlider.Maximum;
+                config.ExposureTimeMin = (float)_exposureMinUs;
+                config.ExposureTimeMax = (float)_exposureMaxUs;
                 config.GainMin = (float)GainSlider.Minimum;
                 config.GainMax = (float)GainSlider.Maximum;
                 
