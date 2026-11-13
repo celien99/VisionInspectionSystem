@@ -1202,6 +1202,17 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     {
         try
         {
+            float s = OverlayScale(canvas);
+            float stroke = 3.5f * s;
+
+            using var boxOutlinePaint = new SKPaint
+            {
+                Color = SKColors.Black.WithAlpha(170),
+                StrokeWidth = stroke + 2.5f * s,
+                IsAntialias = true,
+                Style = SKPaintStyle.Stroke
+            };
+
             // 1. 绘制检测框（使用时序平滑后的轨迹，消除闪烁/跳动）
             foreach (var track in _detectionSmoother.GetActiveBoxes())
             {
@@ -1216,10 +1227,11 @@ public partial class MainViewModel : ViewModelBase, IDisposable
                 using var boxPaint = new SKPaint
                 {
                     Color = color,
-                    StrokeWidth = 3,
+                    StrokeWidth = stroke,
                     IsAntialias = true,
                     Style = SKPaintStyle.Stroke
                 };
+                canvas.DrawRect(box, boxOutlinePaint);
                 canvas.DrawRect(box, boxPaint);
 
                 // 标签
@@ -1227,20 +1239,23 @@ public partial class MainViewModel : ViewModelBase, IDisposable
                 using var textPaint = new SKPaint
                 {
                     Color = SKColors.White,
-                    TextSize = 18,
+                    TextSize = 18 * s,
                     IsAntialias = true,
-                    FakeBoldText = true
+                    FakeBoldText = true,
+                    Typeface = OverlayTypeface
                 };
                 using var bgPaint = new SKPaint
                 {
-                    Color = color.WithAlpha(200),
+                    Color = color.WithAlpha(210),
                     Style = SKPaintStyle.Fill
                 };
 
                 var textBounds = new SKRect();
                 textPaint.MeasureText(labelText, ref textBounds);
-                canvas.DrawRect(box.Left, box.Top - textBounds.Height - 6, textBounds.Width + 8, textBounds.Height + 6, bgPaint);
-                canvas.DrawText(labelText, box.Left + 4, box.Top - 4, textPaint);
+                float pad = 4f * s;
+                canvas.DrawRect(box.Left, box.Top - textBounds.Height - 2 * pad,
+                    textBounds.Width + 2 * pad, textBounds.Height + 2 * pad, bgPaint);
+                canvas.DrawText(labelText, box.Left + pad, box.Top - pad, textPaint);
             }
 
             // 2. 绘制手部关键点（如果启用了手部检测）
@@ -1367,55 +1382,63 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     };
 
     /// <summary>
-    /// 仅绘制的关键手部关键点（约 50% 降采样：手腕 + 5 个掌指关节 MCP + 5 个指尖 = 11 点）。
-    /// 去掉 PIP/DIP 等中间关节，减少视觉杂乱，同时保留手势结构所需的全部关键位置。
+    /// 手部 21 个关键点全画（MediaPipe 全部点位）。之前只画 11 个并刻意缩小半径，
+    /// 叠加层又被缩放到窗口，结果是"几乎看不见"。
     /// </summary>
-    private static readonly HandKeypointType[] KeyHandLandmarks = new[]
-    {
-        HandKeypointType.Wrist,
-        HandKeypointType.ThumbMCP, HandKeypointType.ThumbTip,
-        HandKeypointType.IndexFingerMCP, HandKeypointType.IndexFingerTip,
-        HandKeypointType.MiddleFingerMCP, HandKeypointType.MiddleFingerTip,
-        HandKeypointType.RingFingerMCP, HandKeypointType.RingFingerTip,
-        HandKeypointType.PinkyMCP, HandKeypointType.PinkyTip
-    };
+    private static readonly HandKeypointType[] HandLandmarks = Enum.GetValues<HandKeypointType>();
 
-    /// <summary>
-    /// 简化骨架连线（星形：手腕→各 MCP→各指尖），配合关键关键点绘制，减少凌乱感。
-    /// </summary>
-    private static readonly (HandKeypointType, HandKeypointType)[] ReducedHandSkeleton = new[]
+    /// <summary>MediaPipe 21 点标准骨架：每根手指 腕→MCP→PIP→DIP→指尖。</summary>
+    private static readonly (HandKeypointType, HandKeypointType)[] HandSkeleton = new[]
     {
-        (HandKeypointType.Wrist, HandKeypointType.ThumbMCP),
-        (HandKeypointType.ThumbMCP, HandKeypointType.ThumbTip),
+        (HandKeypointType.Wrist, HandKeypointType.ThumbCMC),
+        (HandKeypointType.ThumbCMC, HandKeypointType.ThumbMCP),
+        (HandKeypointType.ThumbMCP, HandKeypointType.ThumbIP),
+        (HandKeypointType.ThumbIP, HandKeypointType.ThumbTip),
         (HandKeypointType.Wrist, HandKeypointType.IndexFingerMCP),
-        (HandKeypointType.IndexFingerMCP, HandKeypointType.IndexFingerTip),
+        (HandKeypointType.IndexFingerMCP, HandKeypointType.IndexFingerPIP),
+        (HandKeypointType.IndexFingerPIP, HandKeypointType.IndexFingerDIP),
+        (HandKeypointType.IndexFingerDIP, HandKeypointType.IndexFingerTip),
         (HandKeypointType.Wrist, HandKeypointType.MiddleFingerMCP),
-        (HandKeypointType.MiddleFingerMCP, HandKeypointType.MiddleFingerTip),
+        (HandKeypointType.MiddleFingerMCP, HandKeypointType.MiddleFingerPIP),
+        (HandKeypointType.MiddleFingerPIP, HandKeypointType.MiddleFingerDIP),
+        (HandKeypointType.MiddleFingerDIP, HandKeypointType.MiddleFingerTip),
         (HandKeypointType.Wrist, HandKeypointType.RingFingerMCP),
-        (HandKeypointType.RingFingerMCP, HandKeypointType.RingFingerTip),
+        (HandKeypointType.RingFingerMCP, HandKeypointType.RingFingerPIP),
+        (HandKeypointType.RingFingerPIP, HandKeypointType.RingFingerDIP),
+        (HandKeypointType.RingFingerDIP, HandKeypointType.RingFingerTip),
         (HandKeypointType.Wrist, HandKeypointType.PinkyMCP),
-        (HandKeypointType.PinkyMCP, HandKeypointType.PinkyTip)
+        (HandKeypointType.PinkyMCP, HandKeypointType.PinkyPIP),
+        (HandKeypointType.PinkyPIP, HandKeypointType.PinkyDIP),
+        (HandKeypointType.PinkyDIP, HandKeypointType.PinkyTip)
     };
 
     /// <summary>
-    /// 绘制手部姿态（简化骨架线 + 关键关键点）
+    /// 绘制手部姿态（21 点完整骨架，尺寸随帧分辨率缩放）
     /// </summary>
     private void DrawHandPoses(SKCanvas canvas, HandPoseEstimationResult handResult)
     {
-        // 获取画布大小
-        var canvasSize = canvas.LocalClipBounds;
-
         // 保存画布状态
         canvas.Save();
 
         // 注意：DWPose输出的坐标与SkiaSharp坐标系一致（原点在左上角）
         // 不需要翻转Y轴
 
-        // 骨架线画笔
+        // 叠加层画在原始帧上、再整体缩放到窗口显示：所有尺寸必须随帧分辨率缩放，
+        // 否则 1080p/4K 帧缩到窗口后线宽只剩 1px（"姿态看不明显"的直接原因）。
+        float s = OverlayScale(canvas);
+
+        // 骨架线画笔（黑色底衬 + 亮绿线，保证任何背景都看得清）
+        using var skeletonOutlinePaint = new SKPaint
+        {
+            Color = SKColors.Black.WithAlpha(170),
+            StrokeWidth = 5f * s,
+            IsAntialias = true,
+            Style = SKPaintStyle.Stroke
+        };
         using var skeletonPaint = new SKPaint
         {
             Color = SKColors.LimeGreen,
-            StrokeWidth = 3,
+            StrokeWidth = 3f * s,
             IsAntialias = true,
             Style = SKPaintStyle.Stroke
         };
@@ -1424,7 +1447,6 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         using var tipPaint = new SKPaint
         {
             Color = SKColors.Red,
-            StrokeWidth = 3,
             IsAntialias = true,
             Style = SKPaintStyle.Fill
         };
@@ -1433,7 +1455,6 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         using var jointPaint = new SKPaint
         {
             Color = SKColors.Yellow,
-            StrokeWidth = 3,
             IsAntialias = true,
             Style = SKPaintStyle.Fill
         };
@@ -1442,16 +1463,15 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         using var wristPaint = new SKPaint
         {
             Color = SKColors.Cyan,
-            StrokeWidth = 3,
             IsAntialias = true,
             Style = SKPaintStyle.Fill
         };
 
-        // 关键点外圈（白色描边，增加对比度）
+        // 关键点黑色外圈：亮色圆点在任何背景上都有轮廓
         using var keypointOutlinePaint = new SKPaint
         {
-            Color = SKColors.White,
-            StrokeWidth = 2,
+            Color = SKColors.Black.WithAlpha(200),
+            StrokeWidth = 1.5f * s,
             IsAntialias = true,
             Style = SKPaintStyle.Stroke
         };
@@ -1460,35 +1480,39 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         using var labelPaint = new SKPaint
         {
             Color = SKColors.Yellow,
-            TextSize = 12,
+            TextSize = 13 * s,
             IsAntialias = true,
-            FakeBoldText = true
+            FakeBoldText = true,
+            Typeface = OverlayTypeface
         };
 
         // 手部边界框画笔（青色）
         using var handBoxPaint = new SKPaint
         {
             Color = SKColors.Cyan,
-            StrokeWidth = 4,
+            StrokeWidth = 2.5f * s,
+            IsAntialias = true,
+            Style = SKPaintStyle.Stroke
+        };
+        using var handBoxOutlinePaint = new SKPaint
+        {
+            Color = SKColors.Black.WithAlpha(170),
+            StrokeWidth = 4.5f * s,
             IsAntialias = true,
             Style = SKPaintStyle.Stroke
         };
 
         foreach (var hand in handResult.Hands)
         {
-            int validCount = hand.Keypoints.Count(k => k.Confidence >= SkeletonConfidenceThreshold);
-            float avgConf = hand.Keypoints.Count > 0 ? hand.Keypoints.Average(k => k.Confidence) : 0f;
-            System.Diagnostics.Debug.WriteLine($"[DrawHandPoses] Hand {hand.TrackId}({hand.HandType}): Keypoints={hand.Keypoints.Count}, Valid(>={SkeletonConfidenceThreshold:F1})={validCount}, AvgConf={avgConf:F3}");
-
             // 绘制手部边界框
             var bbox = hand.BoundingBox;
+            canvas.DrawRect(bbox, handBoxOutlinePaint);
             canvas.DrawRect(bbox, handBoxPaint);
 
-            // 绘制简化骨架线（星形，仅关键连接）
-            DrawHandSkeleton(canvas, hand, skeletonPaint);
+            // 完整 21 点骨架
+            DrawHandSkeleton(canvas, hand, skeletonPaint, skeletonOutlinePaint);
 
-            // 仅绘制 11 个关键关键点（手腕 + 5 MCP + 5 指尖），约减少 50% 绘制点
-            foreach (var type in KeyHandLandmarks)
+            foreach (var type in HandLandmarks)
             {
                 var kp = hand.GetKeypoint(type);
                 if (kp == null || kp.Confidence < SkeletonConfidenceThreshold) continue;
@@ -1500,20 +1524,18 @@ public partial class MainViewModel : ViewModelBase, IDisposable
                              type == HandKeypointType.PinkyTip;
 
                 bool isWrist = type == HandKeypointType.Wrist;
-                // MCP 略小于指尖，便于区分层级
-                // 关键点半径缩小约 50%（原 tip=7/wrist=8/mcp=6 → 现 tip=4/wrist=4/mcp=3）
-                float radius = isTip ? 4 : (isWrist ? 4 : 3);
+
+                // 指尖/手腕画大一点，中间关节略小：既能看清手势，又不糊成一片
+                float radius = isTip ? 6 * s : (isWrist ? 7 * s : 4 * s);
                 var paint = isTip ? tipPaint : (isWrist ? wristPaint : jointPaint);
 
-                // 绘制关键点外圈（白色描边，半径同步缩小）
-                canvas.DrawCircle(kp.X, kp.Y, radius + 2, keypointOutlinePaint);
-                // 绘制关键点
+                canvas.DrawCircle(kp.X, kp.Y, radius + 1.5f * s, keypointOutlinePaint);
                 canvas.DrawCircle(kp.X, kp.Y, radius, paint);
 
                 // 只在指尖旁边绘制标签，避免杂乱
                 if (isTip)
                 {
-                    canvas.DrawText(type.ToString(), kp.X + 10, kp.Y, labelPaint);
+                    canvas.DrawText(type.ToString(), kp.X + 12 * s, kp.Y, labelPaint);
                 }
             }
         }
@@ -1523,14 +1545,14 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     }
 
     /// <summary>
-    /// 绘制手部骨架线（使用 ReducedHandSkeleton 简化连接，仅关键关键点之间）
+    /// 绘制手部骨架线（MediaPipe 21 点标准连接；先画黑色底衬再画彩色线）
     /// </summary>
     // 骨架绘制置信度阈值（低于此值的关键点不绘制，减少闪烁）
     public float SkeletonConfidenceThreshold { get; set; } = 0.1f;
 
-    private void DrawHandSkeleton(SKCanvas canvas, HandPose hand, SKPaint paint)
+    private void DrawHandSkeleton(SKCanvas canvas, HandPose hand, SKPaint paint, SKPaint outlinePaint)
     {
-        foreach (var (startType, endType) in ReducedHandSkeleton)
+        foreach (var (startType, endType) in HandSkeleton)
         {
             var start = hand.GetKeypoint(startType);
             var end = hand.GetKeypoint(endType);
@@ -1538,6 +1560,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             if (start == null || end == null) continue;
             if (start.Confidence < SkeletonConfidenceThreshold || end.Confidence < SkeletonConfidenceThreshold) continue;
 
+            canvas.DrawLine(start.X, start.Y, end.X, end.Y, outlinePaint);
             canvas.DrawLine(start.X, start.Y, end.X, end.Y, paint);
         }
     }
@@ -2530,60 +2553,103 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     }
 
     /// <summary>
+    /// 叠加层统一缩放系数。
+    /// <para>
+    /// 叠加层是画在<b>原始帧</b>上、再被整体缩放到窗口显示的：
+    /// 1920/3072 宽的帧缩到 ~1000px 宽的画面区只剩 1/2~1/3。
+    /// 所以线宽/半径/字号必须是"相对帧宽"的，按 1280 宽为基准换算，
+    /// 否则画面里的框和骨架会细到 1px（这是"检测框/姿态不突出"的根因，与模型无关）。
+    /// </para>
+    /// </summary>
+    private static float OverlayScale(SKCanvas canvas)
+    {
+        var width = canvas.LocalClipBounds.Width;
+        if (width <= 0) width = 1280;
+        return Math.Clamp(width / 1280f, 1f, 4f);
+    }
+
+    /// <summary>叠加层文字字体（首选带中文字形的字体，避免中文类别名变方块）</summary>
+    private static readonly SKTypeface OverlayTypeface = ResolveOverlayTypeface();
+
+    private static SKTypeface ResolveOverlayTypeface()
+    {
+        foreach (var name in new[] { "Microsoft YaHei", "PingFang SC", "Segoe UI", "Arial" })
+        {
+            var typeface = SKTypeface.FromFamilyName(name);
+            if (typeface != null) return typeface;
+        }
+        return SKTypeface.Default;
+    }
+
+    /// <summary>
     /// 在已有画布上叠加绘制检测结果（边界框 + 标签 + 姿态骨骼 + 分割掩膜）。
     /// <para>提取自 <see cref="DrawDetectionResults"/>，便于在相机最新帧上直接叠加（与 SOP 渲染架构一致），
     /// 避免「无框原始帧」与「有框帧」交替造成的实时检测闪烁。</para>
     /// </summary>
     private void DrawDetectedObjects(SKCanvas canvas, List<DetectedObject> objects, float textSize = 24f)
     {
+        float s = OverlayScale(canvas);
+        float stroke = 3.5f * s;
+
+        // 黑色底衬：浅色/花色背景上也能看清框线
+        using var outlinePaint = new SKPaint
+        {
+            Color = SKColors.Black.WithAlpha(170),
+            StrokeWidth = stroke + 2.5f * s,
+            IsAntialias = true,
+            Style = SKPaintStyle.Stroke
+        };
+
         foreach (var obj in objects)
         {
             // 根据置信度选择颜色
-            var color = obj.Confidence > 0.7 ? SKColors.Green :
+            var color = obj.Confidence > 0.7 ? SKColors.LimeGreen :
                        obj.Confidence > 0.5 ? SKColors.Yellow : SKColors.Red;
 
             using var paint = new SKPaint
             {
                 Color = color,
-                StrokeWidth = 4,
+                StrokeWidth = stroke,
                 IsAntialias = true,
                 Style = SKPaintStyle.Stroke
             };
 
             // 绘制边界框（使用PixelBoundingBox）
+            canvas.DrawRect(obj.PixelBoundingBox, outlinePaint);
             canvas.DrawRect(obj.PixelBoundingBox, paint);
 
-            // 绘制标签背景
+            // 标签（字号随分辨率缩放）
             using var textPaint = new SKPaint
             {
                 Color = color,
-                TextSize = textSize,
-                IsAntialias = true
+                TextSize = textSize * s,
+                IsAntialias = true,
+                FakeBoldText = true,
+                Typeface = OverlayTypeface
             };
 
             var label = $"{obj.ClassName} {obj.Confidence:P0}";
             var textBounds = new SKRect();
             textPaint.MeasureText(label, ref textBounds);
 
-            // 绘制标签背景
+            float pad = 4f * s;
+            var box = obj.PixelBoundingBox;
+            var bgRect = new SKRect(
+                box.Left,
+                box.Top - textBounds.Height - 2 * pad,
+                box.Left + textBounds.Width + 2 * pad,
+                box.Top);
+
             using var bgPaint = new SKPaint
             {
-                Color = color.WithAlpha(200),
+                Color = color.WithAlpha(210),
                 Style = SKPaintStyle.Fill
             };
-            canvas.DrawRect(
-                obj.PixelBoundingBox.Left,
-                obj.PixelBoundingBox.Top - textBounds.Height - 4,
-                textBounds.Width + 8,
-                textBounds.Height + 4,
-                bgPaint);
+            canvas.DrawRect(bgRect, bgPaint);
 
             // 绘制标签文字
             textPaint.Color = SKColors.White;
-            canvas.DrawText(label,
-                obj.PixelBoundingBox.Left + 4,
-                obj.PixelBoundingBox.Top - 4,
-                textPaint);
+            canvas.DrawText(label, box.Left + pad, box.Top - pad, textPaint);
 
             // 绘制人体姿态骨骼（仅姿态估计模型会带 KeyPoints）
             if (obj.KeyPoints != null && obj.KeyPoints.Count > 0)
@@ -2613,11 +2679,21 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         var valid = kps.Where(k => k.Confidence >= POSE_KEYPOINT_CONF).ToList();
         if (valid.Count == 0) return;
 
-        // 先绘制骨骼连线
+        float s = OverlayScale(canvas);
+        float lineWidth = 3f * s;
+
+        // 先绘制骨骼连线（黑色底衬 + 亮绿线）
+        using var lineOutline = new SKPaint
+        {
+            Color = SKColors.Black.WithAlpha(170),
+            StrokeWidth = lineWidth + 2.5f * s,
+            IsAntialias = true,
+            Style = SKPaintStyle.Stroke
+        };
         using var linePaint = new SKPaint
         {
             Color = SKColors.Lime,
-            StrokeWidth = 3,
+            StrokeWidth = lineWidth,
             IsAntialias = true,
             Style = SKPaintStyle.Stroke
         };
@@ -2627,6 +2703,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             var b = valid.FirstOrDefault(k => k.Index == pair[1]);
             if (a != null && b != null)
             {
+                canvas.DrawLine(a.X, a.Y, b.X, b.Y, lineOutline);
                 canvas.DrawLine(a.X, a.Y, b.X, b.Y, linePaint);
             }
         }
@@ -2641,14 +2718,15 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         using var pointOutline = new SKPaint
         {
             Color = SKColors.Black,
-            StrokeWidth = 1.5f,
+            StrokeWidth = 1.5f * s,
             IsAntialias = true,
             Style = SKPaintStyle.Stroke
         };
+        float radius = 4f * s;
         foreach (var k in valid)
         {
-            canvas.DrawCircle(k.X, k.Y, 4, pointPaint);
-            canvas.DrawCircle(k.X, k.Y, 4, pointOutline);
+            canvas.DrawCircle(k.X, k.Y, radius, pointPaint);
+            canvas.DrawCircle(k.X, k.Y, radius, pointOutline);
         }
     }
 
