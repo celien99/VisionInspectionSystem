@@ -6,7 +6,6 @@ using System.Threading;
 using System.Threading.Tasks;
 using VisionInspection.Core.Services;
 using YoloDotNet;
-using YoloDotNet.Video;
 
 namespace VisionInspection.Modules.Detection
 {
@@ -19,6 +18,7 @@ namespace VisionInspection.Modules.Detection
         private ModelInfo? _modelInfo;
         private readonly object _lockObject = new();
         private CancellationTokenSource? _videoInferenceCts;
+        private Task? _videoTask;
         private VideoInferenceOptions? _videoOptions;
         private bool _isVideoProcessing = false;
 
@@ -111,12 +111,26 @@ namespace VisionInspection.Modules.Detection
 
         public void Dispose()
         {
+            try { StopVideoInference(); } catch { /* 忽略停止异常 */ }
+            var loopStopped = WaitVideoLoop(2000);
+
             lock (_lockObject)
             {
-                _yolo?.Dispose();
-                _yolo = null;
+                _videoCapture?.Dispose();   // 已初始化但还没开始推理的解码器
+                _videoCapture = null;
+
+                // 解码线程若仍卡在 Read/检测里，不能释放它正在用的原生会话
+                if (loopStopped)
+                {
+                    _yolo?.Dispose();
+                    _yolo = null;
+                }
+
+                // _videoFrame 故意不释放：UI 可能仍在绘制它（释放后再绘制 = 原生崩溃），随进程回收
                 _modelInfo = null;
             }
+
+            DisposeVideoCts();
         }
 
         public async Task<DetectionResult> DetectAsync(SKBitmap image)
@@ -348,11 +362,26 @@ namespace VisionInspection.Modules.Detection
 
         #region 视频推理
 
+        // 视频解码改用 OpenCvSharp（程序自带，无外部依赖），不再走 YoloDotNet 的 FFmpeg 视频管线。
+        // 原因：YoloDotNet 用 `ffprobe -version` + 2 秒超时校验外部 ffprobe，冷启动（杀软扫描 / 网络盘 /
+        // 慢盘）经常超时，报 "Failed to verify 'ffprobe': Process must exit before requested information
+        // can be determined"。检测仍然走同一个 _yolo，只是取帧换成 OpenCV。
+        private OpenCvSharp.VideoCapture? _videoCapture;
+        private SKBitmap? _videoFrame;          // 复用的帧缓冲（UI 也会引用它绘制，不主动释放）
+        private int _videoFrameInterval = 1;
+        private long _videoMaxFrames;           // 0 = 处理到结尾
+
         public bool InitializeVideoInference(VideoInferenceOptions options)
         {
             if (_yolo == null || _modelInfo == null)
             {
                 DetectionError?.Invoke(this, "检测服务未初始化");
+                return false;
+            }
+
+            if (options == null || string.IsNullOrWhiteSpace(options.VideoPath))
+            {
+                DetectionError?.Invoke(this, "视频路径为空");
                 return false;
             }
 
@@ -362,57 +391,34 @@ namespace VisionInspection.Modules.Detection
                 return false;
             }
 
-            // 检查FFmpeg是否已安装并获取路径
-            var ffmpegPath = GetFFmpegPath();
-            if (string.IsNullOrEmpty(ffmpegPath))
-            {
-                DetectionError?.Invoke(this, "FFmpeg未安装或未添加到系统PATH。请安装FFmpeg并确保ffmpeg.exe和ffprobe.exe在系统PATH中。");
-                return false;
-            }
+            // 取消上一段视频（不阻塞：旧解码线程检测到取消后自行退出并释放自己的解码器）
+            StopVideoInference();
 
             try
             {
+                var capture = new OpenCvSharp.VideoCapture(options.VideoPath);
+                if (!capture.IsOpened())
+                {
+                    capture.Dispose();
+                    DetectionError?.Invoke(this, $"无法解码视频文件（编码不受 OpenCV 支持？）: {options.VideoPath}");
+                    return false;
+                }
+
                 _videoOptions = options;
+                _videoFrameInterval = Math.Max(1, options.FrameInterval); // 0 与 1 都表示每帧
 
-                // 设置环境变量，确保YoloDotNet能找到FFmpeg
-                var currentPath = Environment.GetEnvironmentVariable("PATH") ?? "";
-                if (!string.IsNullOrEmpty(ffmpegPath) && !currentPath.Contains(ffmpegPath))
-                {
-                    Environment.SetEnvironmentVariable("PATH", $"{ffmpegPath}{Path.PathSeparator}{currentPath}");
-                }
-
-                // 创建视频选项
-                var videoOptions = new VideoOptions
-                {
-                    VideoInput = options.VideoPath,
-                    FrameInterval = options.FrameInterval,
-                    Width = 0,  // 使用原始宽度
-                    Height = 0  // 使用原始高度
-                };
-
-                // 设置可选参数
-                if (!string.IsNullOrEmpty(options.OutputPath))
-                {
-                    videoOptions.VideoOutput = options.OutputPath;
-                }
+                var fps = capture.Get(OpenCvSharp.VideoCaptureProperties.Fps);
+                if (double.IsNaN(fps) || fps <= 0) fps = 25;
 
                 if (options.StartTimeSeconds > 0)
-                {
-                    videoOptions.StartTimeSeconds = options.StartTimeSeconds;
-                }
+                    capture.Set(OpenCvSharp.VideoCaptureProperties.PosFrames, options.StartTimeSeconds * fps);
 
-                if (options.DurationSeconds > 0)
-                {
-                    videoOptions.DurationSeconds = options.DurationSeconds;
-                }
+                _videoMaxFrames = options.DurationSeconds > 0
+                    ? (long)Math.Round(options.DurationSeconds * fps)
+                    : 0;
 
-                // 初始化视频
-                _yolo.InitializeVideo(videoOptions);
-
-                // 设置帧接收处理
-                _yolo.OnVideoFrameReceived = OnVideoFrameReceived;
-                _yolo.OnVideoEnd = OnVideoEnd;
-
+                _videoCapture?.Dispose();   // 上一次初始化但没开始推理的解码器
+                _videoCapture = capture;
                 return true;
             }
             catch (Exception ex)
@@ -422,95 +428,110 @@ namespace VisionInspection.Modules.Detection
             }
         }
 
-        /// <summary>
-        /// 获取 FFmpeg 所在目录。查找顺序：
-        /// 环境变量 VISION_FFMPEG_DIR → 程序目录/ffmpeg/bin → 系统 PATH。
-        /// （原先写死了 4 个 E:\ / C:\ 绝对路径，换机器必然失效）
-        /// </summary>
-        private string? GetFFmpegPath()
-        {
-            var envDir = Environment.GetEnvironmentVariable("VISION_FFMPEG_DIR");
-            if (!string.IsNullOrWhiteSpace(envDir))
-            {
-                var exeName = OperatingSystem.IsWindows() ? "ffmpeg.exe" : "ffmpeg";
-                if (File.Exists(Path.Combine(envDir, exeName))) return envDir;
-            }
-
-            var ffmpeg = AppPaths.FindExecutable("ffmpeg", "ffmpeg/bin", "bin", "");
-            if (ffmpeg == null) return null;
-
-            var dir = Path.GetDirectoryName(ffmpeg);
-            return string.IsNullOrEmpty(dir) ? "" : dir;
-        }
-
-        /// <summary>
-        /// 检查FFmpeg是否已安装
-        /// </summary>
-        private bool IsFFmpegInstalled()
-        {
-            return !string.IsNullOrEmpty(GetFFmpegPath());
-        }
-
         public void StartVideoInference()
         {
-            if (_yolo == null || _videoOptions == null)
+            if (_yolo == null || _videoOptions == null || _videoCapture == null)
             {
                 DetectionError?.Invoke(this, "视频推理未初始化");
                 return;
             }
 
-            _videoInferenceCts = new CancellationTokenSource();
+            // 解码器交给解码线程独占：停止/重新初始化时不碰它，避免"释放后仍在 Read"的原生崩溃
+            var capture = _videoCapture;
+            _videoCapture = null;
+
+            DisposeVideoCts();
+            var cts = new CancellationTokenSource();
+            _videoInferenceCts = cts;
             _isVideoProcessing = true;
 
-            Task.Run(() =>
-            {
-                try
-                {
-                    _yolo.StartVideoProcessing();
-                }
-                catch (Exception ex)
-                {
-                    DetectionError?.Invoke(this, $"视频推理失败: {ex.Message}");
-                }
-                finally
-                {
-                    _isVideoProcessing = false;
-                }
-            }, _videoInferenceCts.Token);
+            _videoTask = Task.Run(() => VideoLoop(capture, cts.Token), cts.Token);
         }
 
         public void StopVideoInference()
         {
+            _isVideoProcessing = false;
+
+            try { _videoInferenceCts?.Cancel(); }
+            catch (Exception ex) { DetectionError?.Invoke(this, $"停止视频推理时出错: {ex.Message}"); }
+
+            // 不在这里阻塞等待：停止后 _isVideoProcessing=false，帧回调不会再生效；
+            // 解码器由解码线程自己释放。需要确认线程退出的地方调用 WaitVideoLoop。
+        }
+
+        /// <summary>等待解码线程退出（最多 ms 毫秒），返回是否已退出。</summary>
+        private bool WaitVideoLoop(int ms)
+        {
+            var task = _videoTask;
+            if (task == null) return true;
+
             try
             {
-                // 先设置标志，让回调知道要停止
-                _isVideoProcessing = false;
+                if (!task.Wait(ms)) return false;
+            }
+            catch { /* 异常已在解码线程内记录 */ }
 
-                // 取消令牌
-                _videoInferenceCts?.Cancel();
+            _videoTask = null;
+            return true;
+        }
 
-                // 停止视频处理（这会中断StartVideoProcessing的阻塞调用）
-                _yolo?.StopVideoProcessing();
+        private void DisposeVideoCts()
+        {
+            try { _videoInferenceCts?.Dispose(); } catch { }
+            _videoInferenceCts = null;
+        }
 
-                // 等待一小段时间让处理完全停止
-                Thread.Sleep(200);
+        /// <summary>解码 + 逐帧检测（后台线程）。capture 由本线程独占并负责释放。</summary>
+        private void VideoLoop(OpenCvSharp.VideoCapture capture, CancellationToken token)
+        {
+            long frameIndex = 0;
+            long processed = 0;
+
+            try
+            {
+                using var frame = new OpenCvSharp.Mat();
+
+                while (!token.IsCancellationRequested && _isVideoProcessing)
+                {
+                    if (!capture.Read(frame) || frame.Empty())
+                        break;   // 读到结尾
+
+                    // FrameInterval：每 N 帧处理一帧（1 = 每帧）
+                    if (_videoFrameInterval > 1 && frameIndex % _videoFrameInterval != 0)
+                    {
+                        frameIndex++;
+                        continue;
+                    }
+
+                    _videoFrame = VideoFrameConverter.ToSKBitmap(frame, _videoFrame);
+                    OnVideoFrameReceived(_videoFrame, frameIndex, token);
+
+                    frameIndex++;
+                    processed++;
+
+                    if (_videoMaxFrames > 0 && processed >= _videoMaxFrames)
+                        break;
+                }
             }
             catch (Exception ex)
             {
-                DetectionError?.Invoke(this, $"停止视频推理时出错: {ex.Message}");
+                DetectionError?.Invoke(this, $"视频推理失败: {ex.Message}");
             }
             finally
             {
-                _videoInferenceCts?.Dispose();
-                _videoInferenceCts = null;
                 _isVideoProcessing = false;
+                capture.Dispose();
             }
+
+            // 只有自然播完才通知"完成"；用户手动停止不通知
+            if (!token.IsCancellationRequested)
+                VideoInferenceCompleted?.Invoke(this, EventArgs.Empty);
         }
 
-        private void OnVideoFrameReceived(SKBitmap frame, long frameIndex)
+        private void OnVideoFrameReceived(SKBitmap frame, long frameIndex, CancellationToken token)
         {
-            // 如果正在停止或已停止，不再处理帧
-            if (!_isVideoProcessing || _yolo == null || _modelInfo == null) return;
+            // 如果正在停止或已停止，不再处理帧（token 检查防止"上一段视频"取消后还继续跑检测）
+            if (token.IsCancellationRequested || !_isVideoProcessing || _yolo == null || _modelInfo == null) return;
 
             try
             {
@@ -551,11 +572,6 @@ namespace VisionInspection.Modules.Detection
             {
                 DetectionError?.Invoke(this, $"处理帧 {frameIndex} 失败: {ex.Message}");
             }
-        }
-
-        private void OnVideoEnd()
-        {
-            VideoInferenceCompleted?.Invoke(this, EventArgs.Empty);
         }
 
         #endregion

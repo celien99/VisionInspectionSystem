@@ -4,6 +4,8 @@
     <TargetFramework>net8.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <!-- 视频帧从 OpenCV Mat 直接拷进 SKBitmap 像素缓冲（避免每帧 8MB 托管拷贝） -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
   <!--
@@ -19,6 +21,9 @@
   <ItemGroup>
     <PackageReference Include="SkiaSharp" Version="3.119.1" />
     <PackageReference Include="YoloDotNet" Version="4.2.0" />
+    <!-- 视频解码（视频推理取帧）：OpenCV 自带 FFmpeg，不依赖外部 ffmpeg.exe / ffprobe.exe。
+         原生运行时 DLL 由 UI 工程的 OpenCvSharp4.runtime.win 提供（同一个包，不会重复）。 -->
+    <PackageReference Include="OpenCvSharp4" Version="4.10.0.20241108" />
   </ItemGroup>
 
   <ItemGroup Condition="'$(YoloEp)' == 'Cuda'">

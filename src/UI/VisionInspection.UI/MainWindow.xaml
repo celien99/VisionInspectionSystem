@@ -307,23 +307,14 @@
                                 </controls:CameraCellTemplateSelector.SecondaryTemplate>
                             </controls:CameraCellTemplateSelector>
                         </ItemsControl.ItemTemplateSelector>
-                        <ItemsControl.Style>
-                            <Style TargetType="ItemsControl">
-                                <Setter Property="Visibility" Value="Visible"/>
-                                <Style.Triggers>
-                                    <DataTrigger Binding="{Binding CameraViews.Count}" Value="0">
-                                        <Setter Property="Visibility" Value="Collapsed"/>
-                                    </DataTrigger>
-                                </Style.Triggers>
-                            </Style>
-                        </ItemsControl.Style>
                     </ItemsControl>
 
-                    <!-- 无相机时提示 -->
-                    <TextBlock Text="连接相机后显示实时画面"
+                    <!-- 画面区始终存在：主画面格子由 MainViewModel.RebuildCameraLayout 常驻创建，
+                         加载的图片 / 视频 / 视频推理结果都画在主画面里；没有画面时才提示 -->
+                    <TextBlock Text="连接相机或加载视频后显示画面"
                                HorizontalAlignment="Center" VerticalAlignment="Center"
                                Foreground="#AAA" FontSize="16"
-                               Visibility="{Binding CameraViews.Count, Converter={StaticResource CountToVisibilityConverter}}"/>
+                               Visibility="{Binding RoiEditorViewModel.CurrentImage, Converter={StaticResource Object2VisibilityReConverter}}"/>
                 </Grid>
             </Border>
 

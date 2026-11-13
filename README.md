@@ -90,7 +90,8 @@ CPU 构建下界面的「GPU/CPU」开关不会生效（日志会说明），检
 | `configs/last_recipe.json` | 记住上次使用的配方 | 运行时生成，不进版本库 |
 
 - 环境变量 `VISION_HOME`：把程序根目录指到别处（部署到非程序目录时用）。
-- 环境变量 `VISION_FFMPEG_DIR`：指定 ffmpeg 所在目录（视频推理/抽帧用），否则查找程序目录与 PATH。
+- 环境变量 `VISION_FFMPEG_DIR`：指定 ffmpeg 所在目录（数据采集的录像/抽帧用），否则查找程序目录与 PATH。
+  > 视频推理（检测 → 视频推理）已改用内置 OpenCV 解码，**不再需要** ffmpeg/ffprobe。
 
 ## 配置说明
 

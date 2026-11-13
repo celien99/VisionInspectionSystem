@@ -197,6 +197,8 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     private string _lastDetectionError = "";
     private DateTime _lastFrameTime = DateTime.Now;
     private int _frameCount = 0;
+    // 视频推理时"原始帧 + 检测框"的副本（自己创建，负责释放；解码器的原始帧缓冲不能释放）
+    private SKBitmap? _videoDrawnImage;
     private DateTime _lastInferenceTime = DateTime.Now;
     private int _inferenceFrameCount = 0;
     private bool _isProcessingFrame = false;
@@ -461,18 +463,41 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     }
 
     /// <summary>
-    /// 根据已连接槽位重建 CameraViews 与宫格行列数
+    /// 重建画面区。
+    /// <para>
+    /// 不变式：<b>主画面格子常驻</b>。它是"当前显示源的宿主"——相机帧、加载的图片、视频推理结果
+    /// 都画在这一格（<see cref="RoiEditorViewModel"/> 的 CurrentImage）。其余格子才随已连接相机增减。
+    /// </para>
+    /// 之前 CameraViews 只由"已连接槽位"生成，没连相机时整块画面区被隐藏，
+    /// 加载视频只更新了 CurrentImage 却没有宿主控件 → "上传成功但看不到"。
     /// </summary>
     private void RebuildCameraLayout()
     {
         var connected = _cameraManager.Slots.Where(s => s.IsConnected).ToList();
-        int count = connected.Count;
 
+        // ① 主画面格子常驻（与是否连相机无关）
+        var primary = CameraViews.FirstOrDefault(v => v.IsPrimary);
+        if (primary == null)
+        {
+            primary = new CameraViewItem
+            {
+                CameraId = CameraManager.PrimaryCameraId,
+                DisplayName = "主画面",
+                IsPrimary = true
+            };
+            CameraViews.Insert(0, primary);
+        }
+        primary.IsConnected = connected.Any(c =>
+            string.Equals(c.CameraId, primary.CameraId, StringComparison.OrdinalIgnoreCase));
+
+        // ② 宫格尺寸按"显示格子数"算（没相机时就是 1x1 这一格）
+        int count = CameraViews.Count;
         GridRows = count <= 2 ? 1 : 2;
         GridColumns = count == 1 ? 1 : 2;
 
-        // 移除已断开或已注销的槽位
-        foreach (var removed in CameraViews.Where(v => !connected.Any(c => string.Equals(c.CameraId, v.CameraId, StringComparison.OrdinalIgnoreCase))).ToList())
+        // ③ 移除已断开/已注销的副相机格子（主画面不参与移除）
+        foreach (var removed in CameraViews.Where(v => !v.IsPrimary &&
+                     !connected.Any(c => string.Equals(c.CameraId, v.CameraId, StringComparison.OrdinalIgnoreCase))).ToList())
         {
             // ROI 编辑画面与主相机格子共用同一个 SKBitmap 实例：
             // 直接 Dispose 后 ROI 控件还会绘制它 → 原生 AccessViolation（进程闪退）。
@@ -481,23 +506,21 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             CameraViews.Remove(removed);
         }
 
-        // 新增/更新已连接槽位（主相机在前）
+        // ④ 新增/更新已连接相机对应的格子（主相机复用常驻主画面）
         foreach (var slot in connected.OrderByDescending(s => s.IsPrimary).ThenBy(s => s.CameraId, StringComparer.OrdinalIgnoreCase))
         {
             var item = CameraViews.FirstOrDefault(v => string.Equals(v.CameraId, slot.CameraId, StringComparison.OrdinalIgnoreCase));
             if (item == null)
             {
-                CameraViews.Add(new CameraViewItem
+                item = new CameraViewItem
                 {
                     CameraId = slot.CameraId,
                     DisplayName = string.IsNullOrEmpty(slot.DisplayName) ? slot.CameraId : slot.DisplayName,
                     IsPrimary = slot.IsPrimary
-                });
+                };
+                CameraViews.Add(item);
             }
-            else
-            {
-                item.IsConnected = slot.IsConnected;
-            }
+            item.IsConnected = slot.IsConnected;
         }
 
         UpdateCameraModelText();
@@ -2766,35 +2789,33 @@ public partial class MainViewModel : ViewModelBase, IDisposable
                 VideoPath = openFileDialog.FileName;
                 Status = $"正在加载视频: {Path.GetFileName(VideoPath)}...";
 
-                // 加载并显示视频第一帧
+                // 加载并显示视频第一帧（与视频推理共用同一个解码/转换路径）
                 await Task.Run(() =>
                 {
                     try
                     {
-                        // 使用FFmpeg或视频库提取第一帧
-                        var videoCapture = new OpenCvSharp.VideoCapture(VideoPath);
-                        if (videoCapture.IsOpened())
+                        using var videoCapture = new OpenCvSharp.VideoCapture(VideoPath);
+                        if (!videoCapture.IsOpened())
                         {
-                            using var frame = new OpenCvSharp.Mat();
-                            if (videoCapture.Read(frame))
+                            Application.Current.Dispatcher.Invoke(() =>
                             {
-                                // 转换OpenCV Mat为SKBitmap
-                                var bitmap = OpenCvSharp.Extensions.BitmapConverter.ToBitmap(frame);
-                                using var ms = new MemoryStream();
-                                bitmap.Save(ms, System.Drawing.Imaging.ImageFormat.Png);
-                                ms.Position = 0;
-                                
-                                var skBitmap = SKBitmap.Decode(ms);
-                                
-                                // 在UI线程更新图像
-                                Application.Current.Dispatcher.Invoke(() =>
-                                {
-                                    CurrentImage = skBitmap;
-                                    RoiEditorViewModel.CurrentImage = skBitmap;
-                                    Status = $"视频已加载: {Path.GetFileName(VideoPath)}";
-                                });
-                            }
-                            videoCapture.Release();
+                                Status = $"无法解码视频文件（编码不受支持？）: {Path.GetFileName(VideoPath)}";
+                            });
+                            return;
+                        }
+
+                        using var frame = new OpenCvSharp.Mat();
+                        if (videoCapture.Read(frame) && !frame.Empty())
+                        {
+                            var skBitmap = VideoFrameConverter.ToSKBitmap(frame);
+
+                            // 在UI线程更新图像
+                            Application.Current.Dispatcher.Invoke(() =>
+                            {
+                                CurrentImage = skBitmap;
+                                RoiEditorViewModel.CurrentImage = skBitmap;
+                                Status = $"视频已加载: {Path.GetFileName(VideoPath)}";
+                            });
                         }
                     }
                     catch (Exception ex)
@@ -2831,6 +2852,10 @@ public partial class MainViewModel : ViewModelBase, IDisposable
                 return;
             }
 
+            // 重复点击"视频推理"：先停掉上一轮（顺带取消事件订阅，避免同一处理器被订阅两次）
+            if (IsVideoPlaying)
+                StopVideoInference();
+
             IsBusy = true;
             IsVideoPlaying = true;
             Status = "正在初始化视频推理...";
@@ -2851,33 +2876,13 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             {
                 IsVideoPlaying = false;
                 
-                // 检查是否是FFmpeg未安装的问题
-                if (_lastDetectionError.Contains("FFmpeg"))
-                {
-                    Status = "FFmpeg未安装";
-                    var result = MessageBox.Show(
-                        "视频推理需要FFmpeg支持。\n\n" +
-                        "FFmpeg未安装或未添加到系统PATH。\n\n" +
-                        "是否打开FFmpeg下载页面？",
-                        "缺少FFmpeg",
-                        MessageBoxButton.YesNo,
-                        MessageBoxImage.Warning);
-                    
-                    if (result == MessageBoxResult.Yes)
-                    {
-                        // 打开FFmpeg下载页面
-                        System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
-                        {
-                            FileName = "https://ffmpeg.org/download.html",
-                            UseShellExecute = true
-                        });
-                    }
-                }
-                else
-                {
-                    Status = $"视频推理初始化失败: {_lastDetectionError}";
-                    MessageBox.Show($"视频推理初始化失败:\n{_lastDetectionError}", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
-                }
+                // 视频解码现在由程序内置的 OpenCV 完成，不再依赖外部 ffmpeg/ffprobe
+                Status = $"视频推理初始化失败: {_lastDetectionError}";
+                MessageBox.Show(
+                    $"视频推理初始化失败:\n{_lastDetectionError}\n\n" +
+                    "视频解码使用程序内置 OpenCV（不需要外部 ffmpeg）。\n" +
+                    "若视频文件本身损坏或编码不受支持，请先转成 MP4(H.264) 再试。",
+                    "视频推理初始化失败", MessageBoxButton.OK, MessageBoxImage.Error);
                 return;
             }
 
@@ -2937,16 +2942,16 @@ public partial class MainViewModel : ViewModelBase, IDisposable
                 _lastFrameTime = now;
             }
 
-            // 绘制检测结果
-            if (e.DetectionResult.Objects.Count > 0)
-            {
-                var resultImage = DrawDetectionResults(e.Frame, e.DetectionResult.Objects);
-                RoiEditorViewModel.CurrentImage = resultImage;
-            }
-            else
-            {
-                RoiEditorViewModel.CurrentImage = e.Frame;
-            }
+            // 绘制检测结果。e.Frame 是解码器复用的缓冲（不能释放）；
+            // 自己画出来的副本必须释放上一张，否则分辨率 1080p 时每帧泄漏 8MB。
+            var drawn = e.DetectionResult.Objects.Count > 0
+                ? DrawDetectionResults(e.Frame, e.DetectionResult.Objects)
+                : null;
+
+            var previous = _videoDrawnImage;
+            _videoDrawnImage = drawn;
+            RoiEditorViewModel.CurrentImage = drawn ?? e.Frame;
+            previous?.Dispose();
 
             Status = $"处理帧 {e.FrameIndex}，检测到 {e.DetectionResult.Objects.Count} 个对象，FPS: {Fps:F1}";
         });
