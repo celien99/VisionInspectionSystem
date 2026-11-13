@@ -44,6 +44,16 @@ VisionInspectionSystem/
 - ✅ **MVVM 架构**：`ViewModelBase` 等基础类型实现 UI 与业务逻辑解耦，便于维护与测试。
 - ✅ **用户与权限**：`UserManager` / `User` 提供基础用户管理。
 
+## SOP 使用文档（必读）
+
+| 文档 | 内容 |
+|---|---|
+| [docs/SOP使用指南.md](docs/SOP使用指南.md) | **总览入口**：系统能做什么、三种使用路径、核心概念、目录约定、五分钟跑通 |
+| [docs/SOP_01_使用手册.md](docs/SOP_01_使用手册.md) | 环境安装、相机接入、界面逐项说明、日常运行、看板/日志/Modbus 联锁、部署检查清单 |
+| [docs/SOP_02_新建SOP检测.md](docs/SOP_02_新建SOP检测.md) | 从零新建配方：向导/复制/手写 → 标定 → 调试 → 三个完整示例（喝水/安全帽/跨相机）→ YAML 字段速查 |
+| [docs/SOP_03_模型训练.md](docs/SOP_03_模型训练.md) | 采集→抽帧→标注→训练→导出 ONNX（opset 规则）→部署，含 `scripts/train_sop_detector.py` |
+| [docs/SOP_04_调参指南.md](docs/SOP_04_调参指南.md) | 全部可调参数 + 按症状调参（漏检/误报/抖动/卡步/卡顿）+ 推荐调参顺序与预设 |
+
 ## 快速开始
 
 > 需要 .NET 8 SDK（WPF 只能在 Windows 上运行）。**不再需要** YoloDotNet 的源码仓库：推理库走 NuGet。

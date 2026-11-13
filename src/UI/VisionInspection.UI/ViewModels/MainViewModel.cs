@@ -474,7 +474,10 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         // 移除已断开或已注销的槽位
         foreach (var removed in CameraViews.Where(v => !connected.Any(c => string.Equals(c.CameraId, v.CameraId, StringComparison.OrdinalIgnoreCase))).ToList())
         {
-            removed.CurrentImage?.Dispose();
+            // ROI 编辑画面与主相机格子共用同一个 SKBitmap 实例：
+            // 直接 Dispose 后 ROI 控件还会绘制它 → 原生 AccessViolation（进程闪退）。
+            // 先解除 ROI 画面的引用，再释放。
+            ReleaseSharedImage(removed.CurrentImage);
             CameraViews.Remove(removed);
         }
 
@@ -498,6 +501,18 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         }
 
         UpdateCameraModelText();
+    }
+
+    /// <summary>
+    /// 释放与 ROI 编辑画面共用的位图：先解除 ROI 画面的引用再 Dispose。
+    /// 直接释放后 ROI 控件仍可能绘制它 → 原生 AccessViolationException（连接/断开相机时闪退）。
+    /// </summary>
+    private void ReleaseSharedImage(SKBitmap? bitmap)
+    {
+        if (bitmap == null) return;
+        if (ReferenceEquals(RoiEditorViewModel.CurrentImage, bitmap))
+            RoiEditorViewModel.CurrentImage = null;
+        bitmap.Dispose();
     }
 
     /// <summary>
@@ -3073,32 +3088,25 @@ public partial class MainViewModel : ViewModelBase, IDisposable
                 _sopModule = null;
             }
 
-            // 释放图像资源
-            CurrentImage?.Dispose();
-            DetectionResultImage?.Dispose();
-
-            // CameraViews 绑定到 ItemsControl（UI CollectionView），必须在 UI 线程清空，
-            // 否则关闭时在后台线程执行 Clear() 会抛 NotSupportedException
-            var dispatcher = System.Windows.Application.Current?.Dispatcher;
-            if (dispatcher != null && !dispatcher.CheckAccess())
+            // 释放图像资源（可能仍被 ROI 编辑画面引用：先解除引用再释放）
+            void DisposeImages()
             {
-                dispatcher.Invoke(new Action(() =>
-                {
-                    foreach (var item in CameraViews)
-                    {
-                        item.CurrentImage?.Dispose();
-                    }
-                    CameraViews.Clear();
-                }));
-            }
-            else
-            {
+                ReleaseSharedImage(CurrentImage);
+                ReleaseSharedImage(DetectionResultImage);
                 foreach (var item in CameraViews)
                 {
-                    item.CurrentImage?.Dispose();
+                    ReleaseSharedImage(item.CurrentImage);
                 }
                 CameraViews.Clear();
             }
+
+            // CameraViews / SKBitmap 都必须在 UI 线程处理：
+            // 后台线程 Clear() 会抛 NotSupportedException；在渲染期间释放位图则是原生崩溃。
+            var dispatcher = System.Windows.Application.Current?.Dispatcher;
+            if (dispatcher != null && !dispatcher.CheckAccess())
+                dispatcher.Invoke(new Action(DisposeImages));
+            else
+                DisposeImages();
 
             // 释放检测服务（YOLO 推理会话）
             try { _detectionService?.Dispose(); } catch (Exception) { }

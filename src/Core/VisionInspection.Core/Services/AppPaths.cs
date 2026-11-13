@@ -22,7 +22,9 @@ public static class AppPaths
     /// <summary>程序根目录。优先环境变量 VISION_HOME（部署到非程序目录时使用）。</summary>
     public static string Root { get; } = ResolveRoot();
 
-    public static string ConfigDir => Path.Combine(Root, "configs");
+    /// <summary>配置目录：全进程唯一的解析结果（读写都指向它，启动时确定一次）。</summary>
+    public static string ConfigDir { get; } = ResolveConfigDirCore();
+
     public static string ModelsDir => Path.Combine(Root, "models");
     public static string LogsDir => Path.Combine(Root, "logs");
     public static string DataDir => Path.Combine(Root, "data");
@@ -39,30 +41,37 @@ public static class AppPaths
     }
 
     /// <summary>配置文件绝对路径（不保证存在）。<paramref name="relative"/> 可为 "sop_config.json" 或 "sop/sop_phone_usage.yaml"。</summary>
-    public static string Config(string relative)
-    {
-        var direct = Path.Combine(ConfigDir, relative);
-        if (File.Exists(direct)) return direct;
+    public static string Config(string relative) => Path.Combine(ConfigDir, relative);
 
-        // 开发期：从 bin 目录向上找仓库根的 configs/
+    /// <summary>
+    /// 配置目录（与 <see cref="ConfigDir"/> 同一个值）。
+    /// <para>
+    /// 以前这里是"每个文件分别向上找"：读的时候找不到就回退到仓库根，
+    /// 写的时候却可能落到 bin/…/configs（运行时文件不存在 → 写入 → 把目录创建出来）。
+    /// 于是第一次启动正常，写过一次运行时配置后再启动，<see cref="ResolveConfigDir"/>
+    /// 就认了 bin 里那半套目录，配方/相机配置全部"找不到"，只能删 bin 重来。
+    /// 现在改为启动时只解析一次：读写永远同一个目录。
+    /// </para>
+    /// </summary>
+    public static string ResolveConfigDir() => ConfigDir;
+
+    /// <summary>
+    /// 解析配置目录：从程序目录向上找第一个带 configs/sop 的目录。
+    /// configs/sop 是源码树和发布包都有的标志；运行时写出来的"半套" bin/configs
+    /// （只有 camera_config.json 等运行时 json）不带 sop，会被跳过。
+    /// </summary>
+    private static string ResolveConfigDirCore()
+    {
+        // ponytail: 用 configs/sop 作为"真正的配置根"标志（源码树 / 发布包都有）。
+        // 精简发布若去掉 sop，会退化到程序目录/configs；届时在发布根放一个 marker 文件更稳。
         for (var dir = new DirectoryInfo(Root); dir != null; dir = dir.Parent)
         {
-            var candidate = Path.Combine(dir.FullName, "configs", relative);
-            if (File.Exists(candidate)) return candidate;
+            var configs = Path.Combine(dir.FullName, "configs");
+            if (Directory.Exists(Path.Combine(configs, "sop"))) return configs;
         }
-        return direct;
-    }
 
-    /// <summary>配置目录（优先存在的那个；找不到时返回约定目录）。</summary>
-    public static string ResolveConfigDir()
-    {
-        if (Directory.Exists(ConfigDir)) return ConfigDir;
-        for (var dir = new DirectoryInfo(Root); dir != null; dir = dir.Parent)
-        {
-            var candidate = Path.Combine(dir.FullName, "configs");
-            if (Directory.Exists(candidate)) return candidate;
-        }
-        return ConfigDir;
+        // 没有 sop 子目录（精简发布等）：退化到程序目录/configs
+        return Path.Combine(Root, "configs");
     }
 
     /// <summary>日志文件绝对路径（目录不存在时创建）。</summary>
@@ -149,9 +158,15 @@ public static class AppPaths
             catch { /* 忽略 */ }
         }
 
+        var stale = Path.Combine(Root, "configs");
+        var staleNote = Directory.Exists(stale) &&
+                        !string.Equals(stale.TrimEnd(Path.DirectorySeparatorChar), configsDir.TrimEnd(Path.DirectorySeparatorChar), StringComparison.OrdinalIgnoreCase)
+            ? $" | 已忽略程序目录残留={stale}"
+            : "";
+
         return $"Root={Root} | configs={configsDir} | sop={sopDir} | recipes={recipes} | " +
                $"models=[{(modelDirs.Count > 0 ? string.Join(", ", modelDirs) : "无 models/ 目录")}] | " +
-               $"VISION_HOME={(Environment.GetEnvironmentVariable("VISION_HOME") ?? "-")}";
+               $"VISION_HOME={(Environment.GetEnvironmentVariable("VISION_HOME") ?? "-")}{staleNote}";
     }
 
     /// <summary>查找外部可执行文件（如 ffmpeg）：程序目录 → 子目录 → PATH。</summary>

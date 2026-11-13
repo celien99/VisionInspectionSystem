@@ -24,6 +24,11 @@ namespace VisionInspection.UI.Services
         private readonly object _lockObject = new object();
         private GCHandle _bufferHandle;
 
+        // 回调线程与 Dispose 的互斥：Dispose 释放固定缓冲区前必须确认没有在途回调，
+        // 否则 SDK 回调线程读已释放的固定内存 = 原生 AccessViolationException（进程直接消失）。
+        private readonly object _callbackLock = new object();
+        private volatile bool _disposed;
+
         // 图像缓冲区
         private UInt32 _bufferSize = 5120 * 5120 * 3 + 2048;
         private byte[] _buffer;
@@ -113,6 +118,8 @@ namespace VisionInspection.UI.Services
             {
                 try
                 {
+                    if (_disposed) return false;
+
                     // 断开已有连接
                     Disconnect();
 
@@ -209,23 +216,30 @@ namespace VisionInspection.UI.Services
         /// </summary>
         public void Dispose()
         {
+            if (_disposed) return;
+
+            // 先置位：新回调进来直接返回；再停采集/注销回调
             try
             {
+                _disposed = true;
                 System.Diagnostics.Debug.WriteLine("开始释放相机资源...");
-                
-                // 先断开连接（内部会停止采集）
+
+                // 先断开连接（内部会停止采集并注销回调）
                 Disconnect();
-                
-                // 释放缓冲区
-                if (_bufferHandle.IsAllocated)
+
+                // 等在途回调退出后再释放固定缓冲区（SDK 线程可能还有一帧在转换）
+                lock (_callbackLock)
                 {
-                    _bufferHandle.Free();
-                    System.Diagnostics.Debug.WriteLine("相机缓冲区已释放");
+                    if (_bufferHandle.IsAllocated)
+                    {
+                        _bufferHandle.Free();
+                        System.Diagnostics.Debug.WriteLine("相机缓冲区已释放");
+                    }
                 }
-                
+
                 // 清理相机对象
                 _camera = null;
-                
+
                 System.Diagnostics.Debug.WriteLine("相机资源已完全释放");
             }
             catch (Exception ex)
@@ -245,7 +259,7 @@ namespace VisionInspection.UI.Services
         {
             return Task.Run(() =>
             {
-                if (!_isConnected)
+                if (!_isConnected || _disposed)
                 {
                     ErrorOccurred?.Invoke(this, "设备未连接");
                     return false;
@@ -331,6 +345,18 @@ namespace VisionInspection.UI.Services
         /// 图像回调函数
         /// </summary>
         private void ImageCallbackFunc(IntPtr pData, ref MyCamera.MV_FRAME_OUT_INFO_EX pFrameInfo, IntPtr pUser)
+        {
+            // 与 Dispose 互斥：保证回调读缓冲区期间缓冲区不会被释放
+            if (_disposed) return;
+            lock (_callbackLock)
+            {
+                if (_disposed) return;
+                ConvertFrame(pData, ref pFrameInfo);
+            }
+        }
+
+        /// <summary>帧格式转换 + 事件广播（SDK 回调线程执行）</summary>
+        private void ConvertFrame(IntPtr pData, ref MyCamera.MV_FRAME_OUT_INFO_EX pFrameInfo)
         {
             try
             {
@@ -648,10 +674,10 @@ namespace VisionInspection.UI.Services
 
             if (info.nTLayerType == MyCamera.MV_GIGE_DEVICE)
             {
-                // GigE设备
-                IntPtr buffer = Marshal.UnsafeAddrOfPinnedArrayElement(info.SpecialInfo.stGigEInfo, 0);
+                // GigE设备：SDK 把设备信息放在托管数组里，必须先固定再取地址。
+                // UnsafeAddrOfPinnedArrayElement 并不真正固定数组，GC 一搬移就指向野内存（原生崩溃）。
                 MyCamera.MV_GIGE_DEVICE_INFO gigeInfo =
-                    (MyCamera.MV_GIGE_DEVICE_INFO)Marshal.PtrToStructure(buffer, typeof(MyCamera.MV_GIGE_DEVICE_INFO));
+                    ReadDeviceInfo<MyCamera.MV_GIGE_DEVICE_INFO>(info.SpecialInfo.stGigEInfo);
 
                 cameraInfo.Name = gigeInfo.chUserDefinedName;
                 cameraInfo.Model = gigeInfo.chModelName;
@@ -664,9 +690,8 @@ namespace VisionInspection.UI.Services
             else if (info.nTLayerType == MyCamera.MV_USB_DEVICE)
             {
                 // USB设备
-                IntPtr buffer = Marshal.UnsafeAddrOfPinnedArrayElement(info.SpecialInfo.stUsb3VInfo, 0);
                 MyCamera.MV_USB3_DEVICE_INFO usbInfo =
-                    (MyCamera.MV_USB3_DEVICE_INFO)Marshal.PtrToStructure(buffer, typeof(MyCamera.MV_USB3_DEVICE_INFO));
+                    ReadDeviceInfo<MyCamera.MV_USB3_DEVICE_INFO>(info.SpecialInfo.stUsb3VInfo);
 
                 cameraInfo.Name = usbInfo.chUserDefinedName;
                 cameraInfo.Model = usbInfo.chModelName;
@@ -678,6 +703,23 @@ namespace VisionInspection.UI.Services
             }
 
             return cameraInfo;
+        }
+
+        /// <summary>固定托管数组 → 按结构体解析（读取期间 GC 不会搬移）。</summary>
+        private static T ReadDeviceInfo<T>(Array? bytes) where T : struct
+        {
+            if (bytes == null || bytes.Length == 0) return default;
+
+            var handle = GCHandle.Alloc(bytes, GCHandleType.Pinned);
+            try
+            {
+                var parsed = Marshal.PtrToStructure(handle.AddrOfPinnedObject(), typeof(T));
+                return parsed is T value ? value : default;
+            }
+            finally
+            {
+                handle.Free();
+            }
         }
 
         #endregion

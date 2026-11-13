@@ -61,7 +61,7 @@ namespace VisionInspection.UI.Services
         #region 相机枚举
 
         /// <summary>
-        /// 枚举可用 UVC 相机（DirectShow 后端，遍历 0..10 索引）
+        /// 枚举可用 UVC 相机（后端优先级与 <see cref="ConnectAsync"/> 一致：MSMF → DSHOW，遍历 0..10 索引）
         /// </summary>
         public Task<List<CameraInfo>> EnumCamerasAsync()
         {
@@ -74,13 +74,16 @@ namespace VisionInspection.UI.Services
                 {
                     try
                     {
-                        // 跳过已被本进程占用的索引：对同一设备重复开 DSHOW 图会原生崩溃
+                        // 跳过已被本进程占用的索引：对同一设备重复开图会原生崩溃
                         lock (DshowGlobalLock)
                         {
                             if (OccupiedIndices.Contains(i)) continue;
 
-                            using var capture = new VideoCapture(i, VideoCaptureAPIs.DSHOW);
-                            if (!capture.IsOpened())
+                            // 与 ConnectAsync 用同一后端顺序。原先枚举固定走 DSHOW、连接走 MSMF，
+                            // 同一台 UVC 相机被两个原生栈先后开图/销毁（销毁是异步的），
+                            // 紧接的连接就撞上未完成的图销毁 —— "点连接相机直接闪退"的根因之一。
+                            using var capture = TryOpen(i, VideoCaptureAPIs.MSMF) ?? TryOpen(i, VideoCaptureAPIs.DSHOW);
+                            if (capture == null)
                                 continue;
 
                             // 尝试读取一帧以确认相机可用
