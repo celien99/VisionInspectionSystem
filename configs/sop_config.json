@@ -1,7 +1,7 @@
 {
   "SOPModule": {
     "ModelPath": "yolo_models/yolov8s.onnx",
-    "UseGpu": false,
+    "UseGpu": true,
     "GpuId": 0,
     "ConfidenceThreshold": 0.6,
     "IouThreshold": 0.45,
@@ -10,7 +10,7 @@
       "ModelPath": "models",
       "ConfidenceThreshold": 0.3,
       "MaxNumHands": 2,
-      "UseGpu": false,
+      "UseGpu": true,
       "InferenceInterval": 2,
       "RotationAugmentation": false,
       "DetectionConfidenceThreshold": 0.2

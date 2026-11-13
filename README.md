@@ -79,6 +79,25 @@ dotnet build -p:YoloEp=Cuda           :: GPU，需自行安装 CUDA Toolkit 12.x
 
 CPU 构建下界面的「GPU/CPU」开关不会生效（日志会说明），检测按 CPU 运行。
 
+#### CUDA 一键构建（推荐）
+
+目标机装好 .NET 8 SDK + NVIDIA 驱动 + **CUDA Toolkit 12.x** + **cuDNN 9.x**（两者的 `bin` 目录都要在 `PATH` 中）后，运行：
+
+```bat
+scripts\build_cuda.bat              :: Debug
+scripts\build_cuda.bat --release    :: Release
+```
+
+脚本会自动完成：
+
+1. 检查程序是否正在运行（被占用会中止，避免输出文件锁定导致构建失败）；
+2. 检查 CUDA 12.x / cuDNN 9.x 运行库（缺失即中止并给出安装提示，避免"构建成功但运行仍显示 CUDA 不可用"）；
+3. 清理并执行 `dotnet build -p:YoloEp=Cuda`；
+4. 校验产物确实是 CUDA 版（`YoloDotNet.ExecutionProvider.Cuda.dll`、`onnxruntime_providers_cuda.dll`）。
+
+> 构建完成后直接运行 `bin\Debug\net8.0-windows\VisionInspection.UI.exe` 即可使用 GPU。
+> 在 Visual Studio 中按 F5 或执行不带参数的 `dotnet build` 会重新编译成 CPU 版，覆盖当前产物。
+
 ### 目录约定（全部可在运行时解析，无需改代码）
 
 | 位置 | 用途 | 说明 |
