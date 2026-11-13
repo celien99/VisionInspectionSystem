@@ -144,19 +144,28 @@ namespace VisionInspection.UI.Services
             // ---- ② 粗抽 ----
             progress?.Report(new AcquireProgress { Phase = "粗抽", Message = "ffmpeg 抽帧中...", Percent = 5 });
             var filters = BuildFilters(cfg, meta, out var stepFrames, out var needVfr);
-            var args = BuildFfmpegArgs(videoPath, cfg, meta, filters, needVfr, outPattern, ext);
+            // 只有 select/scene 这类策略需要 vfr；fps= 策略不需要，避免多起一次进程做版本探测
+            var useFpsMode = needVfr && SupportsFpsMode(ffmpeg);
+            var args = BuildFfmpegArgs(videoPath, cfg, meta, filters, needVfr, outPattern, ext, useFpsMode);
 
-            var (candidates, exitCode) = await RunCoarseExtractionAsync(ffmpeg, args, progress, ct, tmpDir, ext);
+            var (candidates, exitCode, ffmpegError) = await RunCoarseExtractionAsync(ffmpeg, args, progress, ct, tmpDir, ext);
             summary.CandidateCount = candidates.Count;
 
             if (candidates.Count == 0)
             {
                 if (cfg.CleanupTemp) TryDeleteDir(tmpDir);
                 summary.ElapsedSec = sw.Elapsed.TotalSeconds;
-                summary.Message = "粗抽未产出任何帧。" +
+                summary.Message = (exitCode != 0
+                        ? $"粗抽失败（ffmpeg 退出码 {exitCode}）。"
+                        : "粗抽未产出任何帧。") +
                     (cfg.Strategy == ExtractStrategy.SceneChange
                         ? $"场景阈值 {cfg.SceneThreshold} 可能过高（该视频画面变化量不足），建议降到 0.05 以下。"
                         : "请检查采样参数或视频内容。");
+                // ffmpeg 的真实报错必须带出来：否则用户只能看到"未产出帧"，无从判断是编码不支持、
+                // 参数不兼容还是路径/权限问题。同时附上实际执行的命令，便于在 cmd 里复现。
+                summary.ErrorDetail =
+                    "命令：" + FormatCommandLine(ffmpeg, args) + Environment.NewLine + Environment.NewLine +
+                    (string.IsNullOrWhiteSpace(ffmpegError) ? "(ffmpeg 无输出)" : ffmpegError);
                 return summary;
             }
 
@@ -262,7 +271,69 @@ namespace VisionInspection.UI.Services
 
         // ==================== 内部实现 ====================
 
-        private static async Task<(List<string> Files, int ExitCode)> RunCoarseExtractionAsync(
+        /// <summary>
+        /// 当前 ffmpeg 是否支持 -fps_mode（5.1+）。更老的版本只认 -vsync，二者不兼容，必须按实际版本选。
+        /// 结果按进程缓存：抽一次帧只探测一次。
+        /// </summary>
+        private static readonly object _fpsModeLock = new();
+        private static bool? _fpsModeSupported;
+
+        private static bool SupportsFpsMode(string ffmpeg)
+        {
+            lock (_fpsModeLock)
+            {
+                if (_fpsModeSupported.HasValue) return _fpsModeSupported.Value;
+            }
+
+            // 解析不出版本号（如每日构建 N-xxxx）时按现代版本处理
+            var supported = true;
+            try
+            {
+                var psi = new ProcessStartInfo(ffmpeg)
+                {
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    StandardOutputEncoding = Encoding.UTF8,
+                    StandardErrorEncoding = Encoding.UTF8
+                };
+                psi.ArgumentList.Add("-version");
+
+                using var p = Process.Start(psi);
+                if (p != null)
+                {
+                    var text = p.StandardOutput.ReadToEnd() + p.StandardError.ReadToEnd();
+                    p.WaitForExit(3000);
+
+                    var match = Regex.Match(text, @"ffmpeg version n?(\d+)\.(\d+)");
+                    if (match.Success && int.TryParse(match.Groups[1].Value, out var major))
+                    {
+                        var minor = int.TryParse(match.Groups[2].Value, out var m) ? m : 0;
+                        supported = major > 5 || (major == 5 && minor >= 1);
+                        Debug.WriteLine($"[抽帧] ffmpeg {major}.{minor} → {(supported ? "-fps_mode" : "-vsync")} vfr");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[抽帧] 探测 ffmpeg 版本失败，按现代版本处理: {ex.Message}");
+            }
+
+            lock (_fpsModeLock) { _fpsModeSupported = supported; }
+            return supported;
+        }
+
+        /// <summary>把 ffmpeg 调用还原成可复制到命令行复现的一行（路径/含空格参数加引号）。</summary>
+        private static string FormatCommandLine(string ffmpeg, List<string> args)
+        {
+            static string Quote(string s) =>
+                s.IndexOfAny(new[] { ' ', '\t', '&', '|', '<', '>', '^' }) >= 0 ? $"\"{s}\"" : s;
+
+            return Quote(ffmpeg) + " " + string.Join(" ", args.Select(Quote));
+        }
+
+        private static async Task<(List<string> Files, int ExitCode, string ErrorTail)> RunCoarseExtractionAsync(
             string ffmpeg, List<string> args, IProgress<AcquireProgress>? progress, CancellationToken ct,
             string tmpDir, string ext)
         {
@@ -312,14 +383,15 @@ namespace VisionInspection.UI.Services
 
             // 注意：select 类过滤可能一帧都选不出来（例如场景阈值过高），
             // 此时 ffmpeg 会非零退出。不能一概抛异常，交给上层按"实际产出文件数"判断。
+            var errorTail = SplitTail(errorBuilder.ToString(), 800);
             if (p.ExitCode != 0)
-                Debug.WriteLine("[抽帧] ffmpeg 非零退出 " + p.ExitCode + "：" + SplitTail(errorBuilder.ToString(), 400));
+                Debug.WriteLine("[抽帧] ffmpeg 非零退出 " + p.ExitCode + "：" + errorTail);
 
             var collected = Directory.Exists(tmpDir)
                 ? Directory.GetFiles(tmpDir, "*." + ext).OrderBy(x => x, StringComparer.Ordinal).ToList()
                 : new List<string>();
 
-            return (collected, p.ExitCode);
+            return (collected, p.ExitCode, errorTail);
         }
 
         private int EstimateCandidateCount(VideoMeta meta, ExtractConfig cfg)
@@ -418,7 +490,7 @@ namespace VisionInspection.UI.Services
         }
 
         private static List<string> BuildFfmpegArgs(string videoPath, ExtractConfig cfg, VideoMeta meta,
-            List<string> filters, bool needVfr, string outPattern, string ext)
+            List<string> filters, bool needVfr, string outPattern, string ext, bool useFpsMode)
         {
             var args = new List<string> { "-y", "-hide_banner", "-loglevel", "error", "-progress", "pipe:1", "-nostats" };
 
@@ -447,8 +519,13 @@ namespace VisionInspection.UI.Services
                 args.Add(string.Join(",", filters));
             }
 
-            if (needVfr) args.Add("-vsync");
-            if (needVfr) args.Add("vfr");
+            if (needVfr)
+            {
+                // -vsync 在新版 ffmpeg 已移除；-fps_mode 是它的替代（ffmpeg 5.1+）。
+                // 两者不存在交集，所以必须按实际使用的 ffmpeg 版本选择，不能写死。
+                args.Add(useFpsMode ? "-fps_mode" : "-vsync");
+                args.Add("vfr");
+            }
 
             if (ext == "jpg")
             {

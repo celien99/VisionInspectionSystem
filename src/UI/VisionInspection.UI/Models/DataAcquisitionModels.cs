@@ -190,6 +190,8 @@ namespace VisionInspection.UI.Models
         public int NegativeCount { get; set; }
         public double ElapsedSec { get; set; }
         public string Message { get; set; } = "";
+        /// <summary>失败时的原始错误（ffmpeg stderr 末尾），供界面直接展示，避免"只报未产出帧"</summary>
+        public string ErrorDetail { get; set; } = "";
         public System.Collections.Generic.List<FrameRecord> Records { get; set; } = new();
     }
 

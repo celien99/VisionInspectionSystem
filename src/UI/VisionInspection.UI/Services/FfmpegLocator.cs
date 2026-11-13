@@ -6,7 +6,7 @@ namespace VisionInspection.UI.Services
 {
     /// <summary>
     /// ffmpeg / ffprobe 可执行文件定位器。
-    /// 搜索顺序：显式配置路径 → 逐级向上查找 &lt;dir&gt;/ffmpeg/bin → 逐级向上查找 &lt;dir&gt; → 当前工作目录。
+    /// 搜索顺序：VISION_FFMPEG_DIR 环境变量 → 显式注入目录 → 逐级向上查找 &lt;dir&gt;/ffmpeg/bin 与 &lt;dir&gt; → 系统 PATH。
     /// 注意：不要用 Path.Combine(BaseDirectory,".."*N) 硬编码层数，改为逐级向上遍历（历史教训：少回退一层就漏）。
     /// </summary>
     public static class FfmpegLocator
@@ -25,12 +25,22 @@ namespace VisionInspection.UI.Services
         {
             try
             {
+                // ① 显式配置：VISION_FFMPEG_DIR（README / 使用手册承诺支持）
+                var envDir = Environment.GetEnvironmentVariable("VISION_FFMPEG_DIR");
+                if (!string.IsNullOrWhiteSpace(envDir))
+                {
+                    var p = System.IO.Path.Combine(envDir.Trim(), exeName);
+                    if (File.Exists(p)) return p;
+                }
+
+                // ② 代码注入的显式目录
                 if (!string.IsNullOrWhiteSpace(OverrideDirectory))
                 {
                     var p = System.IO.Path.Combine(OverrideDirectory!, exeName);
                     if (File.Exists(p)) return p;
                 }
 
+                // ③ 程序目录及其逐级上级目录的 ffmpeg/bin、bin、目录自身
                 foreach (var dir in CandidateDirectories())
                 {
                     var p = System.IO.Path.Combine(dir, exeName);
@@ -40,6 +50,30 @@ namespace VisionInspection.UI.Services
             catch
             {
                 // 路径异常忽略
+            }
+
+            // ④ 系统 PATH：用户已经装好 ffmpeg 并加入 PATH 的情况（文档承诺支持）
+            return FindOnPath(exeName);
+        }
+
+        /// <summary>在系统 PATH 中查找可执行文件；找不到返回 null。</summary>
+        private static string? FindOnPath(string exeName)
+        {
+            var pathVar = Environment.GetEnvironmentVariable("PATH") ?? "";
+            foreach (var raw in pathVar.Split(System.IO.Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
+            {
+                try
+                {
+                    var dir = raw.Trim().Trim('"');
+                    if (dir.Length == 0) continue;
+
+                    var candidate = System.IO.Path.Combine(dir, exeName);
+                    if (File.Exists(candidate)) return candidate;
+                }
+                catch
+                {
+                    // 非法 PATH 项忽略
+                }
             }
 
             return null;
@@ -53,14 +87,17 @@ namespace VisionInspection.UI.Services
 
             if (!File.Exists(ffmpeg))
             {
-                error = $"未找到 {FfmpegExe}。请将 ffmpeg 的 ffmpeg.exe / ffprobe.exe 放到程序目录下的 ffmpeg\\bin\\（或任意上级目录的 ffmpeg\\bin\\）。";
+                error = $"未找到 {FfmpegExe}。三选一：\n" +
+                        "  • 放到程序目录（或任意上级目录）的 ffmpeg\\bin\\ 下；\n" +
+                        "  • 把 ffmpeg 目录加入系统 PATH；\n" +
+                        "  • 设置环境变量 VISION_FFMPEG_DIR 指向含 ffmpeg.exe 的目录。";
                 ffmpeg = "";
                 return false;
             }
 
             if (!File.Exists(ffprobe))
             {
-                error = $"未找到 {FfprobeExe}（通常与 ffmpeg.exe 同目录）。";
+                error = $"未找到 {FfprobeExe}（一般与 ffmpeg.exe 在同一目录）。";
                 return false;
             }
 

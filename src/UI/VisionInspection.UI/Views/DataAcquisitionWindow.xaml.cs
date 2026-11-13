@@ -621,6 +621,15 @@ public partial class DataAcquisitionWindow : Window
             }
 
             ShowSummary(summary);
+
+            // 一帧都没产出是硬失败：把 ffmpeg 的原始报错直接弹出来，不再只给一句"请检查参数"
+            if (summary.CandidateCount == 0)
+            {
+                var text = summary.Message;
+                if (!string.IsNullOrWhiteSpace(summary.ErrorDetail))
+                    text += "\n\nffmpeg 输出（末尾）：\n" + summary.ErrorDetail;
+                MessageBox.Show(this, text, "抽帧失败", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
         }
         catch (OperationCanceledException)
         {
@@ -703,6 +712,13 @@ public partial class DataAcquisitionWindow : Window
             lines.Add($"预标注：有目标 {s.LabeledCount} 张，负样本 {s.NegativeCount} 张");
 
         lines.Add("输出目录：" + s.SessionDir);
+
+        if (!string.IsNullOrWhiteSpace(s.ErrorDetail))
+        {
+            lines.Add("");
+            lines.Add("ffmpeg 输出（末尾）：");
+            lines.Add(s.ErrorDetail);
+        }
 
         txtSummary.Text = string.Join(Environment.NewLine, lines);
         listResults.ItemsSource = s.Records;
