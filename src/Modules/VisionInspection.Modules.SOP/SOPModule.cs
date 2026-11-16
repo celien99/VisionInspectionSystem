@@ -309,11 +309,22 @@ public class SOPModule : IDetectionModule
     }
 
     /// <summary>
-    /// 初始?YOLO（启动时调用一次）
+    /// 初始化 YOLO（启动时调用一次）
     /// </summary>
     private async Task InitializeYoloAsync()
     {
         await LoadYoloAsync(_config.ModelPath, _config.UseGpu, _config.GpuId.ToString());
+
+        // 启动时 CUDA 不可用（未安装 / 版本不匹配，例如只装了 CUDA 13 而 ORT 1.23 需要 CUDA 12）
+        // → 自动回退 CPU。否则整个模块会没有模型、界面却显示"初始化完成"，表现为静默零检出。
+        if (_yolo == null && _config.UseGpu)
+        {
+            Log("CUDA 不可用：GPU 模型加载失败，启动时自动回退 CPU（原因见上方模型加载失败日志）");
+            _config.UseGpu = false;
+            _lastLoadedModelPath = null;
+            await LoadYoloAsync(_config.ModelPath, false, _config.GpuId.ToString());
+            GpuSwitchFailed?.Invoke(this, EventArgs.Empty);
+        }
     }
 
     /// <summary>

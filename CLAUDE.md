@@ -63,6 +63,12 @@ UI (WPF + MVVM)
 
 The intended boundary is that SOP/UI consume domain types (`DetectedObject`, `HandPoseEstimationResult`), not YoloDotNet types. Current exceptions: `YoloPoseHandEstimationService` in Modules.SOP directly creates a `Yolo` instance for pose and an `Microsoft.ML.OnnxRuntime.InferenceSession` for the landmark model. Do not spread this pattern further; extend `YoloModel` instead.
 
+## Development constraints
+
+- **Minimal-scope verification only.** No full-suite / "test everything" passes. Verify only the smallest scope the change touches (one runnable check for non-trivial logic), and do not invent test projects or test commands — this repo has none.
+- **Fix root causes, never patch over symptoms.** Read the real flow and every caller of the function you touch before editing. The fix goes once in the shared path — no per-caller guards, fallbacks, or "just in case" workarounds for a reported symptom.
+- **Keep it modular.** Reuse the existing helper/type for the job (`AppPaths`, `YoloModel`, existing evaluators) instead of re-implementing it; keep the dependency direction above; do not let UI/SOP absorb detection or YoloDotNet concepts; no duplicated logic and no new cross-module coupling.
+
 ## Runtime architecture
 
 **Startup:** `App.xaml.cs` installs crash handlers, writes `logs/startup.log` (`AppPaths.Describe()`), opens `LoginWindow` (SQLite users in `data/users.db`), then `MainWindow`/`MainViewModel`, then starts the Modbus singleton. There is no DI container; `MainViewModel` constructs services, and `CameraManager.Instance` / `ModbusService.Instance` / `RegionConfigManager.Instance` are singletons.

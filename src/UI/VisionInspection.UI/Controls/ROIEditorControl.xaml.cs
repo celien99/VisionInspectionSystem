@@ -266,8 +266,10 @@ public partial class ROIEditorControl : SKElement
                     // 计算图像适应控件大小的缩放比例（UniformToFill模式 - 填充整个控件）
                     float imageWidth = ViewModel.CurrentImage.Width;
                     float imageHeight = ViewModel.CurrentImage.Height;
-                    float controlWidth = (float)ActualWidth;
-                    float controlHeight = (float)ActualHeight;
+                    // 用画布物理像素而非 DIP，否则高 DPI 下图像只填满控件的一部分
+                    var canvasSize = GetCanvasPixelSize();
+                    float controlWidth = canvasSize.Width;
+                    float controlHeight = canvasSize.Height;
                     
                     float scaleX = controlWidth / imageWidth;
                     float scaleY = controlHeight / imageHeight;
@@ -318,25 +320,11 @@ public partial class ROIEditorControl : SKElement
         var imageWidth = ViewModel.CurrentImage.Width;
         var imageHeight = ViewModel.CurrentImage.Height;
 
-        // 应用变换：先平移到控件中心，然后缩放，再旋转/翻转，最后平移使图像居中
-        canvas.Translate(info.Width / 2.0f, info.Height / 2.0f);  // 移到控件中心
-        canvas.Scale(_zoomScale);  // 应用缩放
-        
-        // 应用图像旋转（围绕图像中心）
-        if (ViewModel.ImageRotationAngle != 0)
-        {
-            canvas.RotateDegrees(ViewModel.ImageRotationAngle, 0, 0);
-        }
-        
-        // 应用水平翻转（左右对调）
-        if (ViewModel.IsImageFlippedHorizontally)
-        {
-            canvas.Scale(-1, 1, 0, 0);  // X轴翻转
-        }
-        
-        canvas.Translate(_panOffset.X, _panOffset.Y);  // 平移使图像居中
+        // 应用变换：控件中心 → 缩放 → 旋转/翻转 → 图像平移。
+        // 鼠标反向换算（ScreenToCanvas）复用同一矩阵，保证标注位置与鼠标严格一致。
+        canvas.Concat(BuildImageToCanvasMatrix(info.Width, info.Height));
 
-        // 绘制图像（使用原始尺寸，缩放由canvas.Scale处理）
+        // 绘制图像（使用原始尺寸，缩放由上面应用的变换矩阵处理）
         var drawRect = new SKRect(0, 0, imageWidth, imageHeight);
         canvas.DrawBitmap(ViewModel.CurrentImage, drawRect);
 
@@ -653,31 +641,55 @@ public partial class ROIEditorControl : SKElement
     }
 
     /// <summary>
-    /// 将屏幕坐标转换为图像坐标（考虑缩放、平移和控件中心）
+    /// 构建"图像坐标 → 画布像素"的变换矩阵，顺序与 OnPaintSurface 绘制完全一致：
+    /// 画布中心平移 → 缩放 → 旋转 → 水平翻转 → 图像平移。
+    /// </summary>
+    private SKMatrix BuildImageToCanvasMatrix(float canvasWidth, float canvasHeight)
+    {
+        // SKMatrix.Concat(a, b) = a × b；画布变换是后调用的先作用于点，所以从图像平移往外拼。
+        var m = SKMatrix.CreateTranslation(_panOffset.X, _panOffset.Y);
+
+        if (ViewModel?.IsImageFlippedHorizontally == true)
+            m = SKMatrix.Concat(SKMatrix.CreateScale(-1, 1), m);
+
+        float angle = ViewModel?.ImageRotationAngle ?? 0f;
+        if (angle != 0)
+            m = SKMatrix.Concat(SKMatrix.CreateRotationDegrees(angle), m);
+
+        m = SKMatrix.Concat(SKMatrix.CreateScale(_zoomScale, _zoomScale), m);
+        return SKMatrix.Concat(SKMatrix.CreateTranslation(canvasWidth / 2f, canvasHeight / 2f), m);
+    }
+
+    /// <summary>
+    /// 画布实际像素尺寸。SKElement 在高 DPI 下按物理像素建画布（e.Info），
+    /// 与 WPF 布局 DIP 尺寸（ActualWidth/Height）不同，两者不能混用。
+    /// </summary>
+    private SKSize GetCanvasPixelSize()
+    {
+        var dpi = VisualTreeHelper.GetDpi(this);
+        return new SKSize(
+            (float)(ActualWidth * dpi.DpiScaleX),
+            (float)(ActualHeight * dpi.DpiScaleY));
+    }
+
+    /// <summary>
+    /// 将鼠标坐标（WPF DIP）转换为图像坐标：先按显示器 DPI 换算为画布像素，
+    /// 再用绘制矩阵的逆变换映射（DPI 缩放、平移、缩放、旋转、翻转统一处理）。
     /// </summary>
     private SKPoint ScreenToCanvas(Point screenPoint)
     {
         if (ViewModel?.CurrentImage == null) return new SKPoint(0, 0);
 
-        var imageWidth = ViewModel.CurrentImage.Width;
-        var imageHeight = ViewModel.CurrentImage.Height;
-        var controlWidth = ActualWidth;
-        var controlHeight = ActualHeight;
+        var dpi = VisualTreeHelper.GetDpi(this);
+        var canvasPoint = new SKPoint(
+            (float)(screenPoint.X * dpi.DpiScaleX),
+            (float)(screenPoint.Y * dpi.DpiScaleY));
 
-        // 计算控件中心到图像左上角的偏移（与绘制时一致）
-        // 绘制时: canvas.Translate(info.Width / 2.0f, info.Height / 2.0f);
-        //         canvas.Scale(_zoomScale);
-        //         canvas.Translate(_panOffset.X, _panOffset.Y);
-        // 逆变换: 先减去控件中心，除以缩放，再减去平移偏移
+        var canvasSize = GetCanvasPixelSize();
+        if (canvasSize.Width <= 0 || canvasSize.Height <= 0) return canvasPoint;
 
-        float centerX = (float)(controlWidth / 2.0f);
-        float centerY = (float)(controlHeight / 2.0f);
-
-        // 逆变换计算
-        float imageX = (float)((screenPoint.X - centerX) / _zoomScale - _panOffset.X);
-        float imageY = (float)((screenPoint.Y - centerY) / _zoomScale - _panOffset.Y);
-
-        return new SKPoint(imageX, imageY);
+        var matrix = BuildImageToCanvasMatrix(canvasSize.Width, canvasSize.Height);
+        return matrix.TryInvert(out var inverse) ? inverse.MapPoint(canvasPoint) : canvasPoint;
     }
 
     private void OnMouseDown(object sender, MouseButtonEventArgs e)
@@ -740,7 +752,7 @@ public partial class ROIEditorControl : SKElement
         {
             // 非ROI创建模式下，左键拖动进行平移
             _isPanning = true;
-            _panStart = new SKPoint((float)point.X, (float)point.Y);
+            _panStart = skPoint; // 图像坐标：平移量与缩放/DPI/旋转/翻转无关
             _panStartOffset = _panOffset;
             CaptureMouse();
         }
@@ -822,11 +834,10 @@ public partial class ROIEditorControl : SKElement
         }
         else if (_isPanning)
         {
-            // 平移图像
-            var deltaX = (float)point.X - _panStart.X;
-            var deltaY = (float)point.Y - _panStart.Y;
-            _panOffset.X = _panStartOffset.X + deltaX;
-            _panOffset.Y = _panStartOffset.Y + deltaY;
+            // 平移图像：鼠标位移经逆变换换算为图像坐标位移，拖动时图像严格跟随鼠标
+            _panOffset = new SKPoint(
+                _panStartOffset.X + (skPoint.X - _panStart.X),
+                _panStartOffset.Y + (skPoint.Y - _panStart.Y));
             InvalidateVisual();
         }
         else if (ViewModel.IsEditing)
@@ -877,10 +888,6 @@ public partial class ROIEditorControl : SKElement
     {
         if (ViewModel?.CurrentImage == null) return;
 
-        var mousePos = e.GetPosition(this);
-        var controlCenterX = ActualWidth / 2;
-        var controlCenterY = ActualHeight / 2;
-
         // 计算新的缩放比例
         float newScale;
         if (e.Delta > 0)
@@ -892,19 +899,14 @@ public partial class ROIEditorControl : SKElement
             newScale = Math.Max(_zoomScale * 0.9f, MinZoom);
         }
 
-        // 以鼠标位置为中心缩放的算法（基于控件中心坐标系）
-        // 1. 将鼠标位置转换为相对于控件中心的坐标
-        float mouseOffsetX = (float)(mousePos.X - controlCenterX);
-        float mouseOffsetY = (float)(mousePos.Y - controlCenterY);
-        
-        // 2. 计算缩放比例
-        float scaleRatio = newScale / _zoomScale;
-        
-        // 3. 调整平移偏移，使鼠标位置保持不变
-        // 新的平移偏移 = 旧平移偏移 - (鼠标偏移 * (1 - 缩放比例))
-        _panOffset.X = _panOffset.X - mouseOffsetX * (1 - scaleRatio) / newScale;
-        _panOffset.Y = _panOffset.Y - mouseOffsetY * (1 - scaleRatio) / newScale;
-        
+        // 以鼠标处的图像点为中心缩放：缩放前后该点仍位于鼠标下。
+        // 由绘制矩阵推导：pan' = (pan + anchor) * (旧缩放/新缩放) - anchor
+        var anchor = ScreenToCanvas(e.GetPosition(this));
+        float ratio = _zoomScale / newScale;
+
+        _panOffset = new SKPoint(
+            (_panOffset.X + anchor.X) * ratio - anchor.X,
+            (_panOffset.Y + anchor.Y) * ratio - anchor.Y);
         _zoomScale = newScale;
 
         InvalidateVisual();
@@ -923,8 +925,9 @@ public partial class ROIEditorControl : SKElement
         {
             float imageWidth = ViewModel.CurrentImage.Width;
             float imageHeight = ViewModel.CurrentImage.Height;
-            float controlWidth = (float)ActualWidth;
-            float controlHeight = (float)ActualHeight;
+            var canvasSize = GetCanvasPixelSize();
+            float controlWidth = canvasSize.Width;
+            float controlHeight = canvasSize.Height;
             
             float scaleX = controlWidth / imageWidth;
             float scaleY = controlHeight / imageHeight;
@@ -961,8 +964,9 @@ public partial class ROIEditorControl : SKElement
     {
         if (ViewModel?.CurrentImage == null) return;
 
-        var actualWidth = ActualWidth;
-        var actualHeight = ActualHeight;
+        var canvasSize = GetCanvasPixelSize();
+        var actualWidth = canvasSize.Width;
+        var actualHeight = canvasSize.Height;
 
         if (actualWidth <= 0 || actualHeight <= 0) return;
 
