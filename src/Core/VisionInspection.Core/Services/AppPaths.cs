@@ -169,6 +169,16 @@ public static class AppPaths
                $"VISION_HOME={(Environment.GetEnvironmentVariable("VISION_HOME") ?? "-")}{staleNote}";
     }
 
+    /// <summary>与模型路径解析共用搜索根，供模型管理、向导和基准测试使用。</summary>
+    public static IEnumerable<string> FindModelDirectories()
+        => SearchRoots().SelectMany(root => ModelSubdirs.Select(sub => Path.Combine(root, sub)))
+            .Where(Directory.Exists).Distinct(StringComparer.OrdinalIgnoreCase);
+
+    public static List<string> FindModelFiles()
+        => FindModelDirectories().SelectMany(dir => Directory.EnumerateFiles(dir, "*.onnx", SearchOption.AllDirectories))
+            .Select(Path.GetFullPath).Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(path => path, StringComparer.OrdinalIgnoreCase).ToList();
+
     /// <summary>查找外部可执行文件（如 ffmpeg）：程序目录 → 子目录 → PATH。</summary>
     public static string? FindExecutable(string exeName, params string[] subdirs)
     {

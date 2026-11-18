@@ -397,7 +397,7 @@ namespace VisionInspection.UI.Views
             StepModelCombo.Items.Add(new ModelOptionItem { Display = "（默认：全局模型）", Value = "" });
             try
             {
-                foreach (var file in new ModelManager().ScanOnnxFiles())
+                foreach (var file in AppPaths.FindModelFiles())
                 {
                     var idx = file.IndexOf("yolo_models", StringComparison.OrdinalIgnoreCase);
                     string rel = idx >= 0 ? file.Substring(idx).Replace('\\', '/') : file;
@@ -851,7 +851,7 @@ namespace VisionInspection.UI.Views
             ModelPathCombo.Items.Clear();
             try
             {
-                foreach (var file in new ModelManager().ScanOnnxFiles())
+                foreach (var file in AppPaths.FindModelFiles())
                 {
                     var idx = file.IndexOf("yolo_models", StringComparison.OrdinalIgnoreCase);
                     string rel = idx >= 0 ? file.Substring(idx).Replace('\\', '/') : file;

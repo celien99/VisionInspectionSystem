@@ -49,7 +49,8 @@ namespace VisionInspection.UI.Services
             // 关键修复：不再用固定层数 ".." 回退（少算一层会导致漏掉项目根的 yolo_models）。
             // 改为从 BaseDirectory 向上逐级探测所有包含 yolo_models 子目录的祖先目录，
             // 无论目录深度如何都能正确找到模型位置。
-            _yoloModelsDirectories = FindYoloModelsDirectories(AppDomain.CurrentDomain.BaseDirectory);
+            _yoloModelsDirectories = AppPaths.FindModelDirectories()
+                .Where(dir => string.Equals(Path.GetFileName(dir), "yolo_models", StringComparison.OrdinalIgnoreCase)).ToList();
             // 优先使用最靠近 BaseDirectory 的那个（通常是项目根 yolo_models）作为主目录
             _yoloModelsDirectory = _yoloModelsDirectories.FirstOrDefault()
                 ?? Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "yolo_models");
@@ -63,51 +64,12 @@ namespace VisionInspection.UI.Services
             InitializeDatabase();
         }
 
-        /// <summary>
-        /// 从指定目录向上逐级查找所有含 yolo_models 子目录的祖先目录（去重、由近及远）。
-        /// </summary>
-        private static List<string> FindYoloModelsDirectories(string startDir)
-        {
-            var found = new List<string>();
-            var dir = new DirectoryInfo(startDir);
-            // 向上遍历，直到到达盘符根目录
-            while (dir != null && dir.Parent != null)
-            {
-                var candidate = Path.Combine(dir.FullName, "yolo_models");
-                if (Directory.Exists(candidate)
-                    && !found.Any(x => string.Equals(x, candidate, StringComparison.OrdinalIgnoreCase)))
-                {
-                    found.Add(candidate);
-                }
-                dir = dir.Parent;
-            }
-            return found;
-        }
 
         /// <summary>
         /// 获取YOLO模型文件夹路径（主目录，通常为项目根 yolo_models）
         /// </summary>
         public string YoloModelsDirectory => _yoloModelsDirectory;
 
-        /// <summary>
-        /// 轻量扫描：列出探测到的所有 yolo_models 目录下的 .onnx 文件（不分析模型元数据，速度快）。
-        /// 供向导/配置窗口的"模型选择"下拉使用。
-        /// </summary>
-        public List<string> ScanOnnxFiles()
-        {
-            var results = new List<string>();
-            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var dir in _yoloModelsDirectories)
-            {
-                if (!Directory.Exists(dir)) continue;
-                foreach (var filePath in Directory.GetFiles(dir, "*.onnx", SearchOption.AllDirectories))
-                {
-                    var fullPath = Path.GetFullPath(filePath);
-                    if (seen.Add(fullPath)) results.Add(fullPath);
-                }
-            }
-            return results.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToList();
-        }
 
         /// <summary>
         /// 扫描模型文件夹中的ONNX模型（自动探测到的所有 yolo_models 目录，合并去重）

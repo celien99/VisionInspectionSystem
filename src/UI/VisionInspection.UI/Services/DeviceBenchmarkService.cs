@@ -498,48 +498,17 @@ namespace VisionInspection.UI.Services
         }
 
         /// <summary>
-        /// 扫描可用于基准测试的 YOLO 模型（yolo_models 目录下的 onnx）。
+        /// 扫描标准模型目录中的 YOLO 模型，排除 MediaPipe 手部模型。
         /// </summary>
         public static List<string> ScanYoloModels()
         {
-            var results = new List<string>();
-            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
             try
             {
-                var dir = new DirectoryInfo(AppDomain.CurrentDomain.BaseDirectory);
-                for (int i = 0; i < 8 && dir != null; i++)
-                {
-                    // 1) yolo_models（主来源，位于项目根，从 bin 向上 7 层）
-                    var yoloDir = Path.Combine(dir.FullName, "yolo_models");
-                    if (Directory.Exists(yoloDir))
-                    {
-                        foreach (var f in Directory.GetFiles(yoloDir, "*.onnx", SearchOption.TopDirectoryOnly))
-                        {
-                            if (seen.Add(Path.GetFileName(f))) results.Add(f);
-                        }
-                        break;
-                    }
-                    dir = dir.Parent;
-                }
-
-                // 2) 兜底：部分部署会把模型统一复制到 bin/models/ 下，
-                //    此时 yolo_models 不存在，需从 models 里挑出非 MediaPipe 的检测模型。
-                var modelsDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "models");
-                if (Directory.Exists(modelsDir))
-                {
-                    foreach (var f in Directory.GetFiles(modelsDir, "*.onnx", SearchOption.TopDirectoryOnly))
-                    {
-                        var name = Path.GetFileName(f);
-                        if (name.Equals(PalmModelFileName, StringComparison.OrdinalIgnoreCase)) continue;
-                        if (name.Equals(LandmarkModelFileName, StringComparison.OrdinalIgnoreCase)) continue;
-                        if (seen.Add(name)) results.Add(f);
-                    }
-                }
+                return AppPaths.FindModelFiles().Where(path =>
+                    !string.Equals(Path.GetFileName(path), PalmModelFileName, StringComparison.OrdinalIgnoreCase) &&
+                    !string.Equals(Path.GetFileName(path), LandmarkModelFileName, StringComparison.OrdinalIgnoreCase)).ToList();
             }
-            catch { }
-
-            return results.OrderBy(p => Path.GetFileName(p), StringComparer.OrdinalIgnoreCase).ToList();
+            catch { return new List<string>(); }
         }
     }
 }

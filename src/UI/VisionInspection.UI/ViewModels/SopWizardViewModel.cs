@@ -1,3 +1,4 @@
+using VisionInspection.Core.Services;
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
@@ -179,7 +180,7 @@ public partial class SopWizardViewModel : ObservableObject
         List<string> files;
         try
         {
-            files = new Services.ModelManager().ScanOnnxFiles();
+            files = AppPaths.FindModelFiles();
         }
         catch
         {
