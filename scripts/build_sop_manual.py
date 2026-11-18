@@ -1,10 +1,20 @@
 """把 docs/SOP*.md 编译成一份可直接分发的 Word 手册。
 
 用法: python3 scripts/build_sop_manual.py
-输出: docs/SOP检测系统使用与调参手册.docx
+输出: artifacts/docs/SOP检测系统使用与调参手册.docx
 """
 import re
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+OUT = ROOT / "artifacts" / "docs" / "SOP检测系统使用与调参手册.docx"
+
+SOURCES = sorted((ROOT / "docs").glob("SOP*.md"),
+                 key=lambda path: (path.name != "SOP使用指南.md", path.name))
+
+# 先检查输入，避免缺少文档源时仍加载文档生成依赖或创建空产物。
+if not SOURCES:
+    raise SystemExit("docs/ 下未找到 SOP*.md 文档源文件，无法生成手册。")
 
 from docx import Document
 from docx.enum.table import WD_TABLE_ALIGNMENT
@@ -12,17 +22,6 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Pt, RGBColor
-
-ROOT = Path(__file__).resolve().parent.parent
-OUT = ROOT / "docs" / "SOP检测系统使用与调参手册.docx"
-
-SOURCES = [
-    ROOT / "docs" / "SOP使用指南.md",
-    ROOT / "docs" / "SOP_01_使用手册.md",
-    ROOT / "docs" / "SOP_02_新建SOP检测.md",
-    ROOT / "docs" / "SOP_03_模型训练.md",
-    ROOT / "docs" / "SOP_04_调参指南.md",
-]
 
 CODE_FONT = "Consolas"
 CN_FONT = "微软雅黑"
@@ -197,6 +196,7 @@ def convert(doc, md_path):
 
 
 def build():
+    OUT.parent.mkdir(parents=True, exist_ok=True)
     doc = Document()
     sec = doc.sections[0]
     sec.page_width, sec.page_height = Cm(21), Cm(29.7)
@@ -220,7 +220,7 @@ def build():
              color=(0x55, 0x55, 0x55))
     meta = doc.add_paragraph()
     meta.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    set_font(meta.add_run("VisionInspectionSystem · 汇编自 docs/SOP*.md"), size=9,
+    set_font(meta.add_run("Inspection · 汇编自 docs/SOP*.md"), size=9,
              color=(0x88, 0x88, 0x88))
 
     toc = doc.add_paragraph()

@@ -16,17 +16,20 @@ dotnet build                       :: CPU build (default)
 dotnet run --project src/Desktop
 ```
 
-Build output: `src/Desktop/bin/Debug/net8.0-windows/Desktop.exe`.
+Build output: `artifacts/bin/Desktop/Cpu/Debug/net8.0-windows/Desktop.exe`.
+All .NET outputs live under `artifacts/`, isolated by project, EP and configuration; NuGet intermediates are under `artifacts/obj/<Project>/<EP>/<build-or-publish>/`.
 
 GPU is a **build-time** choice. Only one ONNX Runtime execution provider can be referenced:
 
 ```bat
 dotnet build -p:YoloEp=Cuda                       :: needs CUDA 12.x + cuDNN 9.x on PATH
-scripts\build_cuda.bat                            :: recommended: checks deps, cleans, builds, verifies artifacts
-scripts\build_cuda.bat --release                  :: Release; also supports --force, --no-clean
+scripts\build.bat --cuda                        :: checks deps, builds incrementally, verifies artifacts
+scripts\build.bat --cuda --release              :: Release build
+scripts\build.bat --cuda --publish              :: Release, framework-dependent win-x64 publish
+scripts\build.bat --cpu --publish --clean       :: clean selected outputs before publishing
 ```
 
-A plain `dotnet build` or F5 in Visual Studio **overwrites a CUDA build with the CPU build**. `Directory.Build.props` turns `-p:YoloEp=Cuda` into the `YOLO_EP_CUDA` compile constant; `YoloExecutionProviders.IsCudaBuild` is the single place that branches on it.
+A plain `dotnet build` or F5 in Visual Studio builds CPU into its own directory, preserving CUDA outputs. Publishing places Desktop and its dependencies/configs under `artifacts/publish/Desktop/<EP>/<Configuration>/win-x64/`; build logs are in `artifacts/logs/`. `Directory.Build.props` turns `-p:YoloEp=Cuda` into the `YOLO_EP_CUDA` compile constant; `YoloExecutionProviders.IsCudaBuild` is the single place that branches on it.
 
 There is **no .NET test project, lint config, or formatter config** in this repo — do not invent test commands.
 

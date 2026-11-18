@@ -11,15 +11,18 @@
 - 输出 PNG-in-ICO 容器（每帧独立 PNG 编码），规避 Pillow ICO 单帧坑。
 
 用法：
-    python gen_modern_icon.py --out Assets/AppIcon.ico
-    python gen_modern_icon.py --out preview.png --png 256
+    python scripts/gen_modern_icon.py
+    python scripts/gen_modern_icon.py --png 256
+    python scripts/gen_modern_icon.py --out artifacts/assets/preview.png --png 256
 """
 import argparse
 import io
 import math
-import os
 import struct
+from pathlib import Path
 from PIL import Image, ImageDraw
+
+ROOT = Path(__file__).resolve().parent.parent
 
 # ==== CONFIG（按需改）====
 CONFIG = {
@@ -129,27 +132,30 @@ def build_ico(frames):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default="Assets/AppIcon.ico")
+    ap.add_argument("--out", help="输出路径，相对路径基于仓库根目录")
     ap.add_argument("--sizes", default=",".join(str(s) for s in CONFIG["sizes"]))
     ap.add_argument("--png", type=int, default=0,
-                    help="若 >0，仅输出该尺寸 PNG 预览（忽略 --out 的 ico）")
+                    help="若 >0，仅输出该尺寸 PNG 预览")
     args = ap.parse_args()
 
+    output = Path(args.out) if args.out else Path(
+        "artifacts/assets/AppIcon.png" if args.png else "src/Desktop/Assets/AppIcon.ico")
+    if not output.is_absolute():
+        output = ROOT / output
+    output.parent.mkdir(parents=True, exist_ok=True)
     sizes = [int(s) for s in args.sizes.split(",") if s]
 
     if args.png:
         img = draw_icon(args.png, CONFIG)
-        img.save(args.out, format="PNG")
-        print(f"preview png saved: {args.out} ({args.png}x{args.png})")
+        img.save(output, format="PNG")
+        print(f"preview png saved: {output} ({args.png}x{args.png})")
         return
 
     frames = [(s, encode_png(draw_icon(s, CONFIG))) for s in sizes]
     ico = build_ico(frames)
-    out = os.path.abspath(args.out)
-    os.makedirs(os.path.dirname(out), exist_ok=True)
-    with open(out, "wb") as f:
+    with output.open("wb") as f:
         f.write(ico)
-    print(f"saved: {out} sizes: {sizes} bytes: {len(ico)}")
+    print(f"saved: {output} sizes: {sizes} bytes: {len(ico)}")
 
 
 if __name__ == "__main__":

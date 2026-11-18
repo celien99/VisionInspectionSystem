@@ -19,4 +19,15 @@
     <DefineConstants Condition="'$(YoloEp)' == 'Cuda'">$(DefineConstants);YOLO_EP_CUDA</DefineConstants>
   </PropertyGroup>
 
+  <!-- 项目 / EP 分开存放，避免 CPU 与 CUDA 的还原缓存、生成代码和原生 DLL 互相覆盖。
+       使用绝对路径，保证从仓库根、项目目录和 Visual Studio 构建时结果一致。 -->
+  <PropertyGroup>
+    <BaseOutputPath>$(MSBuildThisFileDirectory)artifacts/bin/$(MSBuildProjectName)/$(YoloEp)/</BaseOutputPath>
+    <InspectionBuildMode Condition="'$(InspectionBuildMode)' == ''">build</InspectionBuildMode>
+    <BaseIntermediateOutputPath>$(MSBuildThisFileDirectory)artifacts/obj/$(MSBuildProjectName)/$(YoloEp)/$(InspectionBuildMode)/</BaseIntermediateOutputPath>
+    <PublishDir>$(MSBuildThisFileDirectory)artifacts/publish/$(MSBuildProjectName)/$(YoloEp)/$(Configuration)/$(RuntimeIdentifier)/</PublishDir>
+    <!-- 同时排除迁移前留在 src/ 内的 bin/obj，禁止将其作为源码或资源重新收集。 -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);**/bin/**;**/obj/**;$(MSBuildThisFileDirectory)artifacts/**</DefaultItemExcludes>
+  </PropertyGroup>
+
 </Project>

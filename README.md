@@ -24,6 +24,8 @@ VisionInspectionSystem/
 │   │   └── SOP/                    # SOP 合规检测（SOP.csproj）
 │   ├── Desktop/                    # WPF 主界面（Desktop.csproj）
 │   └── Converters/                 # 无原生依赖的 WPF 转换器（Converters.csproj）
+├── scripts/                        # 构建、发布与辅助工具
+├── artifacts/                      # 构建 / 发布 / 生成文件（不入库）
 ├── configs/                        # 配置（唯一来源）
 │   ├── sop_config.json             # SOP 模块配置
 │   └── sop/                        # 配方（产品/工位 SOP）+ regions/ 区域坐标
@@ -79,24 +81,36 @@ dotnet build -p:YoloEp=Cuda           :: GPU，需自行安装 CUDA Toolkit 12.x
 
 CPU 构建下界面的「GPU/CPU」开关不会生效（日志会说明），检测按 CPU 运行。
 
-#### CUDA 一键构建（推荐）
+#### 统一构建与发布（推荐）
 
-目标机装好 .NET 8 SDK + NVIDIA 驱动 + **CUDA Toolkit 12.x** + **cuDNN 9.x**（两者的 `bin` 目录都要在 `PATH` 中）后，运行：
+构建入口为 `scripts/build.bat`（内部调用 `build.ps1`），可从任意工作目录调用：
 
 ```bat
-scripts\build_cuda.bat              :: Debug
-scripts\build_cuda.bat --release    :: Release
+scripts\build.bat                         :: CPU / Debug，增量构建
+scripts\build.bat --cuda                  :: CUDA / Debug
+scripts\build.bat --cuda --release        :: CUDA / Release
+scripts\build.bat --cuda --publish        :: CUDA / Release / win-x64 发布
+scripts\build.bat --cpu --publish --clean :: 清理后发布 CPU 版
+scripts\build.bat --help
 ```
 
-脚本会自动完成：
+CUDA 构建检查 PATH 中的 CUDA 12.x / cuDNN 9.x 运行库；仅需编译时可加 `--force`。默认不清理以便增量构建，`--clean` 只清理所选 EP 和配置，发布时还会清空对应发布目录。请先关闭该目录中的程序，并保留需要的运行数据。脚本检查程序占用、构建退出码、执行提供器与原生运行库，日志保存到 `artifacts/logs/`。
 
-1. 检查程序是否正在运行（被占用会中止，避免输出文件锁定导致构建失败）；
-2. 检查 CUDA 12.x / cuDNN 9.x 运行库（缺失即中止并给出安装提示，避免"构建成功但运行仍显示 CUDA 不可用"）；
-3. 清理并执行 `dotnet build -p:YoloEp=Cuda`；
-4. 校验产物确实是 CUDA 版（`YoloDotNet.ExecutionProvider.Cuda.dll`、`onnxruntime_providers_cuda.dll`）。
+所有 .NET 构建（包括直接执行 `dotnet build` 和 Visual Studio）共用以下目录规则，CPU / CUDA 的产物和 NuGet 还原缓存互相隔离：
 
-> 构建完成后直接运行 `bin\Debug\net8.0-windows\Desktop.exe` 即可使用 GPU。
-> 在 Visual Studio 中按 F5 或执行不带参数的 `dotnet build` 会重新编译成 CPU 版，覆盖当前产物。
+```text
+artifacts/
+├── bin/<项目>/<Cpu|Cuda>/<Debug|Release>/<目标框架>/
+├── obj/<项目>/<Cpu|Cuda>/<build|publish>/
+├── publish/Desktop/<Cpu|Cuda>/<Debug|Release>/win-x64/
+└── logs/
+```
+
+例如 CUDA Debug 可执行文件为 `artifacts/bin/Desktop/Cuda/Debug/net8.0-windows/Desktop.exe`。普通 `dotnet build` 和 F5 默认使用独立的 CPU 目录。
+
+`--publish` 默认 Release（可用 `--debug` 覆盖），生成依赖 **.NET 8 桌面运行时**的 Windows x64 发布目录，只发布 Desktop 及其依赖。分发整个 `artifacts/publish/Desktop/<EP>/Release/win-x64/`，其中包含 `configs/`、程序与原生依赖；模型按配方放入 `models/` 或 `yolo_models/`，CUDA 目标机还需 NVIDIA 驱动、CUDA 12.x 和 cuDNN 9.x。日常构建继续使用仓库中的配置，避免复制出多份开发配置。
+
+其他辅助脚本的用法和输出见 [scripts/README.md](scripts/README.md)。
 
 ### 目录约定（全部可在运行时解析，无需改代码）
 
