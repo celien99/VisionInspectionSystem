@@ -1,7 +1,7 @@
 // =============================================================================
 //  step_condition.h  —  StepConditionEvaluator
 // =============================================================================
-//  1:1 移植自 C# src/Modules/VisionInspection.Modules.SOP/Services/
+//  1:1 移植自 C# src/Modules/SOP/Services/
 //      StepConditionEvaluator.cs（878 行）
 //
 //  ★ 判定语义铁律（详见 src/step_condition.cpp 顶部注释与

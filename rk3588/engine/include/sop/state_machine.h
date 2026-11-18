@@ -1,7 +1,7 @@
 // =============================================================================
 //  state_machine.h  —  SOPStateMachine 的 C++ 移植
 // =============================================================================
-//  1:1 移植自 C# src/Modules/VisionInspection.Modules.SOP/Models/SOPStateMachine.cs
+//  1:1 移植自 C# src/Modules/SOP/Models/SOPStateMachine.cs
 //
 //  ★ 与评估器共享实例（ViolationDetector 的 DetectSkipStep 也要用）——
 //    这是 2026-09-29 回归的根源：若评估器不区分"当前步骤"与"探测下一步"，

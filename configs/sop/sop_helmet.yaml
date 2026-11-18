@@ -6,7 +6,7 @@
 # 仅做持续安全帽监控，在「产品配方」下拉框中显示为独立任务「安全帽监控」。
 #
 # 生效路径：仓库根 configs/sop/ 是唯一来源（运行时由 AppPaths 解析；
-#   publish 时整目录随 exe 输出）。不要再维护 src/UI/.../configs/ 副本。
+#   publish 时整目录随 exe 输出）。不要再维护 src/Desktop/configs/ 副本。
 #
 # ⚠️ 使用前必须：
 #   1) 用「🎯 标定区域」按真机画面重框 monitor_zone 区域（坐标请以实际画面为准）；

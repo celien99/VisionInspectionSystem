@@ -409,7 +409,7 @@ rk3588/
 
 **硬约定**：
 1. `engine/` **不 include 任何推理/相机/UI 头文件**，只依赖 `inference/include/detector.h` 的纯数据结构 → 保证可离线单测、可逐帧对拍。
-2. `configs/sop/*.yaml` 从 `src/UI/VisionInspection.UI/configs/sop/` **原样拷贝**，不改任何格式。
+2. `configs/sop/*.yaml` 从仓库根 `configs/sop/` **原样拷贝**，不改任何格式。
 3. `models/` 与编译产物入 `.gitignore`，板端部署包单独打包。
 4. 移植进度与差异全部记入 `rk3588/docs/移植台账.md`，**每次对拍结果都要落档**。
 

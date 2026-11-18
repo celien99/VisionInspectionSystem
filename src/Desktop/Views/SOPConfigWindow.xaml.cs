@@ -1,0 +1,1301 @@
+using Core.Services;
+using Microsoft.Win32;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+using System.Linq;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Media;
+using Modules.SOP.Models;
+using Desktop.Services;
+using Desktop.ViewModels;
+
+namespace Desktop.Views
+{
+    /// <summary>
+    /// SOP 流程预览与编辑窗口：
+    /// 直接读写 YAML 的完整配置模型（SOPYamlConfig），支持预览/修改步骤、全局设置、
+    /// 模型与监控配置；区域坐标仍由「🎯 标定区域」工具维护，此处仅预览。
+    /// </summary>
+    public partial class SOPConfigWindow : Window
+    {
+        private SOPYamlConfig? _config;      // 完整 YAML 模型（steps/regions/model/monitoring/settings 全保留）
+        private string _yamlPath = "";
+        private int _selectedIndex = -1;     // 当前编辑的步骤索引
+        private bool _isLoading;             // 程序填充控件时屏蔽事件
+        private bool _hadModel;              // 原配置是否存在 model 节点
+        private bool _hadMonitoring;         // 原配置是否存在 monitoring 节点
+        private SopyamlCrossCamera? _crossConfig;   // 跨相机规则（镜像 _config.Sop.CrossCamera）
+        private SopyamlCrossRule? _selectedCrossRule;
+
+        /// <summary>保存成功后最终写入的 YAML 路径（供调用方重载工作流）</summary>
+        public string? SavedYamlPath { get; private set; }
+
+        private HandPoseEstimationConfig _handPoseConfig = new();
+
+        public SOPConfigWindow(string? yamlPath = null)
+        {
+            InitializeComponent();
+            SetHandPoseConfig(_handPoseConfig);
+            FillStepCameraModelCombos();
+            RefreshYamlFilesList();
+
+            if (!string.IsNullOrEmpty(yamlPath) && File.Exists(yamlPath))
+            {
+                try
+                {
+                    LoadYaml(yamlPath);
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show($"加载 YAML 失败: {ex.Message}", "警告",
+                        MessageBoxButton.OK, MessageBoxImage.Warning);
+                    SetEmptyState();
+                }
+            }
+            else
+            {
+                SetEmptyState();
+            }
+        }
+
+        // ==================== YAML 文件列表 ====================
+
+        /// <summary>获取 SOP 配方目录（与 TryGetSopDirectory 一致，附带文件系统真实路径兜底）</summary>
+        private string? GetSopDirectory() => TryGetSopDirectory();
+
+        /// <summary>扫描 SOP 目录下所有 yaml/yml 文件，填充到 ComboBox</summary>
+        private void RefreshYamlFilesList()
+        {
+            _isLoading = true;
+            try
+            {
+                YamlFilesCombo.Items.Clear();
+                var dir = GetSopDirectory();
+                if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir))
+                {
+                    YamlFilesCombo.Items.Add(new ComboBoxItem { Content = "（未找到 configs/sop 目录）", IsEnabled = false });
+                    YamlFilesCombo.SelectedIndex = 0;
+                    return;
+                }
+
+                var files = Directory.EnumerateFiles(dir, "*.yaml")
+                    .Concat(Directory.EnumerateFiles(dir, "*.yml"))
+                    .Distinct()
+                    .OrderBy(f => Path.GetFileName(f), StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+
+                if (files.Count == 0)
+                {
+                    YamlFilesCombo.Items.Add(new ComboBoxItem { Content = "（目录下没有 YAML 文件）", IsEnabled = false });
+                    YamlFilesCombo.SelectedIndex = 0;
+                    return;
+                }
+
+                foreach (var f in files)
+                    YamlFilesCombo.Items.Add(new ComboBoxItem
+                    {
+                        Content = Path.GetFileName(f),
+                        Tag = f,
+                        ToolTip = f
+                    });
+
+                // 若当前已加载文件在列表中，则选中它
+                if (!string.IsNullOrEmpty(_yamlPath))
+                {
+                    var match = YamlFilesCombo.Items.OfType<ComboBoxItem>()
+                        .FirstOrDefault(i => string.Equals(i.Tag as string, _yamlPath, StringComparison.OrdinalIgnoreCase));
+                    if (match != null)
+                    {
+                        YamlFilesCombo.SelectedItem = match;
+                        return;
+                    }
+                }
+                YamlFilesCombo.SelectedIndex = -1;
+            }
+            finally
+            {
+                _isLoading = false;
+            }
+        }
+
+        private void YamlFilesCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (_isLoading) return;
+            if (YamlFilesCombo.SelectedItem is not ComboBoxItem item || item.Tag is not string path) return;
+
+            if (!File.Exists(path))
+            {
+                MessageBox.Show($"文件不存在：{path}", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
+                RefreshYamlFilesList();
+                return;
+            }
+
+            // 已加载同一文件则跳过
+            if (string.Equals(_yamlPath, path, StringComparison.OrdinalIgnoreCase)) return;
+
+            try
+            {
+                LoadYaml(path);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"加载 YAML 失败: {ex.Message}", "错误",
+                    MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        private void RefreshYamlButton_Click(object sender, RoutedEventArgs e)
+        {
+            RefreshYamlFilesList();
+        }
+
+        /// <summary>让 ComboBox 选中项与当前 _yamlPath 同步（不触发重新加载）</summary>
+        private void SyncYamlComboSelection()
+        {
+            _isLoading = true;
+            try
+            {
+                var match = YamlFilesCombo.Items.OfType<ComboBoxItem>()
+                    .FirstOrDefault(i => string.Equals(i.Tag as string, _yamlPath, StringComparison.OrdinalIgnoreCase));
+                YamlFilesCombo.SelectedItem = match; // 找不到则清空选中
+            }
+            finally
+            {
+                _isLoading = false;
+            }
+        }
+
+        private void SetEmptyState()
+        {
+            MainContentGrid.IsEnabled = false;
+            FilePathText.Text = "未加载文件 — 请点「📂 打开YAML」选择配方";
+            StepsListPanel.Children.Clear();
+            StepsListPanel.Children.Add(new TextBlock
+            {
+                Text = "尚未加载 YAML 文件",
+                Foreground = new SolidColorBrush(Color.FromRgb(153, 153, 153)),
+                Margin = new Thickness(8, 10, 8, 0)
+            });
+        }
+
+        // ==================== 加载 ====================
+
+        private void LoadYaml(string path)
+        {
+            _config = SOPYamlConverter.LoadFullConfig(path);
+            _yamlPath = path;
+            SavedYamlPath = null;
+            MainContentGrid.IsEnabled = true;
+            FilePathText.Text = path;
+            SyncYamlComboSelection();
+
+            _isLoading = true;
+            try
+            {
+                LoadFlowInfoTab();
+                LoadModelMonitoringTab();
+                LoadCrossCameraTab();
+                RefreshRegionsPanel();
+                RefreshStepsList();
+                var sop = _config.Sop ?? new SopyamlSop();
+                SelectStep(sop.Steps.Count > 0 ? 0 : -1, commitCurrent: false);
+            }
+            finally
+            {
+                _isLoading = false;
+            }
+        }
+
+        private void OpenButton_Click(object sender, RoutedEventArgs e)
+        {
+            var dialog = new OpenFileDialog
+            {
+                Filter = "YAML 文件 (*.yaml;*.yml)|*.yaml;*.yml|所有文件 (*.*)|*.*",
+                Title = "选择 SOP YAML 文件",
+                InitialDirectory = TryGetSopDirectory()
+            };
+
+            if (dialog.ShowDialog() != true) return;
+
+            try
+            {
+                LoadYaml(dialog.FileName);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"加载 YAML 失败: {ex.Message}", "错误",
+                    MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        private string? TryGetSopDirectory()
+            => Directory.Exists(RecipeFile.SopDir) ? RecipeFile.SopDir : null;
+
+        // ==================== 步骤列表 ====================
+
+        private List<SopyamlStep> Steps => _config?.Sop?.Steps ?? new List<SopyamlStep>();
+
+        private void RefreshStepsList()
+        {
+            StepsListPanel.Children.Clear();
+            var steps = Steps;
+            StepsHeader.Text = $"步骤列表 ({steps.Count})";
+
+            for (int i = 0; i < steps.Count; i++)
+                StepsListPanel.Children.Add(CreateStepCard(steps[i], i));
+
+            if (steps.Count == 0)
+            {
+                StepsListPanel.Children.Add(new TextBlock
+                {
+                    Text = "（无步骤，点下方「➕ 添加步骤」新建）",
+                    Foreground = new SolidColorBrush(Color.FromRgb(153, 153, 153)),
+                    Margin = new Thickness(8, 10, 8, 0)
+                });
+            }
+        }
+
+        private Border CreateStepCard(SopyamlStep step, int index)
+        {
+            bool selected = index == _selectedIndex;
+            var border = new Border
+            {
+                Background = selected ? new SolidColorBrush(Color.FromRgb(230, 247, 255)) : Brushes.White,
+                BorderBrush = selected ? new SolidColorBrush(Color.FromRgb(24, 144, 255)) : new SolidColorBrush(Color.FromRgb(232, 232, 232)),
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(6),
+                Margin = new Thickness(0, 0, 0, 8),
+                Padding = new Thickness(10, 8, 10, 8),
+                Cursor = System.Windows.Input.Cursors.Hand
+            };
+            border.MouseLeftButtonUp += (s, e) => SelectStep(index);
+
+            var grid = new Grid();
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(28) });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+            // 序号
+            var numberText = new TextBlock
+            {
+                Text = (index + 1).ToString(),
+                FontWeight = FontWeights.Bold,
+                Foreground = new SolidColorBrush(Color.FromRgb(24, 144, 255)),
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            Grid.SetColumn(numberText, 0);
+            grid.Children.Add(numberText);
+
+            // 名称 + 摘要
+            var namePanel = new StackPanel { Margin = new Thickness(8, 0, 8, 0) };
+            namePanel.Children.Add(new TextBlock
+            {
+                Text = step.Name,
+                FontWeight = FontWeights.Bold,
+                FontSize = 13,
+                TextTrimming = TextTrimming.CharacterEllipsis
+            });
+            namePanel.Children.Add(new TextBlock
+            {
+                Text = $"{step.Id} · {step.Detection?.Method ?? "无检测"} · 超时{(step.Timeout > 0 ? step.Timeout + "s" : "不限")}",
+                FontSize = 11,
+                Foreground = new SolidColorBrush(Color.FromRgb(153, 153, 153)),
+                TextTrimming = TextTrimming.CharacterEllipsis
+            });
+            Grid.SetColumn(namePanel, 1);
+            grid.Children.Add(namePanel);
+
+            // 操作按钮：编辑/上移/下移/删除
+            var buttonPanel = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+
+            Button MakeButton(string content, string tooltip, bool enabled, RoutedEventHandler onClick)
+            {
+                var btn = new Button
+                {
+                    Content = content,
+                    Width = 26,
+                    Height = 26,
+                    Margin = new Thickness(1),
+                    Padding = new Thickness(0),
+                    ToolTip = tooltip,
+                    IsEnabled = enabled,
+                    FontSize = 12
+                };
+                btn.Click += onClick;
+                return btn;
+            }
+
+            buttonPanel.Children.Add(MakeButton("↑", "上移", index > 0, (s, e) => MoveStep(index, -1)));
+            buttonPanel.Children.Add(MakeButton("↓", "下移", index < Steps.Count - 1, (s, e) => MoveStep(index, 1)));
+            buttonPanel.Children.Add(MakeButton("🗑️", "删除", true, (s, e) => DeleteStep(index)));
+            Grid.SetColumn(buttonPanel, 2);
+            grid.Children.Add(buttonPanel);
+
+            border.Child = grid;
+            return border;
+        }
+
+        // ==================== 步骤编辑 ====================
+
+        /// <summary>
+        /// 填充步骤级"相机/模型"下拉：相机 = 主相机 + cam_2..cam_4（显示已连接槽位名）；
+        /// 模型 = 扫描 yolo_models 目录下的 .onnx（含"（默认：全局模型）"空选项）。
+        /// </summary>
+        private void FillStepCameraModelCombos()
+        {
+            // 相机
+            StepCameraCombo.Items.Clear();
+            StepCameraCombo.Items.Add(new CameraOptionItem("main_camera", "主相机（相机1）"));
+            var slots = Core.Services.CameraManager.Instance.Slots;
+            for (int i = 2; i <= Core.Services.CameraManager.MaxCameraCount; i++)
+            {
+                string id = $"cam_{i}";
+                var slot = slots.FirstOrDefault(s => string.Equals(s.CameraId, id, StringComparison.OrdinalIgnoreCase));
+                string display = slot != null && !string.IsNullOrEmpty(slot.DisplayName)
+                    ? $"{id}（{slot.DisplayName}）"
+                    : $"{id}（未连接）";
+                StepCameraCombo.Items.Add(new CameraOptionItem(id, display));
+            }
+            StepCameraCombo.SelectedIndex = 0;
+
+            // 模型
+            StepModelCombo.Items.Clear();
+            StepModelCombo.Items.Add(new ModelOptionItem { Display = "（默认：全局模型）", Value = "" });
+            try
+            {
+                foreach (var file in AppPaths.FindModelFiles())
+                {
+                    var idx = file.IndexOf("yolo_models", StringComparison.OrdinalIgnoreCase);
+                    string rel = idx >= 0 ? file.Substring(idx).Replace('\\', '/') : file;
+                    StepModelCombo.Items.Add(new ModelOptionItem { Display = rel, Value = rel });
+                }
+            }
+            catch
+            {
+                // 扫描失败不影响窗口使用，仅保留"默认：全局模型"
+            }
+            StepModelCombo.SelectedIndex = 0;
+        }
+
+        /// <summary>按值选中 ComboBox 项（相机按 Id、模型按 Value）；未命中则选中第一项</summary>
+        private static void SelectComboItemByValue(ComboBox combo, string value)
+        {
+            foreach (var item in combo.Items)
+            {
+                if (item is CameraOptionItem c && string.Equals(c.Id, value, StringComparison.OrdinalIgnoreCase))
+                {
+                    combo.SelectedItem = item;
+                    return;
+                }
+                if (item is ModelOptionItem m && string.Equals(m.Value ?? "", value ?? "", StringComparison.OrdinalIgnoreCase))
+                {
+                    combo.SelectedItem = item;
+                    return;
+                }
+            }
+            combo.SelectedIndex = 0;
+        }
+
+        private void SelectStep(int index, bool commitCurrent = true)
+        {
+            var steps = Steps;
+            if (index < 0 || index >= steps.Count)
+            {
+                _selectedIndex = -1;
+                ClearStepEditor();
+                RefreshStepsList();
+                return;
+            }
+
+            // 切换前先提交当前编辑内容，避免丢失
+            if (commitCurrent && _selectedIndex >= 0 && _selectedIndex != index && _selectedIndex < steps.Count)
+                ApplyEditorToStep();
+
+            _selectedIndex = index;
+            _isLoading = true;
+            try
+            {
+                LoadStepToEditor(steps[index]);
+            }
+            finally
+            {
+                _isLoading = false;
+            }
+            RefreshStepsList();
+        }
+
+        private void LoadStepToEditor(SopyamlStep step)
+        {
+            StepIdTextBox.Text = step.Id ?? "";
+            StepNameTextBox.Text = step.Name ?? "";
+            StepDescTextBox.Text = step.Description ?? "";
+            TimeoutTextBox.Text = step.Timeout.ToString();
+            bool timeoutEnabled = step.Timeout > 0;
+            EnableTimeoutCheckBox.IsChecked = timeoutEnabled;
+            TimeoutTextBox.IsEnabled = timeoutEnabled;
+            TransitionsTextBox.Text = string.Join(", ", step.Transitions ?? new List<string>());
+
+            var d = step.Detection ?? new SopyamlDetection();
+            SelectComboByTag(DetectionMethodCombo, d.Method);
+            TargetObjectTextBox.Text = d.TargetObject ?? "";
+            SelectComboByTag(HandCombo, d.Hand ?? "any");
+            SelectComboByTag(ActionCombo, d.Action ?? "pickup");
+            RegionCombo.Text = d.Region ?? "";
+            FromRegionCombo.Text = d.FromRegion ?? "";
+            ToRegionCombo.Text = d.ToRegion ?? "";
+            ToleranceTextBox.Text = d.Tolerance.ToString();
+            DurationMsTextBox.Text = d.DurationMs.ToString();
+            MinConfTextBox.Text = d.MinConfidence.ToString("0.##");
+            StableFramesTextBox.Text = d.StableFrames.ToString();
+            DetectionDescTextBox.Text = d.Description ?? "";
+
+            ForbiddenTextBox.Text = string.Join(", ", step.ForbiddenObjects ?? new List<string>());
+            MustKeepTextBox.Text = string.Join(", ", step.MustKeep ?? new List<string>());
+            RequiredObjectsTextBox.Text = FormatRequiredObjects(step.RequiredObjects);
+            StandardDurationMsTextBox.Text = step.StandardDurationMs.ToString();
+
+            // ⭐ 步骤级 Modbus 违规触发
+            var mt = step.ModbusTrigger;
+            ModbusTriggerCheckBox.IsChecked = mt?.Enabled == true;
+            SelectModbusAddress(mt?.Address ?? 0);
+            ModbusPulseTextBox.Text = ((mt?.PulseMs) ?? 500).ToString();
+            ModbusLatchCheckBox.IsChecked = mt?.Latch == true;
+            SetModbusPanelEnabled(mt?.Enabled == true);
+
+            // ⭐ 步骤级相机/模型
+            SelectComboItemByValue(StepCameraCombo, string.IsNullOrWhiteSpace(step.Camera) ? "main_camera" : step.Camera);
+            SelectComboItemByValue(StepModelCombo, step.Model ?? "");
+
+            UpdateDetectionFieldVisibility();
+        }
+
+        /// <summary>根据地址 0-7 选中 Y1-Y8</summary>
+        private void SelectModbusAddress(int address)
+        {
+            foreach (var item in ModbusAddressCombo.Items)
+            {
+                if (item is ComboBoxItem cbi && cbi.Tag?.ToString() == address.ToString())
+                {
+                    ModbusAddressCombo.SelectedItem = cbi;
+                    return;
+                }
+            }
+            ModbusAddressCombo.SelectedIndex = 0;
+        }
+
+        private void SetModbusPanelEnabled(bool enabled)
+        {
+            ModbusTriggerPanel.IsEnabled = enabled;
+            ModbusLatchCheckBox.IsEnabled = enabled;
+        }
+
+        private void ModbusTriggerCheckBox_Changed(object sender, RoutedEventArgs e)
+        {
+            SetModbusPanelEnabled(ModbusTriggerCheckBox.IsChecked == true);
+        }
+
+        private void ClearStepEditor()
+        {
+            StepIdTextBox.Text = "";
+            StepNameTextBox.Text = "";
+            StepDescTextBox.Text = "";
+            TimeoutTextBox.Text = "";
+            EnableTimeoutCheckBox.IsChecked = true;
+            TimeoutTextBox.IsEnabled = true;
+            TransitionsTextBox.Text = "";
+            TargetObjectTextBox.Text = "";
+            RegionCombo.Text = "";
+            FromRegionCombo.Text = "";
+            ToRegionCombo.Text = "";
+            ToleranceTextBox.Text = "";
+            DurationMsTextBox.Text = "";
+            MinConfTextBox.Text = "";
+            StableFramesTextBox.Text = "";
+            DetectionDescTextBox.Text = "";
+            ForbiddenTextBox.Text = "";
+            MustKeepTextBox.Text = "";
+            RequiredObjectsTextBox.Text = "";
+            StandardDurationMsTextBox.Text = "";
+            // ⭐ 步骤级 Modbus 触发复位为默认
+            ModbusTriggerCheckBox.IsChecked = false;
+            SelectModbusAddress(0);
+            ModbusPulseTextBox.Text = "500";
+            ModbusLatchCheckBox.IsChecked = false;
+            SetModbusPanelEnabled(false);
+            // ⭐ 步骤级相机/模型复位为默认
+            StepCameraCombo.SelectedIndex = 0;
+            StepModelCombo.SelectedIndex = 0;
+        }
+
+        /// <summary>把编辑器内容写回当前选中的步骤（容错：非法输入保持原值）</summary>
+        private void ApplyEditorToStep()
+        {
+            var steps = Steps;
+            if (_selectedIndex < 0 || _selectedIndex >= steps.Count || _config?.Sop == null) return;
+            var step = steps[_selectedIndex];
+
+            step.Name = string.IsNullOrWhiteSpace(StepNameTextBox.Text) ? step.Name : StepNameTextBox.Text.Trim();
+            step.Id = string.IsNullOrWhiteSpace(StepIdTextBox.Text)
+                ? $"step_{_selectedIndex + 1}"
+                : StepIdTextBox.Text.Trim();
+            step.Description = string.IsNullOrWhiteSpace(StepDescTextBox.Text) ? null : StepDescTextBox.Text.Trim();
+            // 未勾选"启用本步超时"或填 0 → 该步骤不限制超时
+            if (EnableTimeoutCheckBox.IsChecked == true
+                && int.TryParse(TimeoutTextBox.Text, out var timeout) && timeout > 0)
+                step.Timeout = timeout;
+            else
+                step.Timeout = 0;
+            step.Transitions = SplitList(TransitionsTextBox.Text) ?? new List<string>();
+
+            step.Detection ??= new SopyamlDetection();
+            var d = step.Detection;
+            d.Method = GetSelectedMethod();
+
+            // 仅更新当前方法相关的字段，无关字段保持原值
+            if (TargetObjectPanel.Visibility == Visibility.Visible)
+                d.TargetObject = string.IsNullOrWhiteSpace(TargetObjectTextBox.Text) ? null : TargetObjectTextBox.Text.Trim();
+            if (HandPanel.Visibility == Visibility.Visible)
+                d.Hand = GetSelectedTag(HandCombo) ?? "any";
+            if (ActionPanel.Visibility == Visibility.Visible)
+                d.Action = GetSelectedTag(ActionCombo) ?? "pickup";
+            if (RegionPanel.Visibility == Visibility.Visible)
+                d.Region = string.IsNullOrWhiteSpace(RegionCombo.Text) ? null : RegionCombo.Text.Trim();
+            if (FromToPanel.Visibility == Visibility.Visible)
+            {
+                d.FromRegion = string.IsNullOrWhiteSpace(FromRegionCombo.Text) ? null : FromRegionCombo.Text.Trim();
+                d.ToRegion = string.IsNullOrWhiteSpace(ToRegionCombo.Text) ? null : ToRegionCombo.Text.Trim();
+            }
+            if (TolerancePanel.Visibility == Visibility.Visible && float.TryParse(ToleranceTextBox.Text, out var tol))
+                d.Tolerance = tol;
+            if (DurationPanel.Visibility == Visibility.Visible && int.TryParse(DurationMsTextBox.Text, out var dur))
+                d.DurationMs = dur;
+            if (float.TryParse(MinConfTextBox.Text, out var conf)) d.MinConfidence = conf;
+            if (int.TryParse(StableFramesTextBox.Text, out var sf)) d.StableFrames = sf;
+            d.Description = string.IsNullOrWhiteSpace(DetectionDescTextBox.Text) ? null : DetectionDescTextBox.Text.Trim();
+
+            step.ForbiddenObjects = SplitList(ForbiddenTextBox.Text);
+            step.MustKeep = SplitList(MustKeepTextBox.Text);
+            step.RequiredObjects = ParseRequiredObjects(RequiredObjectsTextBox.Text);
+            step.StandardDurationMs = int.TryParse(StandardDurationMsTextBox.Text, out var sd) ? Math.Max(0, sd) : 0;
+
+            // ⭐ 步骤级 Modbus 违规触发（仅在启用时写入；未启用则清空节点）
+            if (ModbusTriggerCheckBox.IsChecked == true)
+            {
+                int address = int.TryParse(GetSelectedTag(ModbusAddressCombo), out var ad) ? Math.Clamp(ad, 0, 7) : 0;
+                int pulse = int.TryParse(ModbusPulseTextBox.Text, out var pm) ? Math.Clamp(pm, 100, 5000) : 500;
+                step.ModbusTrigger = new SopyamlModbusTrigger
+                {
+                    Enabled = true,
+                    Address = address,
+                    PulseMs = pulse,
+                    Latch = ModbusLatchCheckBox.IsChecked == true
+                };
+            }
+            else
+            {
+                step.ModbusTrigger = null;
+            }
+
+            // ⭐ 步骤级相机/模型（主相机与空模型不写，保持缺省语义）
+            step.Camera = StepCameraCombo.SelectedItem is CameraOptionItem camSel && camSel.Id != "main_camera"
+                ? camSel.Id
+                : null;
+            step.Model = StepModelCombo.SelectedItem is ModelOptionItem modelSel && !string.IsNullOrWhiteSpace(modelSel.Value)
+                ? modelSel.Value.Trim()
+                : null;
+        }
+
+        private void ApplyStepButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (_selectedIndex < 0)
+            {
+                MessageBox.Show("请先在左侧列表选择一个步骤。", "提示",
+                    MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+            if (_config?.Sop == null || string.IsNullOrEmpty(_yamlPath))
+            {
+                MessageBox.Show("请先点「📂 打开YAML」加载一个配方文件。", "提示",
+                    MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+
+            // 将当前编辑内容写回模型并立即保存到 YAML 文件（不关闭窗口，可继续编辑）
+            try
+            {
+                CommitAllTabs();
+                SOPYamlConverter.SaveFullConfig(_yamlPath, _config);
+                SavedYamlPath = _yamlPath;
+                RefreshStepsList();
+                MessageBox.Show($"修改已保存到:\n{_yamlPath}", "保存成功",
+                    MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"保存失败: {ex.Message}", "错误",
+                    MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        // ==================== 步骤增删移动 ====================
+
+        private void AddStepButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (_config?.Sop == null) return;
+            ApplyEditorToStep(); // 提交当前编辑
+
+            var steps = _config.Sop.Steps;
+            var step = new SopyamlStep
+            {
+                Id = $"step_{steps.Count + 1}",
+                Name = $"新步骤{steps.Count + 1}",
+                Description = "",
+                Timeout = 30,
+                Detection = new SopyamlDetection
+                {
+                    Method = "object_present",
+                    MinConfidence = 0.6f,
+                    StableFrames = 5
+                }
+            };
+            steps.Add(step);
+            SelectStep(steps.Count - 1, commitCurrent: false);
+        }
+
+        private void DeleteStep(int index)
+        {
+            var steps = Steps;
+            if (index < 0 || index >= steps.Count) return;
+
+            if (MessageBox.Show($"确定要删除步骤 \"{steps[index].Name}\" 吗？", "确认删除",
+                MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes) return;
+
+            steps.RemoveAt(index);
+            if (_selectedIndex == index)
+            {
+                // 删除的是当前编辑步骤 → 选中相邻步骤
+                _selectedIndex = -1;
+                SelectStep(Math.Min(index, steps.Count - 1), commitCurrent: false);
+            }
+            else
+            {
+                if (_selectedIndex > index) _selectedIndex--;
+                RefreshStepsList();
+            }
+        }
+
+        private void MoveStep(int index, int direction)
+        {
+            var steps = Steps;
+            int newIndex = index + direction;
+            if (newIndex < 0 || newIndex >= steps.Count) return;
+
+            ApplyEditorToStep(); // 提交当前编辑
+            (steps[index], steps[newIndex]) = (steps[newIndex], steps[index]);
+
+            _selectedIndex = newIndex;
+            _isLoading = true;
+            try { LoadStepToEditor(steps[newIndex]); }
+            finally { _isLoading = false; }
+            RefreshStepsList();
+        }
+
+        // ==================== 流程信息 Tab ====================
+
+        private void LoadFlowInfoTab()
+        {
+            var sop = _config!.Sop!;
+            FlowNameTextBox.Text = sop.Name ?? "";
+            FlowVersionTextBox.Text = sop.Version ?? "";
+            FlowDescTextBox.Text = sop.Description ?? "";
+
+            sop.Settings ??= new SopyamlSettings();
+            var s = sop.Settings;
+            SettingsConfTextBox.Text = s.ConfidenceThreshold.ToString("0.##");
+            SettingsStableTextBox.Text = s.StableFrames.ToString();
+            ResetDelayTextBox.Text = s.ResetDelaySec.ToString();
+            SettingsSkipCheckBox.IsChecked = s.EnableSkipDetection;
+            SettingsTimeoutDetectCheckBox.IsChecked = s.EnableTimeoutDetection;
+            AutoResetCheckBox.IsChecked = s.AutoResetOnComplete;
+        }
+
+        private void ApplyFlowInfoTab()
+        {
+            var sop = _config!.Sop!;
+            sop.Name = string.IsNullOrWhiteSpace(FlowNameTextBox.Text) ? sop.Name : FlowNameTextBox.Text.Trim();
+            sop.Version = string.IsNullOrWhiteSpace(FlowVersionTextBox.Text) ? sop.Version : FlowVersionTextBox.Text.Trim();
+            sop.Description = string.IsNullOrWhiteSpace(FlowDescTextBox.Text) ? null : FlowDescTextBox.Text.Trim();
+
+            sop.Settings ??= new SopyamlSettings();
+            var s = sop.Settings;
+            if (float.TryParse(SettingsConfTextBox.Text, out var conf)) s.ConfidenceThreshold = conf;
+            if (int.TryParse(SettingsStableTextBox.Text, out var sf)) s.StableFrames = sf;
+            if (int.TryParse(ResetDelayTextBox.Text, out var rd)) s.ResetDelaySec = rd;
+            s.EnableSkipDetection = SettingsSkipCheckBox.IsChecked ?? true;
+            s.EnableTimeoutDetection = SettingsTimeoutDetectCheckBox.IsChecked ?? true;
+            s.AutoResetOnComplete = AutoResetCheckBox.IsChecked ?? true;
+        }
+
+        // ==================== 区域与模型 Tab ====================
+
+        private void RefreshRegionsPanel()
+        {
+            RegionsPanel.Children.Clear();
+            var regions = _config?.Sop?.Regions;
+            var keys = new List<string>();
+
+            if (regions == null || regions.Count == 0)
+            {
+                RegionsPanel.Children.Add(new TextBlock
+                {
+                    Text = "（无区域 — 请用「🎯 标定区域」工具标定后重新打开）",
+                    Foreground = new SolidColorBrush(Color.FromRgb(153, 153, 153)),
+                    FontSize = 12
+                });
+            }
+            else
+            {
+                foreach (var (regionId, r) in regions)
+                {
+                    keys.Add(regionId);
+                    var card = new Border
+                    {
+                        Background = new SolidColorBrush(Color.FromRgb(250, 250, 250)),
+                        BorderBrush = new SolidColorBrush(Color.FromRgb(232, 232, 232)),
+                        BorderThickness = new Thickness(1),
+                        CornerRadius = new CornerRadius(4),
+                        Padding = new Thickness(10, 6, 10, 6),
+                        Margin = new Thickness(0, 0, 0, 6)
+                    };
+                    card.Child = new TextBlock
+                    {
+                        Text = $"{regionId}  {r.Name ?? ""}   ({r.X1},{r.Y1}) - ({r.X2},{r.Y2})",
+                        FontSize = 12
+                    };
+                    RegionsPanel.Children.Add(card);
+                }
+            }
+
+            keys.Sort(StringComparer.OrdinalIgnoreCase);
+            RegionCombo.ItemsSource = keys;
+            FromRegionCombo.ItemsSource = keys;
+            ToRegionCombo.ItemsSource = keys;
+        }
+
+        private void LoadModelMonitoringTab()
+        {
+            var sop = _config!.Sop!;
+
+            // 模型：原配置没有时展示空，不主动创建节点
+            var md = sop.Model;
+            _hadModel = md != null;
+            md ??= new SopyamlModel();
+            FillModelPathCombo(); // ⭐ 扫描 yolo_models 目录填充模型下拉
+            ModelPathCombo.Text = _hadModel ? md.Path : "";
+            ModelConfTextBox.Text = md.Confidence.ToString("0.##");
+            ModelIouTextBox.Text = md.Iou.ToString("0.##");
+            ModelGpuCheckBox.IsChecked = md.UseGpu;
+            ModelGpuIdTextBox.Text = md.GpuId.ToString();
+
+            // 监控：同上，原配置没有时默认不启用，不主动创建节点
+            var m = sop.Monitoring;
+            _hadMonitoring = m != null;
+            m ??= new SopyamlMonitoring { Enabled = false };
+            MonitorEnabledCheckBox.IsChecked = _hadMonitoring && m.Enabled;
+            PersonClassesTextBox.Text = string.Join(", ", m.PersonClasses ?? new List<string>());
+            HelmetClassesTextBox.Text = string.Join(", ", m.HelmetClasses ?? new List<string>());
+            MonitorRegionsTextBox.Text = m.Regions == null ? "" : string.Join(", ", m.Regions);
+            MonitorConfTextBox.Text = m.MinConfidence.ToString("0.##");
+            CooldownTextBox.Text = m.CooldownSeconds.ToString("0.##");
+        }
+
+        /// <summary>
+        /// 填充模型路径下拉：扫描 yolo_models 目录下的 .onnx（相对路径形式，与配方 sop.model.path 风格一致）。
+        /// </summary>
+        private void FillModelPathCombo()
+        {
+            ModelPathCombo.Items.Clear();
+            try
+            {
+                foreach (var file in AppPaths.FindModelFiles())
+                {
+                    var idx = file.IndexOf("yolo_models", StringComparison.OrdinalIgnoreCase);
+                    string rel = idx >= 0 ? file.Substring(idx).Replace('\\', '/') : file;
+                    ModelPathCombo.Items.Add(rel);
+                }
+            }
+            catch
+            {
+                // 扫描失败不影响窗口使用
+            }
+        }
+
+        private void ApplyModelMonitoringTab()
+        {
+            var sop = _config!.Sop!;
+
+            // 模型：原本有节点、或用户填写了路径、或填写了类别，才写回（避免"只填类别不填路径"时丢失）
+            if (_hadModel
+                || !string.IsNullOrWhiteSpace(ModelPathCombo.Text))
+            {
+                var md = sop.Model ?? new SopyamlModel();
+                md.Path = ModelPathCombo.Text.Trim();
+                if (float.TryParse(ModelConfTextBox.Text, out var conf)) md.Confidence = conf;
+                if (float.TryParse(ModelIouTextBox.Text, out var iou)) md.Iou = iou;
+                md.UseGpu = ModelGpuCheckBox.IsChecked ?? true;
+                if (int.TryParse(ModelGpuIdTextBox.Text, out var gpuId)) md.GpuId = gpuId;
+                sop.Model = md;
+            }
+            else
+            {
+                sop.Model = null;
+            }
+
+            // 监控：原本有节点或用户勾选启用才写回（项目约定：monitoring 任务需显式节点）
+            if (_hadMonitoring || MonitorEnabledCheckBox.IsChecked == true)
+            {
+                var m = sop.Monitoring ?? new SopyamlMonitoring();
+                m.Enabled = MonitorEnabledCheckBox.IsChecked ?? false;
+                m.PersonClasses = SplitList(PersonClassesTextBox.Text) ?? new List<string>();
+                m.HelmetClasses = SplitList(HelmetClassesTextBox.Text) ?? new List<string>();
+                m.Regions = SplitList(MonitorRegionsTextBox.Text);
+                if (float.TryParse(MonitorConfTextBox.Text, out var mc)) m.MinConfidence = mc;
+                if (double.TryParse(CooldownTextBox.Text, out var cd)) m.CooldownSeconds = cd;
+                sop.Monitoring = m;
+            }
+            else
+            {
+                sop.Monitoring = null;
+            }
+        }
+
+        // ==================== 跨相机协同规则 Tab ====================
+
+        private void LoadCrossCameraTab()
+        {
+            var sop = _config?.Sop;
+            _crossConfig = sop?.CrossCamera;
+            CrossEnabledCheckBox.IsChecked = _crossConfig != null;
+            CrossCooldownTextBox.Text = (_crossConfig?.CooldownSeconds ?? 5).ToString("0.##");
+            CrossRuleListBox.ItemsSource = _crossConfig?.Rules ?? new List<SopyamlCrossRule>();
+            CrossRuleDetailPanel.IsEnabled = _crossConfig != null;
+            _selectedCrossRule = null;
+            ClearCrossRuleDetail();
+        }
+
+        private void ApplyCrossCameraTab()
+        {
+            var sop = _config?.Sop;
+            if (sop == null) return;
+
+            // 先把正在编辑的 DataGrid 单元格提交到绑定对象
+            try { CrossConditionGrid.CommitEdit(DataGridEditingUnit.Row, true); } catch { }
+            try { CrossConditionGrid.CancelEdit(); } catch { }
+
+            if (CrossEnabledCheckBox.IsChecked != true)
+            {
+                sop.CrossCamera = null;
+                return;
+            }
+
+            if (_crossConfig == null)
+                _crossConfig = new SopyamlCrossCamera();
+            sop.CrossCamera = _crossConfig;
+
+            // 回写当前选中规则的明细字段（用户可能只改了文本框未切选项）
+            if (_selectedCrossRule != null)
+            {
+                _selectedCrossRule.Id = string.IsNullOrWhiteSpace(CrossRuleIdTextBox.Text)
+                    ? _selectedCrossRule.Id : CrossRuleIdTextBox.Text.Trim();
+                _selectedCrossRule.Name = string.IsNullOrWhiteSpace(CrossRuleNameTextBox.Text)
+                    ? _selectedCrossRule.Name : CrossRuleNameTextBox.Text.Trim();
+                if (int.TryParse(CrossRuleSeverityTextBox.Text, out var sev)) _selectedCrossRule.Severity = sev;
+            }
+            if (double.TryParse(CrossCooldownTextBox.Text, out var cd)) _crossConfig.CooldownSeconds = cd;
+        }
+
+        private void ClearCrossRuleDetail()
+        {
+            CrossRuleIdTextBox.Text = "";
+            CrossRuleNameTextBox.Text = "";
+            CrossRuleSeverityTextBox.Text = "";
+            CrossConditionGrid.ItemsSource = null;
+        }
+
+        private void CrossEnabledCheckBox_Changed(object sender, RoutedEventArgs e)
+        {
+            bool enabled = CrossEnabledCheckBox.IsChecked == true;
+            if (enabled)
+            {
+                if (_crossConfig == null)
+                {
+                    _crossConfig = _config!.Sop!.CrossCamera = new SopyamlCrossCamera();
+                }
+                CrossCooldownTextBox.Text = _crossConfig.CooldownSeconds.ToString("0.##");
+                CrossRuleListBox.ItemsSource = _crossConfig.Rules;
+                CrossRuleDetailPanel.IsEnabled = true;
+            }
+            else
+            {
+                CrossRuleDetailPanel.IsEnabled = false;
+                _selectedCrossRule = null;
+                ClearCrossRuleDetail();
+            }
+        }
+
+        private void CrossRuleListBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            _selectedCrossRule = CrossRuleListBox.SelectedItem as SopyamlCrossRule;
+            if (_selectedCrossRule == null) { ClearCrossRuleDetail(); return; }
+            CrossRuleIdTextBox.Text = _selectedCrossRule.Id ?? "";
+            CrossRuleNameTextBox.Text = _selectedCrossRule.Name ?? "";
+            CrossRuleSeverityTextBox.Text = _selectedCrossRule.Severity.ToString();
+            // 直接绑定共享实例（DataGrid 编辑会就地修改 Conditions 中的对象）
+            CrossConditionGrid.ItemsSource = _selectedCrossRule.Conditions;
+        }
+
+        private void CrossAddRuleButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (_crossConfig == null) return;
+            var rule = new SopyamlCrossRule
+            {
+                Id = $"rule_{_crossConfig.Rules.Count + 1}",
+                Name = $"规则{_crossConfig.Rules.Count + 1}",
+                Severity = 1,
+                Conditions = new List<SopyamlCrossCondition>()
+            };
+            _crossConfig.Rules.Add(rule);
+            CrossRuleListBox.ItemsSource = null;
+            CrossRuleListBox.ItemsSource = _crossConfig.Rules;
+            CrossRuleListBox.SelectedItem = rule;
+        }
+
+        private void CrossDelRuleButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (_crossConfig == null || _selectedCrossRule == null) return;
+            _crossConfig.Rules.Remove(_selectedCrossRule);
+            _selectedCrossRule = null;
+            CrossRuleListBox.ItemsSource = null;
+            CrossRuleListBox.ItemsSource = _crossConfig.Rules;
+            ClearCrossRuleDetail();
+        }
+
+        private void CrossAddCondButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (_selectedCrossRule == null) return;
+            _selectedCrossRule.Conditions.Add(new SopyamlCrossCondition());
+            CrossConditionGrid.ItemsSource = null;
+            CrossConditionGrid.ItemsSource = _selectedCrossRule.Conditions;
+        }
+
+        private void CrossDelCondButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (_selectedCrossRule == null) return;
+            var cond = CrossConditionGrid.SelectedItem as SopyamlCrossCondition;
+            if (cond == null) return;
+            _selectedCrossRule.Conditions.Remove(cond);
+            CrossConditionGrid.ItemsSource = null;
+            CrossConditionGrid.ItemsSource = _selectedCrossRule.Conditions;
+        }
+
+        // ==================== 保存 ====================
+
+        private void SaveButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (_config?.Sop == null || string.IsNullOrEmpty(_yamlPath))
+            {
+                MessageBox.Show("请先点「📂 打开YAML」加载一个配方文件。", "提示",
+                    MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+
+            try
+            {
+                CommitAllTabs();
+                SOPYamlConverter.SaveFullConfig(_yamlPath, _config);
+                SavedYamlPath = _yamlPath;
+                MessageBox.Show($"已保存 {Steps.Count} 个步骤到:\n{_yamlPath}\n\n关闭后主界面将自动重载工作流。",
+                    "保存成功", MessageBoxButton.OK, MessageBoxImage.Information);
+                DialogResult = true;
+                Close();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"保存失败: {ex.Message}", "错误",
+                    MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        private void SaveAsButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (_config?.Sop == null)
+            {
+                MessageBox.Show("请先点「📂 打开YAML」加载一个配方文件。", "提示",
+                    MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+
+            var dialog = new SaveFileDialog
+            {
+                Filter = "YAML 文件 (*.yaml)|*.yaml|所有文件 (*.*)|*.*",
+                Title = "另存为 SOP YAML",
+                InitialDirectory = TryGetSopDirectory(),
+                FileName = $"sop_new_{DateTime.Now:yyyyMMdd_HHmm}.yaml"
+            };
+
+            if (dialog.ShowDialog() != true) return;
+
+            try
+            {
+                CommitAllTabs();
+                SOPYamlConverter.SaveFullConfig(dialog.FileName, _config);
+                _yamlPath = dialog.FileName;
+                FilePathText.Text = _yamlPath;
+                SavedYamlPath = _yamlPath;
+                MessageBox.Show($"已另存到:\n{_yamlPath}", "保存成功",
+                    MessageBoxButton.OK, MessageBoxImage.Information);
+                DialogResult = true;
+                Close();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"另存失败: {ex.Message}", "错误",
+                    MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        /// <summary>保存前把所有 Tab 的编辑内容统一写回模型</summary>
+        private void CommitAllTabs()
+        {
+            ApplyEditorToStep();
+            ApplyFlowInfoTab();
+            ApplyModelMonitoringTab();
+            ApplyCrossCameraTab();
+        }
+
+        private void CloseButton_Click(object sender, RoutedEventArgs e)
+        {
+            DialogResult = SavedYamlPath != null;
+            Close();
+        }
+
+        // ==================== 检测方法字段联动 ====================
+
+        private void DetectionMethodCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (_isLoading) return;
+            UpdateDetectionFieldVisibility();
+        }
+
+        /// <summary>根据检测方法显示/隐藏相关字段</summary>
+        private void UpdateDetectionFieldVisibility()
+        {
+            var m = GetSelectedMethod();
+
+            Visibility V(bool visible) => visible ? Visibility.Visible : Visibility.Collapsed;
+
+            TargetObjectPanel.Visibility = V(IsIn(m, "person_present", "object_present", "object_in_zone", "hand_action", "hand_near_object"));
+            HandPanel.Visibility = V(IsIn(m, "hand_in_region", "hand_not_in_region", "hand_stable", "hand_move", "hand_action", "hand_near_object"));
+            ActionPanel.Visibility = V(IsIn(m, "hand_action"));
+            RegionPanel.Visibility = V(IsIn(m, "hand_in_region", "hand_not_in_region", "object_in_zone"));
+            FromToPanel.Visibility = V(IsIn(m, "hand_move", "hand_action"));
+            TolerancePanel.Visibility = V(IsIn(m, "hand_stable", "hand_near_object", "pose_stable"));
+            DurationPanel.Visibility = V(IsIn(m, "time_elapsed"));
+        }
+
+        private static bool IsIn(string value, params string[] set) => set.Contains(value);
+
+        // ==================== 控件辅助 ====================
+
+        private string GetSelectedMethod() => GetSelectedTag(DetectionMethodCombo) ?? "object_present";
+
+        private static string? GetSelectedTag(ComboBox combo)
+            => (combo.SelectedItem as ComboBoxItem)?.Tag as string;
+
+        private static void SelectComboByTag(ComboBox combo, string? tag)
+        {
+            foreach (var item in combo.Items.OfType<ComboBoxItem>())
+            {
+                if ((item.Tag as string) == tag)
+                {
+                    combo.SelectedItem = item;
+                    return;
+                }
+            }
+            if (combo.Items.Count > 0 && !combo.IsEditable)
+                combo.SelectedIndex = 0;
+        }
+
+        /// <summary>按逗号/分号切分列表文本；空文本返回 null（写入 YAML 时省略）</summary>
+        private static List<string>? SplitList(string? text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return null;
+            var items = text.Split(new[] { ',', '，', ';', '；' },
+                StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Where(s => s.Length > 0)
+                .ToList();
+            return items.Count > 0 ? items : null;
+        }
+
+        // ==================== required_objects 文本 <-> 模型 ====================
+
+        private static string FormatRequiredObjects(List<SopyamlRequiredObject>? list)
+        {
+            if (list == null || list.Count == 0) return "";
+            var sb = new StringBuilder();
+            foreach (var o in list)
+            {
+                var line = o.Object ?? "";
+                if (!string.IsNullOrWhiteSpace(o.Zone)) line += "," + o.Zone;
+                if (Math.Abs(o.MinConfidence - 0.5f) > 1e-6)
+                    line += ":" + o.MinConfidence.ToString("0.##");
+                sb.AppendLine(line);
+            }
+            return sb.ToString();
+        }
+
+        private static List<SopyamlRequiredObject>? ParseRequiredObjects(string? text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return null;
+            var list = new List<SopyamlRequiredObject>();
+            foreach (var raw in (text ?? "").Replace("\r\n", "\n").Split('\n'))
+            {
+                var line = raw.Trim();
+                if (line.Length == 0) continue;
+                // 格式：物体名[,区域ID][:最小置信度]
+                var parts = line.Split(',', 2);
+                var obj = new SopyamlRequiredObject { Object = parts[0].Trim() };
+                if (parts.Length > 1)
+                {
+                    var rest = parts[1].Trim();
+                    var ci = rest.IndexOf(':');
+                    if (ci >= 0)
+                    {
+                        var zonePart = rest.Substring(0, ci).Trim();
+                        if (zonePart.Length > 0) obj.Zone = zonePart;
+                        var confPart = rest.Substring(ci + 1).Trim();
+                        if (float.TryParse(confPart, out var c)) obj.MinConfidence = c;
+                    }
+                    else
+                    {
+                        obj.Zone = rest;
+                    }
+                }
+                if (string.IsNullOrWhiteSpace(obj.Object)) continue;
+                list.Add(obj);
+            }
+            return list.Count > 0 ? list : null;
+        }
+
+        // ==================== 运行时手部检测设置 ====================
+
+        private void EnableHandPoseCheckBox_Checked(object sender, RoutedEventArgs e)
+        {
+            if (MaxHandsComboBox != null)
+                MaxHandsComboBox.IsEnabled = true;
+        }
+
+        private void EnableHandPoseCheckBox_Unchecked(object sender, RoutedEventArgs e)
+        {
+            if (MaxHandsComboBox != null)
+                MaxHandsComboBox.IsEnabled = false;
+        }
+
+        private void KeyConfSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+        {
+            if (KeyConfValue != null)
+                KeyConfValue.Text = e.NewValue.ToString("F2");
+        }
+
+        private void EnableTimeoutCheckBox_Checked(object sender, RoutedEventArgs e)
+        {
+            if (TimeoutTextBox != null)
+            {
+                TimeoutTextBox.IsEnabled = true;
+                if (string.IsNullOrWhiteSpace(TimeoutTextBox.Text)) TimeoutTextBox.Text = "30";
+            }
+        }
+
+        private void EnableTimeoutCheckBox_Unchecked(object sender, RoutedEventArgs e)
+        {
+            if (TimeoutTextBox != null)
+                TimeoutTextBox.IsEnabled = false;
+        }
+
+        /// <summary>获取完整手部配置（供 SOPModuleView 读取运行时参数）</summary>
+        public HandPoseEstimationConfig GetHandPoseConfig()
+        {
+            var result = _handPoseConfig.Copy();
+            result.Enabled = EnableHandPoseCheckBox.IsChecked ?? true;
+            result.MaxNumHands = int.TryParse((MaxHandsComboBox.SelectedItem as ComboBoxItem)?.Content?.ToString(), out var maxHands) ? maxHands : 2;
+            result.UseGpu = UseGpuCheckBox.IsChecked ?? true;
+            result.RotationAugmentation = RotationAugCheckBox.IsChecked ?? true;
+            result.Backend = Enum.Parse<HandDetectionBackend>(GetSelectedTag(BackendComboBox) ?? "MediaPipe");
+            result.DetectLeftHand = DetectLeftHandCheckBox.IsChecked ?? true;
+            result.DetectRightHand = DetectRightHandCheckBox.IsChecked ?? true;
+            result.ConfidenceThreshold = (float)KeyConfSlider.Value;
+
+            return result;
+        }
+
+        /// <summary>设置完整手部配置（供 SOPModuleView 传入当前运行时参数）</summary>
+        public void SetHandPoseConfig(HandPoseEstimationConfig config)
+        {
+            _handPoseConfig = config.Copy();
+            EnableHandPoseCheckBox.IsChecked = config.Enabled;
+
+            foreach (ComboBoxItem item in MaxHandsComboBox.Items)
+            {
+                if (item.Content?.ToString() == config.MaxNumHands.ToString())
+                {
+                    MaxHandsComboBox.SelectedItem = item;
+                    break;
+                }
+            }
+
+            UseGpuCheckBox.IsChecked = config.UseGpu;
+
+            SelectComboByTag(BackendComboBox, config.Backend.ToString());
+            DetectLeftHandCheckBox.IsChecked = config.DetectLeftHand;
+            DetectRightHandCheckBox.IsChecked = config.DetectRightHand;
+            RotationAugCheckBox.IsChecked = config.RotationAugmentation;
+            KeyConfSlider.Value = config.ConfidenceThreshold;
+            KeyConfValue.Text = config.ConfidenceThreshold.ToString("F2");
+        }
+
+        private void AdvancedParamsButton_Click(object sender, RoutedEventArgs e)
+        {
+            var paramsWindow = new HandDetectionParamsWindow(
+                _handPoseConfig.InferenceInterval,
+                _handPoseConfig.SmoothWindowSize,
+                _handPoseConfig.SmoothAlpha,
+                _handPoseConfig.SkeletonConfidenceThreshold,
+                _handPoseConfig.EnableFaceFilter,
+                _handPoseConfig.FaceFilterUpperRatio,
+                _handPoseConfig.EnableHandStructureCheck,
+                _handPoseConfig.HandStructureWristTipRatio,
+                _handPoseConfig.DetectionConfidenceThreshold,
+                _handPoseConfig.MinBoxAreaRatio);
+
+            paramsWindow.Owner = this;
+
+            if (paramsWindow.ShowDialog() == true)
+            {
+                _handPoseConfig.InferenceInterval = paramsWindow.InferenceInterval;
+                _handPoseConfig.SmoothWindowSize = paramsWindow.SmoothWindowSize;
+                _handPoseConfig.SmoothAlpha = paramsWindow.SmoothAlpha;
+                _handPoseConfig.SkeletonConfidenceThreshold = paramsWindow.SkeletonConfidenceThreshold;
+                _handPoseConfig.EnableFaceFilter = paramsWindow.EnableFaceFilter;
+                _handPoseConfig.FaceFilterUpperRatio = paramsWindow.FaceFilterUpperRatio;
+                _handPoseConfig.EnableHandStructureCheck = paramsWindow.EnableHandStructureCheck;
+                _handPoseConfig.HandStructureWristTipRatio = paramsWindow.HandStructureWristTipRatio;
+                _handPoseConfig.DetectionConfidenceThreshold = paramsWindow.DetectionConfidenceThreshold;
+                _handPoseConfig.MinBoxAreaRatio = paramsWindow.MinBoxAreaRatio;
+            }
+        }
+    }
+
+}

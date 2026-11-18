@@ -59,8 +59,8 @@ if ($ShowHelp) {
 
 $Configuration = if ($Release) { 'Release' } else { 'Debug' }
 $Root = Split-Path -Parent $PSScriptRoot
-$Sln = Join-Path $Root 'VisionInspectionSystem.sln'
-$Out = Join-Path $Root ("src\UI\VisionInspection.UI\bin\" + $Configuration + "\net8.0-windows")
+$Sln = Join-Path $Root 'Inspection.sln'
+$Out = Join-Path $Root ("src\Desktop\bin\" + $Configuration + "\net8.0-windows")
 
 function Fail([string]$message) {
     Write-Host ""
@@ -85,10 +85,10 @@ $dotnetVersion = (& dotnet --version) | Select-Object -First 1
 Write-Host "[OK]   .NET SDK $dotnetVersion"
 
 # ---------- 2. 检查程序是否正在运行 ----------
-$running = Get-Process -Name 'VisionInspection.UI' -ErrorAction SilentlyContinue
+$running = Get-Process -Name 'Desktop' -ErrorAction SilentlyContinue
 if ($running) {
     Write-Host ""
-    Write-Host "[错误] 检测到 VisionInspection.UI.exe 正在运行(PID: $($running.Id -join ', '))。" -ForegroundColor Red
+    Write-Host "[错误] 检测到 Desktop.exe 正在运行(PID: $($running.Id -join ', '))。" -ForegroundColor Red
     Write-Host "       请先关闭程序，否则输出文件被锁定，构建会失败。"
     exit 1
 }
@@ -186,7 +186,7 @@ if ($badOutput) {
 Write-Host ""
 Write-Host "============================================================"
 Write-Host " [成功] CUDA 版构建完成"
-Write-Host " 可执行文件: $Out\VisionInspection.UI.exe"
+Write-Host " 可执行文件: $Out\Desktop.exe"
 Write-Host ""
 Write-Host " 提示: 直接运行上面的 exe 即可使用 GPU。"
 Write-Host "       不要在 Visual Studio 中按 F5 或执行不带参数的 dotnet build，"

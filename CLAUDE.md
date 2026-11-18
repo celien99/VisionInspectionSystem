@@ -13,10 +13,10 @@ Windows-only WPF (.NET 8) **SOP compliance inspection** application. It runs YOL
 ```bat
 dotnet restore
 dotnet build                       :: CPU build (default)
-dotnet run --project src/UI/VisionInspection.UI
+dotnet run --project src/Desktop
 ```
 
-Build output: `src/UI/VisionInspection.UI/bin/Debug/net8.0-windows/VisionInspection.UI.exe`.
+Build output: `src/Desktop/bin/Debug/net8.0-windows/Desktop.exe`.
 
 GPU is a **build-time** choice. Only one ONNX Runtime execution provider can be referenced:
 
@@ -56,10 +56,10 @@ Modules.Detection (YoloDotNet object detection + OpenCV video decoding)
   ↑
 Modules.SOP (YAML → workflow/state machine, hand services)
   ↑
-UI (WPF + MVVM)
+Desktop (WPF + MVVM)
 ```
 
-`VisionInspection.Converters` is a small WPF converter library. `src/Modules/VisionInspection.Modules.Cascade` and `.Defect` contain only `obj/` leftovers — the projects themselves were removed.
+`Inspection.sln` contains `src/Core/Core.csproj`, `src/Modules/Detection/Detection.csproj`, `src/Modules/SOP/SOP.csproj`, `src/Desktop/Desktop.csproj`, and `src/Converters/Converters.csproj`. `Converters` is a small WPF converter library kept separate from native dependencies for the XAML designer. Namespaces follow `Core`, `Modules.Detection`, `Modules.SOP`, `Desktop`, and `Converters`.
 
 The intended boundary is that SOP/UI consume domain types (`DetectedObject`, `HandPoseEstimationResult`), not YoloDotNet types. Current exceptions: `YoloPoseHandEstimationService` in Modules.SOP directly creates a `Yolo` instance for pose and an `Microsoft.ML.OnnxRuntime.InferenceSession` for the landmark model. Do not spread this pattern further; extend `YoloModel` instead.
 
@@ -103,7 +103,7 @@ Important engine semantics:
 
 ## Configuration, paths, and data
 
-`AppPaths` (`src/Core/.../Services/AppPaths.cs`) is the single source for path resolution. `Root` = `AppContext.BaseDirectory` or `VISION_HOME`; the config directory is the nearest ancestor containing `configs/sop`, resolved once at startup (so dev runs from `bin/` still read the repo's `configs/`). `configs/` is copied only on publish, not into `bin/`.
+`AppPaths` (`src/Core/Services/AppPaths.cs`) is the single source for path resolution. `Root` = `AppContext.BaseDirectory` or `VISION_HOME`; the config directory is the nearest ancestor containing `configs/sop`, resolved once at startup (so dev runs from `bin/` still read the repo's `configs/`). `configs/` is copied only on publish, not into `bin/`.
 
 - `configs/sop_config.json` — SOP module startup defaults (model, thresholds, hand backend/params, GPU). Keep it the startup source; don't reintroduce the old `AddInMemoryCollection` overrides in `MainViewModel.BuildSopConfig`.
 - `configs/sop/*.yaml` — recipes. `configs/sop/sop_template.yaml` is the annotated template. The UI remembers the last recipe in `configs/last_recipe.json` (runtime file, gitignored).
@@ -127,15 +127,15 @@ Runtime output locations (not in git):
 
 | Concern | Primary file(s) |
 |---|---|
-| UI commands and detection control | `src/UI/VisionInspection.UI/ViewModels/MainViewModel.cs` |
-| Camera workers, overlays, audio | `src/UI/VisionInspection.UI/Services/CameraFramePipeline.cs`, `DetectionOverlayRenderer.cs`, `SopAudioFeedback.cs` |
-| SOP panel state and counters | `src/UI/VisionInspection.UI/ViewModels/SopPanelViewModel.cs` |
-| SOP module façade: model cache, hand init, workflow start | `src/Modules/VisionInspection.Modules.SOP/SOPModule.cs` |
-| State machine / conditions / violations | `src/Modules/VisionInspection.Modules.SOP/Models/SOPStateMachine.cs`, `.../Services/StepConditionEvaluator.cs`, `.../Services/ViolationDetector.cs` |
-| YAML DTOs and two-way conversion | `src/Modules/VisionInspection.Modules.SOP/Models/SOPYamlConfig.cs` |
-| Path, config, model resolution | `src/Core/VisionInspection.Core/Services/AppPaths.cs` |
-| YOLO adapter and EP switch | `src/Modules/VisionInspection.Modules.Detection/YoloModel.cs`, `.../YoloExecutionProviders.cs` |
-| Camera slots and frame events | `src/Core/VisionInspection.Core/Services/CameraManager.cs` |
+| UI commands and detection control | `src/Desktop/ViewModels/MainViewModel.cs` |
+| Camera workers, overlays, audio | `src/Desktop/Services/CameraFramePipeline.cs`, `DetectionOverlayRenderer.cs`, `SopAudioFeedback.cs` |
+| SOP panel state and counters | `src/Desktop/ViewModels/SopPanelViewModel.cs` |
+| SOP module façade: model cache, hand init, workflow start | `src/Modules/SOP/SOPModule.cs` |
+| State machine / conditions / violations | `src/Modules/SOP/Models/SOPStateMachine.cs`, `.../Services/StepConditionEvaluator.cs`, `.../Services/ViolationDetector.cs` |
+| YAML DTOs and two-way conversion | `src/Modules/SOP/Models/SOPYamlConfig.cs` |
+| Path, config, model resolution | `src/Core/Services/AppPaths.cs` |
+| YOLO adapter and EP switch | `src/Modules/Detection/YoloModel.cs`, `.../YoloExecutionProviders.cs` |
+| Camera slots and frame events | `src/Core/Services/CameraManager.cs` |
 
 ## Cross-cutting conventions / gotchas
 

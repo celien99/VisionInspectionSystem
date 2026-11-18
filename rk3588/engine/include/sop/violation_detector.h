@@ -1,7 +1,7 @@
 // =============================================================================
 //  violation_detector.h  —  ViolationDetector 的 C++ 移植
 // =============================================================================
-//  1:1 移植自 C# src/Modules/VisionInspection.Modules.SOP/Services/ViolationDetector.cs
+//  1:1 移植自 C# src/Modules/SOP/Services/ViolationDetector.cs
 //
 //  ★★ 跳步检测（DetectSkipStep）有三个必须照抄的要点：
 //   1. 只检查「下一个」步骤（StepId 更大的最小者），不是所有后续步骤

@@ -1,0 +1,93 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <ApplicationIcon>Assets\AppIcon.ico</ApplicationIcon>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="SkiaSharp" Version="3.119.1" />
+    <PackageReference Include="SkiaSharp.Views.WPF" Version="3.119.1" />
+    <PackageReference Include="CommunityToolkit.Mvvm" Version="8.2.2" />
+    <PackageReference Include="Microsoft.Extensions.Configuration" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="8.0.0" />
+    <PackageReference Include="HandyControl" Version="3.4.0" />
+    <PackageReference Include="OpenCvSharp4" Version="4.10.0.20241108" />
+    <PackageReference Include="OpenCvSharp4.runtime.win" Version="4.10.0.20241108" />
+    <PackageReference Include="OpenCvSharp4.Extensions" Version="4.10.0.20241108" />
+    <PackageReference Include="System.Drawing.Common" Version="8.0.0" />
+    <PackageReference Include="NAudio" Version="2.2.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Resource Include="Assets\AppIcon.ico">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Resource>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Core\Core.csproj" />
+    <ProjectReference Include="..\Modules\SOP\SOP.csproj" />
+    <ProjectReference Include="..\Modules\Detection\Detection.csproj" />
+    <ProjectReference Include="..\Converters\Converters.csproj" />
+  </ItemGroup>
+
+  <!--
+    海康相机 SDK（托管封装 DLL）。原先是绝对路径 E:\yolo\...\MvCameraControl.Net.dll，
+    换机器即编译失败；改为仓库内 libs/，随程序输出。
+  -->
+  <ItemGroup>
+    <Reference Include="MvCameraControl.Net">
+      <HintPath>$(MSBuildThisFileDirectory)..\..\libs\MvCameraControl.Net.dll</HintPath>
+      <Private>true</Private>
+      <Visible>false</Visible>
+    </Reference>
+    <None Include="$(MSBuildThisFileDirectory)..\..\libs\MvCameraControl.Net.dll" Link="MvCameraControl.Net.dll" Condition="Exists('$(MSBuildThisFileDirectory)..\..\libs\MvCameraControl.Net.dll')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+  <!--
+    模型文件：仓库根 models/ 与 yolo_models/ 都是运行时可选（体积大、不进版本库）。
+    这里只在文件存在时才复制，避免 clone 后直接编译失败。
+  -->
+  <ItemGroup>
+    <None Include="..\..\models\palm_detection_full_Nx3x192x192_post.onnx" Link="models\palm_detection_full_Nx3x192x192_post.onnx" Condition="Exists('..\..\models\palm_detection_full_Nx3x192x192_post.onnx')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Include="..\..\models\hand_landmark_sparse_Nx3x224x224.onnx" Link="models\hand_landmark_sparse_Nx3x224x224.onnx" Condition="Exists('..\..\models\hand_landmark_sparse_Nx3x224x224.onnx')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Include="..\..\models\yolov8s-pose.onnx" Link="yolo_models\yolov8s-pose.onnx" Condition="Exists('..\..\models\yolov8s-pose.onnx')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Include="..\..\models\yolov11s-pose.onnx" Link="yolo_models\yolov11s-pose.onnx" Condition="Exists('..\..\models\yolov11s-pose.onnx')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+  <!--
+    configs/ 只在 publish 时随包输出（放到 exe 同目录），开发期不复制到 bin：
+    运行时统一由 Core 的 AppPaths 解析（程序根 → 向上找仓库根），
+    避免"输出目录里有一份旧副本、改了源码配置却不生效"的坑。
+  -->
+  <ItemGroup>
+    <None Include="..\..\configs\**\*" LinkBase="configs" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <!-- SOP 音频反馈文件（ok.wav / ng.wav）：复制到输出目录，运行时由 MainViewModel 定位播放 -->
+  <ItemGroup>
+    <None Include="..\..\ok.wav" Condition="Exists('..\..\ok.wav')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Include="..\..\ng.wav" Condition="Exists('..\..\ng.wav')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+</Project>

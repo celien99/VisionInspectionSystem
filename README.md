@@ -12,18 +12,18 @@
 
 ```
 VisionInspectionSystem/
+├── Inspection.sln                  # 解决方案入口
 ├── src/
-│   ├── Core/                       # 核心类库（接口、模型、基础服务）
-│   │   └── VisionInspection.Core/
-│   │       ├── Interfaces/         # IDetectionModule 等模块契约
-│   │       ├── Models/             # ROI / CameraConfiguration / ModuleResult / User
-│   │       ├── Services/           # 相机、ROI、模型、用户管理
-│   │       └── ViewModels/         # MVVM 基础（ViewModelBase、ROI 编辑器）
+│   ├── Core/                       # 核心类库（Core.csproj）
+│   │   ├── Interfaces/             # IDetectionModule 等模块契约
+│   │   ├── Models/                 # ROI / CameraConfiguration / ModuleResult / User
+│   │   ├── Services/               # 相机、ROI、模型、用户管理
+│   │   └── ViewModels/             # MVVM 基础（ViewModelBase、ROI 编辑器）
 │   ├── Modules/
-│   │   ├── VisionInspection.Modules.SOP/       # SOP 合规检测（状态机 + 条件/违规判定）
-│   │   └── VisionInspection.Modules.Detection/ # 推理层（唯一依赖 YoloDotNet 的工程）
-│   └── UI/
-│       └── VisionInspection.UI/    # WPF 主界面（MVVM）
+│   │   ├── Detection/              # 推理层（Detection.csproj）
+│   │   └── SOP/                    # SOP 合规检测（SOP.csproj）
+│   ├── Desktop/                    # WPF 主界面（Desktop.csproj）
+│   └── Converters/                 # 无原生依赖的 WPF 转换器（Converters.csproj）
 ├── configs/                        # 配置（唯一来源）
 │   ├── sop_config.json             # SOP 模块配置
 │   └── sop/                        # 配方（产品/工位 SOP）+ regions/ 区域坐标
@@ -59,12 +59,12 @@ VisionInspectionSystem/
 > 需要 .NET 8 SDK（WPF 只能在 Windows 上运行）。**不再需要** YoloDotNet 的源码仓库：推理库走 NuGet。
 
 ```bat
-:: 还原 + 编译（默认 CPU 版，任何 Windows 机器可直接跑）
+:: 打开 Inspection.sln，或在仓库根目录还原 + 编译（默认 CPU 版）
 dotnet restore
 dotnet build
 
 :: 运行
-dotnet run --project src/UI/VisionInspection.UI
+dotnet run --project src/Desktop
 ```
 
 ### CPU / CUDA 二选一
@@ -95,7 +95,7 @@ scripts\build_cuda.bat --release    :: Release
 3. 清理并执行 `dotnet build -p:YoloEp=Cuda`；
 4. 校验产物确实是 CUDA 版（`YoloDotNet.ExecutionProvider.Cuda.dll`、`onnxruntime_providers_cuda.dll`）。
 
-> 构建完成后直接运行 `bin\Debug\net8.0-windows\VisionInspection.UI.exe` 即可使用 GPU。
+> 构建完成后直接运行 `bin\Debug\net8.0-windows\Desktop.exe` 即可使用 GPU。
 > 在 Visual Studio 中按 F5 或执行不带参数的 `dotnet build` 会重新编译成 CPU 版，覆盖当前产物。
 
 ### 目录约定（全部可在运行时解析，无需改代码）
@@ -151,7 +151,7 @@ models/
 └── hand_landmark_sparse_Nx3x224x224.onnx       # 第二阶段：21 关键点（224×224）
 ```
 
-- 构建时由 `VisionInspection.UI.csproj` 自动复制到输出目录 `bin\Debug\net8.0-windows\models\`，**clean 重建后会自动恢复，无需手动放置**。
+- 构建时由 `Desktop.csproj` 自动复制到输出目录 `bin\Debug\net8.0-windows\models\`，**clean 重建后会自动恢复，无需手动放置**。
 - 若这两个文件缺失，SOP 手部检测不会初始化（日志出现 `Backend=MediaPipe 但模型文件缺失，手部检测未初始化`），手部动作类步骤（hand_in_region 等）将无法判定。
 
 ### 2. YOLO 检测模型（SOP / 实时检测）

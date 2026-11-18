@@ -71,7 +71,6 @@ Thumbs.db
 docs/
 remember.txt
 seg_reflect.txt
-src/UI/VisionInspection.UI/remember.txt
 
 # Nested git repos / large model files
 yolo_models/dwpose-github/
@@ -80,7 +79,7 @@ yolo_models/dwpose-github/
 # Large model / binary / media files (excluded from repo)
 src/yolo_models/
 yolo_models/
-models/
+/models/
 ffmpeg/
 ffmpeg-release-essentials/
 outputs/
