@@ -33,29 +33,12 @@ namespace VisionInspection.UI.Views
         /// <summary>保存成功后最终写入的 YAML 路径（供调用方重载工作流）</summary>
         public string? SavedYamlPath { get; private set; }
 
-        // ===== 运行时手部检测参数（不写入 YAML，供 SOPModuleView 读取）=====
-        public int HandInferenceInterval { get; private set; } = 2;
-        public int HandSmoothWindowSize { get; private set; } = 5;
-        public float HandSmoothAlpha { get; private set; } = 0.7f;
-        public float HandSkeletonThreshold { get; private set; } = 0.3f;
-        public bool HandEnableFaceFilter { get; private set; } = true;
-        public float HandFaceFilterUpperRatio { get; private set; } = 0.38f;
-        public bool HandEnableStructureCheck { get; private set; } = true;
-        public float HandStructureWristTipRatio { get; private set; } = 0.18f;
-        public float HandDetectionConfidence { get; private set; } = 0.08f;
-        public float HandMinBoxAreaRatio { get; private set; } = 0.0005f;
-        public bool HandRotationAugmentation { get; private set; } = true;
-
-        // 新增：此前仅能从 JSON 配置（sop_config.json）读取、UI 无法设置的参数
-        public string HandBackend { get; private set; } = "MediaPipe";   // Auto / MediaPipe / YoloPose
-        public bool HandDetectLeftHand { get; private set; } = true;
-        public bool HandDetectRightHand { get; private set; } = true;
-        public float HandConfidenceThreshold { get; private set; } = 0.5f; // 关键点平均置信度阈值
+        private HandPoseEstimationConfig _handPoseConfig = new();
 
         public SOPConfigWindow(string? yamlPath = null)
         {
             InitializeComponent();
-            InitializeRuntimeDefaults();
+            SetHandPoseConfig(_handPoseConfig);
             FillStepCameraModelCombos();
             RefreshYamlFilesList();
 
@@ -76,20 +59,6 @@ namespace VisionInspection.UI.Views
             {
                 SetEmptyState();
             }
-        }
-
-        /// <summary>运行时手部检测默认值（与旧版一致）</summary>
-        private void InitializeRuntimeDefaults()
-        {
-            EnableHandPoseCheckBox.IsChecked = true;
-            MaxHandsComboBox.SelectedIndex = 1; // 默认 2 只手
-            UseGpuCheckBox.IsChecked = true;
-            BackendComboBox.SelectedIndex = 0;  // 默认 MediaPipe
-            DetectLeftHandCheckBox.IsChecked = true;
-            DetectRightHandCheckBox.IsChecked = true;
-            RotationAugCheckBox.IsChecked = true;
-            KeyConfSlider.Value = 0.5;
-            KeyConfValue.Text = "0.50";
         }
 
         // ==================== YAML 文件列表 ====================
@@ -1237,9 +1206,8 @@ namespace VisionInspection.UI.Views
 
         private void KeyConfSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
         {
-            HandConfidenceThreshold = (float)e.NewValue;
             if (KeyConfValue != null)
-                KeyConfValue.Text = HandConfidenceThreshold.ToString("F2");
+                KeyConfValue.Text = e.NewValue.ToString("F2");
         }
 
         private void EnableTimeoutCheckBox_Checked(object sender, RoutedEventArgs e)
@@ -1257,37 +1225,27 @@ namespace VisionInspection.UI.Views
                 TimeoutTextBox.IsEnabled = false;
         }
 
-        /// <summary>获取检测模式配置（供 SOPModuleView 读取运行时参数）</summary>
-        public SOPDetectionModeConfig GetDetectionModeConfig()
+        /// <summary>获取完整手部配置（供 SOPModuleView 读取运行时参数）</summary>
+        public HandPoseEstimationConfig GetHandPoseConfig()
         {
-            return new SOPDetectionModeConfig
-            {
-                DetectionMode = "UnifiedDetection",
-                EnableHandPoseEstimation = EnableHandPoseCheckBox.IsChecked ?? true,
-                MaxNumHands = int.TryParse((MaxHandsComboBox.SelectedItem as ComboBoxItem)?.Content?.ToString(), out var maxHands) ? maxHands : 2,
-                UseGpu = UseGpuCheckBox.IsChecked ?? true,
-                EnableFaceFilter = HandEnableFaceFilter,
-                FaceFilterUpperRatio = HandFaceFilterUpperRatio,
-                EnableHandStructureCheck = HandEnableStructureCheck,
-                HandStructureWristTipRatio = HandStructureWristTipRatio,
-                DetectionConfidenceThreshold = HandDetectionConfidence,
-                MinBoxAreaRatio = HandMinBoxAreaRatio,
-                RotationAugmentation = HandRotationAugmentation,
-                HandBackend = GetSelectedTag(BackendComboBox) ?? "MediaPipe",
-                DetectLeftHand = DetectLeftHandCheckBox.IsChecked ?? true,
-                DetectRightHand = DetectRightHandCheckBox.IsChecked ?? true,
-                ConfidenceThreshold = HandConfidenceThreshold,
-                InferenceInterval = HandInferenceInterval,
-                SmoothWindowSize = HandSmoothWindowSize,
-                SmoothAlpha = HandSmoothAlpha,
-                SkeletonConfidenceThreshold = HandSkeletonThreshold
-            };
+            var result = _handPoseConfig.Copy();
+            result.Enabled = EnableHandPoseCheckBox.IsChecked ?? true;
+            result.MaxNumHands = int.TryParse((MaxHandsComboBox.SelectedItem as ComboBoxItem)?.Content?.ToString(), out var maxHands) ? maxHands : 2;
+            result.UseGpu = UseGpuCheckBox.IsChecked ?? true;
+            result.RotationAugmentation = RotationAugCheckBox.IsChecked ?? true;
+            result.Backend = Enum.Parse<HandDetectionBackend>(GetSelectedTag(BackendComboBox) ?? "MediaPipe");
+            result.DetectLeftHand = DetectLeftHandCheckBox.IsChecked ?? true;
+            result.DetectRightHand = DetectRightHandCheckBox.IsChecked ?? true;
+            result.ConfidenceThreshold = (float)KeyConfSlider.Value;
+
+            return result;
         }
 
-        /// <summary>设置检测模式配置（供 SOPModuleView 传入当前运行时参数）</summary>
-        public void SetDetectionModeConfig(SOPDetectionModeConfig config)
+        /// <summary>设置完整手部配置（供 SOPModuleView 传入当前运行时参数）</summary>
+        public void SetHandPoseConfig(HandPoseEstimationConfig config)
         {
-            EnableHandPoseCheckBox.IsChecked = config.EnableHandPoseEstimation;
+            _handPoseConfig = config.Copy();
+            EnableHandPoseCheckBox.IsChecked = config.Enabled;
 
             foreach (ComboBoxItem item in MaxHandsComboBox.Items)
             {
@@ -1300,96 +1258,44 @@ namespace VisionInspection.UI.Views
 
             UseGpuCheckBox.IsChecked = config.UseGpu;
 
-            HandEnableFaceFilter = config.EnableFaceFilter;
-            HandFaceFilterUpperRatio = config.FaceFilterUpperRatio;
-            HandEnableStructureCheck = config.EnableHandStructureCheck;
-            HandStructureWristTipRatio = config.HandStructureWristTipRatio;
-            HandDetectionConfidence = config.DetectionConfidenceThreshold;
-            HandMinBoxAreaRatio = config.MinBoxAreaRatio;
-            HandRotationAugmentation = config.RotationAugmentation;
-
-            // 新增参数往返（UI 控件 + 字段同步）
-            SelectComboByTag(BackendComboBox, config.HandBackend);
-            HandBackend = config.HandBackend;
+            SelectComboByTag(BackendComboBox, config.Backend.ToString());
             DetectLeftHandCheckBox.IsChecked = config.DetectLeftHand;
-            HandDetectLeftHand = config.DetectLeftHand;
             DetectRightHandCheckBox.IsChecked = config.DetectRightHand;
-            HandDetectRightHand = config.DetectRightHand;
             RotationAugCheckBox.IsChecked = config.RotationAugmentation;
             KeyConfSlider.Value = config.ConfidenceThreshold;
             KeyConfValue.Text = config.ConfidenceThreshold.ToString("F2");
-            HandConfidenceThreshold = config.ConfidenceThreshold;
-
-            // 平滑类参数往返（来自「高级参数」窗口）
-            HandInferenceInterval = config.InferenceInterval;
-            HandSmoothWindowSize = config.SmoothWindowSize;
-            HandSmoothAlpha = config.SmoothAlpha;
-            HandSkeletonThreshold = config.SkeletonConfidenceThreshold;
         }
 
         private void AdvancedParamsButton_Click(object sender, RoutedEventArgs e)
         {
             var paramsWindow = new HandDetectionParamsWindow(
-                HandInferenceInterval,
-                HandSmoothWindowSize,
-                HandSmoothAlpha,
-                HandSkeletonThreshold,
-                HandEnableFaceFilter,
-                HandFaceFilterUpperRatio,
-                HandEnableStructureCheck,
-                HandStructureWristTipRatio,
-                HandDetectionConfidence,
-                HandMinBoxAreaRatio);
+                _handPoseConfig.InferenceInterval,
+                _handPoseConfig.SmoothWindowSize,
+                _handPoseConfig.SmoothAlpha,
+                _handPoseConfig.SkeletonConfidenceThreshold,
+                _handPoseConfig.EnableFaceFilter,
+                _handPoseConfig.FaceFilterUpperRatio,
+                _handPoseConfig.EnableHandStructureCheck,
+                _handPoseConfig.HandStructureWristTipRatio,
+                _handPoseConfig.DetectionConfidenceThreshold,
+                _handPoseConfig.MinBoxAreaRatio);
 
             paramsWindow.Owner = this;
 
             if (paramsWindow.ShowDialog() == true)
             {
-                HandInferenceInterval = paramsWindow.InferenceInterval;
-                HandSmoothWindowSize = paramsWindow.SmoothWindowSize;
-                HandSmoothAlpha = paramsWindow.SmoothAlpha;
-                HandSkeletonThreshold = paramsWindow.SkeletonConfidenceThreshold;
-                HandEnableFaceFilter = paramsWindow.EnableFaceFilter;
-                HandFaceFilterUpperRatio = paramsWindow.FaceFilterUpperRatio;
-                HandEnableStructureCheck = paramsWindow.EnableHandStructureCheck;
-                HandStructureWristTipRatio = paramsWindow.HandStructureWristTipRatio;
-                HandDetectionConfidence = paramsWindow.DetectionConfidenceThreshold;
-                HandMinBoxAreaRatio = paramsWindow.MinBoxAreaRatio;
+                _handPoseConfig.InferenceInterval = paramsWindow.InferenceInterval;
+                _handPoseConfig.SmoothWindowSize = paramsWindow.SmoothWindowSize;
+                _handPoseConfig.SmoothAlpha = paramsWindow.SmoothAlpha;
+                _handPoseConfig.SkeletonConfidenceThreshold = paramsWindow.SkeletonConfidenceThreshold;
+                _handPoseConfig.EnableFaceFilter = paramsWindow.EnableFaceFilter;
+                _handPoseConfig.FaceFilterUpperRatio = paramsWindow.FaceFilterUpperRatio;
+                _handPoseConfig.EnableHandStructureCheck = paramsWindow.EnableHandStructureCheck;
+                _handPoseConfig.HandStructureWristTipRatio = paramsWindow.HandStructureWristTipRatio;
+                _handPoseConfig.DetectionConfidenceThreshold = paramsWindow.DetectionConfidenceThreshold;
+                _handPoseConfig.MinBoxAreaRatio = paramsWindow.MinBoxAreaRatio;
             }
         }
     }
 
-    /// <summary>
-    /// SOP检测模式配置（运行时手部检测参数，不写入 YAML）
-    /// </summary>
-    public class SOPDetectionModeConfig
-    {
-        public string DetectionMode { get; set; } = "ObjectBased";
-        public bool EnableHandPoseEstimation { get; set; } = false;
-        public int MaxNumHands { get; set; } = 1;
-        public bool UseGpu { get; set; } = true;
-        public bool EnableFaceFilter { get; set; } = true;
-        public float FaceFilterUpperRatio { get; set; } = 0.38f;
-        public bool EnableHandStructureCheck { get; set; } = true;
-        public float HandStructureWristTipRatio { get; set; } = 0.18f;
-        public float DetectionConfidenceThreshold { get; set; } = 0.08f;
-        public float MinBoxAreaRatio { get; set; } = 0.0005f;
-        public bool RotationAugmentation { get; set; } = true;
-
-        /// <summary>手部检测后端：Auto / MediaPipe / YoloPose（此前仅能从 JSON 读取）</summary>
-        public string HandBackend { get; set; } = "MediaPipe";
-        public bool DetectLeftHand { get; set; } = true;
-        public bool DetectRightHand { get; set; } = true;
-        /// <summary>关键点平均置信度阈值（ConfidenceThreshold，此前写死 0.5）</summary>
-        public float ConfidenceThreshold { get; set; } = 0.5f;
-
-        /// <summary>推理跳帧间隔（每 N 帧推理一次，1=每帧，来自「高级参数」）</summary>
-        public int InferenceInterval { get; set; } = 1;
-        /// <summary>平滑窗口（稳定帧数/去抖），1=无去抖</summary>
-        public int SmoothWindowSize { get; set; } = 1;
-        /// <summary>EMA 平滑系数（当前帧权重）</summary>
-        public float SmoothAlpha { get; set; } = 0.7f;
-        /// <summary>骨架置信度输出门槛</summary>
-        public float SkeletonConfidenceThreshold { get; set; } = 0.3f;
-    }
 }

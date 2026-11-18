@@ -22,7 +22,7 @@ public interface IDetectionModule : IDisposable
     /// <summary>
     /// 初始化模块
     /// </summary>
-    Task InitializeAsync(IConfiguration config, ICameraService cameraService);
+    Task InitializeAsync(IConfiguration config);
 
     /// <summary>
     /// 执行检测

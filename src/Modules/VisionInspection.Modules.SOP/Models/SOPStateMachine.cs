@@ -435,8 +435,9 @@ public class ViolationEventArgs : EventArgs
 
         public SOPCompletedEventArgs(IReadOnlyList<StepExecutionRecord> stepHistory, IReadOnlyList<ViolationRecord> violations)
         {
-            StepHistory = stepHistory;
-            Violations = violations;
+            // UI 异步读取事件；自动复位不能清空已完成周期的数据。
+            StepHistory = stepHistory.ToArray();
+            Violations = violations.ToArray();
         }
     }
 

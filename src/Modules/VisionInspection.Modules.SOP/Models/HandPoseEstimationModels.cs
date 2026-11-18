@@ -158,6 +158,11 @@ public class HandPoseEstimationResult
 /// </summary>
 public class HandPoseEstimationConfig
 {
+    public bool Enabled { get; set; } = true;
+
+    // 所有字段均为值类型或字符串；服务持有独立快照，避免编辑配置影响正在推理的实例。
+    public HandPoseEstimationConfig Copy() => (HandPoseEstimationConfig)MemberwiseClone();
+
     /// <summary>
     /// 手掌检测模型路径（第一阶段）
     /// </summary>

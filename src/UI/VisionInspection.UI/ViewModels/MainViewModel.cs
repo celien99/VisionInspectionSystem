@@ -3,13 +3,9 @@ using CommunityToolkit.Mvvm.Input;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Win32;
 using SkiaSharp;
-using System.Collections.Concurrent;
 using System.Collections.ObjectModel;
 using System.IO;
-using NAudio.Wave;
-using System.Media;
 using System.Threading.Tasks;
-using System.Threading.Channels;
 using System.Windows;
 using VisionInspection.Core.Interfaces;
 using VisionInspection.Core.Models;
@@ -27,11 +23,15 @@ namespace VisionInspection.UI.ViewModels;
 
 public partial class MainViewModel : ViewModelBase, IDisposable
 {
+    private readonly DetectionOverlayRenderer _overlayRenderer = new();
+    private readonly SopAudioFeedback _audioFeedback = new();
+    private readonly CameraFramePipeline _framePipeline;
     private readonly ROIManager _roiManager;
     private readonly CameraManager _cameraManager;
     private readonly YoloDetectionService _detectionService;
     private readonly ModelManager _modelManager;
     private SOPModule? _sopModule;
+    private Task? _sopStartTask;
     private ModelInfo? _loadedModel;
     private bool _isDisposed = false;
 
@@ -39,16 +39,20 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     [ObservableProperty]
     private bool _useGpu;
 
-    /// <summary>
-    /// 保存的SOP检测模式配置（从SOP配置界面获取）
-    /// </summary>
-    private (string DetectionMode, bool EnableHandPose, int MaxNumHands,
-        bool EnableFaceFilter, float FaceFilterUpperRatio,
-        bool EnableHandStructureCheck, float HandStructureWristTipRatio,
-        float DetectionConfidenceThreshold, float MinBoxAreaRatio,
-        bool RotationAugmentation, string HandBackend, bool DetectLeftHand, bool DetectRightHand,
-        float ConfidenceThreshold, int InferenceInterval, int SmoothWindowSize,
-        float SmoothAlpha, float SkeletonConfidenceThreshold)? _savedSOPDetectionConfig;
+    private HandPoseEstimationConfig? _savedHandPoseConfig;
+
+    public HandPoseEstimationConfig GetHandPoseConfig()
+        => (_savedHandPoseConfig ?? SOPModuleConfig.FromConfiguration(BuildSopConfig()).HandPoseEstimation).Copy();
+
+    public async Task ApplySopConfigurationAsync(string yamlPath, HandPoseEstimationConfig config)
+    {
+        SopWorkflowPath = yamlPath;
+        _savedHandPoseConfig = config.Copy();
+        if (_sopModule == null) return;
+        await _sopModule.UpdateHandPoseConfigAsync(_savedHandPoseConfig);
+        if (IsSOPDetecting && File.Exists(yamlPath))
+            await Task.Run(() => _sopModule.StartWorkflowFromYaml(yamlPath));
+    }
 
     private static readonly object _logLock = new();
     private static readonly string _debugLogPath = AppPaths.Log("sop_frame_debug.log");
@@ -118,18 +122,6 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     [ObservableProperty]
     private int _gridColumns = 1;
 
-    /// <summary>每路相机的推理通道（容量 1，DropOldest；ConcurrentDictionary 允许运行中动态补建新相机通道）</summary>
-    private readonly ConcurrentDictionary<string, Channel<SKBitmap>> _perCameraInferenceQueues = new();
-
-    /// <summary>每路相机最近一次用于推理的帧（跨相机规则需要同时刻的多路帧）</summary>
-    private readonly Dictionary<string, SKBitmap> _lastInferenceFrames = new();
-
-    /// <summary>每路相机最近一次的检测结果（供对应画面叠加渲染）</summary>
-    private readonly Dictionary<string, List<DetectedObject>> _perCameraLastResults = new();
-
-    /// <summary>跨相机协同规则评估器</summary>
-    private readonly CrossCameraEvaluator _crossEvaluator = new();
-
     [ObservableProperty]
     private string _status = "就绪";
 
@@ -192,8 +184,6 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     [ObservableProperty]
     private string _sopWorkflowPath = "";
 
-    private readonly SemaphoreSlim _sopInferenceLock = new(1, 1);
-
     private string _lastDetectionError = "";
     private DateTime _lastFrameTime = DateTime.Now;
     private int _frameCount = 0;
@@ -201,60 +191,15 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     private SKBitmap? _videoDrawnImage;
     private DateTime _lastInferenceTime = DateTime.Now;
     private int _inferenceFrameCount = 0;
-    private bool _isProcessingFrame = false;
-    private readonly SemaphoreSlim _inferenceLock = new(1, 1);
 
-    // 缓存最后一次手部骨架结果，在原始帧上绘制，消除"原始帧→骨架帧"交替闪烁
-    private HandPoseEstimationResult? _lastHandPoseResult;
-    // ⭐ 手部骨架结果来自哪路相机（多相机：手部骨架画到产生它的相机画面，而非固定主相机）
-    private string _lastHandPoseCameraId = "main_camera";
-    // 连续无手部检测帧计数器，用于清除残留骨架
-    private int _noHandsFrameCount = 0;
-    private const int MaxNoHandsFrames = 8;
-
-    // 缓存最后一次 SOP 检测结果，让最新相机帧到达时再叠加渲染。
-    // 关键：避免"推理完成 → 把旧帧+检测框覆盖到 CurrentImage → 画面退回上一帧"的卡顿感。
-    private SOPModuleResult? _lastSopResult;
-    private int _noSopResultFrameCount = 0;
-
-    // ---- 违规提示横幅（绘制在主相机画面顶部）----
-    // 违规事件发生即时推入（不等下一次推理结果），由 OnCameraFrameGrabbed 在最新帧上绘制。
-    // 触发方（OnSOPViolationDetected，UI 线程）与绘制方（OnCameraFrameGrabbed，相机采集线程）不同 → 加锁。
-    private readonly List<ViolationToast> _activeViolations = new();
-    private readonly object _violationToastLock = new();
-
-    private sealed record ViolationToast(DateTime Time, string TypeName, string Description);
-
-    // ---- 区域监控（在标定区域内检测"未戴安全帽的人"）状态 ----
-    private DateTime _regionAlertLastTime = DateTime.MinValue;
-    private bool _regionAlertActive = false;
-    private const int MaxNoSopResultFrames = 15;  // ~0.5s @ 30fps，超过后清除残留检测框
-
-    // 检测框时序平滑器：IOU 跟踪 + EMA 位置平滑 + 确认/保持机制，消除检测框闪烁与跳动。
-    // 仅在推理产生新结果时 Update，渲染时读取 GetActiveBoxes。
-    private readonly DetectionTrackSmoother _detectionSmoother = new();
-
-    // 实时检测专用平滑器（与 SOP 的 _detectionSmoother 隔离，避免状态互相污染）
+    // 实时检测平滑器，参数由当前模型配置决定。
     // 参数从当前加载的 ModelInfo 读取，模型管理对话框可调。
     private DetectionTrackSmoother _realtimeSmoother = new(ema: 0.2f, maxMissed: 5);
 
     // 实时检测结果缓存：最近一次平滑后的检测对象，由 OnCameraFrameGrabbed 在最新相机帧上叠加渲染。
-    // 与 SOP 的 _lastSopResult 同理，避免「无框原始帧」与「有框帧」交替造成的闪烁。
     private List<DetectedObject>? _lastRealtimeObjects;
     private int _noRealtimeResultFrameCount;
     private const int MaxNoRealtimeResultFrames = 15; // 连续多少帧无新实时结果则清空缓存
-    
-    private CancellationTokenSource? _inferenceCts;
-    private Task? _inferenceWorkerTask;
-
-    // ===== 预览管线 =====
-    // 相机 SDK 回调线程只入队；位图转换/叠加/UI 派发在独立线程按 PreviewMaxFps 执行。
-    private const int PreviewMaxFps = 25;
-    private readonly Channel<CameraFrameEventArgs> _previewQueue = Channel.CreateBounded<CameraFrameEventArgs>(
-        new BoundedChannelOptions(1) { FullMode = BoundedChannelFullMode.DropOldest });
-    private CancellationTokenSource? _previewCts;
-    private Task? _previewWorkerTask;
-    private DateTime _lastPreviewPushedAt = DateTime.MinValue;
 
     public MainViewModel()
     {
@@ -266,14 +211,13 @@ public partial class MainViewModel : ViewModelBase, IDisposable
 
         // 订阅检测错误事件
         _detectionService.DetectionError += OnDetectionError;
-        
+
         // 订阅相机图像事件
-        _cameraManager.FrameGrabbed += OnCameraFrameGrabbed;
         _cameraManager.SlotStatusChanged += OnCameraSlotStatusChanged;
         _cameraManager.ConnectionStatusChanged += OnCameraConnectionStatusChanged;
 
         // 预览渲染线程：与相机回调线程解耦，按上限帧率消费
-        StartPreviewWorker();
+        _framePipeline = new CameraFramePipeline(_cameraManager, RenderPreview, ProcessCameraFramesAsync);
     }
 
     /// <summary>
@@ -282,23 +226,6 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     public void InitCameraLayout()
     {
         RebuildCameraLayout();
-    }
-    
-    /// <summary>
-    /// 相机帧到达回调（<b>SDK 回调线程</b>）：只把帧塞进容量 1 的预览队列，立即返回。
-    /// <para>
-    /// 原实现在这里同步做 1080p 的 RGB24→BGRA 逐像素转换（~5~10ms）、8MB 位图分配、
-    /// 叠加绘制和 UI 派发 —— 全部压在相机 SDK 回调线程上，回调一慢就开始丢帧，
-    /// 表现就是"不跑推理也掉帧"。现在转换/渲染在 <see cref="StartPreviewWorker"/> 的
-    /// 独立线程按上限帧率执行，超出的帧连转换都不做，直接丢。
-    /// </para>
-    /// </summary>
-    private void OnCameraFrameGrabbed(object? sender, CameraFrameEventArgs e)
-    {
-        if (System.Windows.Application.Current == null || _isDisposed) return;
-
-        // 容量 1 + DropOldest：永远只保留最新帧，积压不会拖慢采集
-        _previewQueue.Writer.TryWrite(e);
     }
 
     /// <summary>
@@ -316,54 +243,19 @@ public partial class MainViewModel : ViewModelBase, IDisposable
 
         bool isPrimary = string.Equals(e.CameraId, CameraManager.PrimaryCameraId, StringComparison.OrdinalIgnoreCase);
 
-        // SOP 运行中：每路克隆入对应推理通道（主相机兼容旧路径）
-        if (IsSOPDetecting && _sopModule != null)
-        {
-            // 相机在 SOP 运行期间才连接/开始采集：动态补建该相机的单槽推理通道，
-            // 否则其帧会被丢弃，导致该相机画面无推理、步骤相机取不到检测。
-            var ch = _perCameraInferenceQueues.GetOrAdd(e.CameraId, _ =>
-                Channel.CreateBounded<SKBitmap>(
-                    new BoundedChannelOptions(1)
-                    {
-                        FullMode = BoundedChannelFullMode.DropOldest
-                    }));
-            var clone = skBitmap.Copy();
-            if (!ch.Writer.TryWrite(clone))
-            {
-                clone.Dispose(); // 队列未就绪或满了，丢弃旧帧
-            }
-        }
+        if (IsSOPDetecting || IsRealTimeDetecting)
+            _framePipeline.EnqueueInference(e.CameraId, skBitmap);
 
-        // 在最新相机帧上叠加该相机缓存的检测结果（检测框 + 手部骨架，两者同时绘制，
-        // 不再互斥：多相机下相机画面常有检测框，互斥会导致手部骨架被检测框分支跳过）
         if (IsSOPDetecting)
         {
             try
             {
                 using var canvas = new SKCanvas(skBitmap);
-
-                // ① 该相机的检测框
-                if (_perCameraLastResults.TryGetValue(e.CameraId, out var cachedDets) && cachedDets.Count > 0)
-                {
-                    DrawDetectedObjects(canvas, cachedDets, 18f);
-                }
-
-                // ② 手部骨架：画到产生手部结果的相机画面上（跟随当前步骤相机）
-                if (string.Equals(_lastHandPoseCameraId, e.CameraId, StringComparison.OrdinalIgnoreCase)
-                    && _lastHandPoseResult is { Hands.Count: > 0 })
-                {
-                    DrawHandPoses(canvas, _lastHandPoseResult);
-                }
-
-                // ③ 违规提示横幅（仅主相机画面）：违规事件即时推入缓存，随帧持续绘制
-                if (isPrimary)
-                {
-                    DrawViolationBanner(canvas, skBitmap.Info);
-                }
+                _overlayRenderer.DrawSop(canvas, skBitmap.Info, e.CameraId);
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine($"[OnCameraFrameGrabbed] 叠加 SOP 结果异常: {ex.Message}");
+                System.Diagnostics.Debug.WriteLine($"[Preview] 叠加 SOP 结果异常: {ex.Message}");
             }
         }
 
@@ -373,7 +265,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             try
             {
                 using var canvas = new SKCanvas(skBitmap);
-                DrawDetectedObjects(canvas, _lastRealtimeObjects, 32f);
+                _overlayRenderer.DrawDetectedObjects(canvas, _lastRealtimeObjects, 32f);
             }
             catch (Exception ex)
             {
@@ -391,7 +283,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         // 在UI线程更新对应画面（主相机同步到 ROI 编辑画面，避免阻塞相机采集线程）
         System.Windows.Application.Current.Dispatcher.BeginInvoke(new Action(() =>
         {
-            if (_isDisposed) return;
+            if (_isDisposed) { skBitmap.Dispose(); return; }
 
             var item = CameraViews.FirstOrDefault(v => string.Equals(v.CameraId, e.CameraId, StringComparison.OrdinalIgnoreCase));
             if (item != null)
@@ -412,42 +304,6 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             }
         }));
 
-        // 实时检测（仅主相机）触发推理
-        if (isPrimary && IsRealTimeDetecting && _detectionService.IsInitialized && !_isProcessingFrame)
-        {
-            _ = PerformRealTimeDetectionAsync(skBitmap);
-        }
-    }
-
-    /// <summary>
-    /// 启动预览渲染线程：按 <see cref="PreviewMaxFps"/> 上限消费帧，其余帧直接丢弃。
-    /// </summary>
-    private void StartPreviewWorker()
-    {
-        _previewCts = new CancellationTokenSource();
-        var token = _previewCts.Token;
-
-        _previewWorkerTask = Task.Run(async () =>
-        {
-            while (!token.IsCancellationRequested)
-            {
-                CameraFrameEventArgs frame;
-                try
-                {
-                    frame = await _previewQueue.Reader.ReadAsync(token);
-                }
-                catch (OperationCanceledException) { break; }
-                catch { continue; }
-
-                var now = DateTime.UtcNow;
-                if ((now - _lastPreviewPushedAt).TotalMilliseconds < 1000.0 / PreviewMaxFps)
-                    continue;   // 超频帧：连位图转换都不做
-
-                _lastPreviewPushedAt = now;
-                try { RenderPreview(frame); }
-                catch (Exception ex) { DebugLog($"[Preview] 渲染异常: {ex.Message}"); }
-            }
-        }, token);
     }
 
     /// <summary>
@@ -554,166 +410,20 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     }
 
     /// <summary>
-    /// 启动推理工作线程（多相机批量：每 tick 收集各相机最新帧一次性推理）
-    /// </summary>
-    private void StartInferenceWorker()
-    {
-        // 为每个已连接槽位创建单槽推理通道（容量 1，DropOldest）
-        CreateInferenceQueues();
-
-        _inferenceCts = new CancellationTokenSource();
-        _inferenceWorkerTask = Task.Run(async () =>
-        {
-            try
-            {
-                while (!_inferenceCts.Token.IsCancellationRequested)
-                {
-                    // 等待任一相机通道有数据
-                    var reads = _perCameraInferenceQueues.Values
-                        .Select(ch => ch.Reader.WaitToReadAsync(_inferenceCts.Token).AsTask())
-                        .ToArray();
-                    if (reads.Length == 0)
-                    {
-                        await Task.Delay(50, _inferenceCts.Token);
-                        continue;
-                    }
-                    await Task.WhenAny(reads);
-
-                    // 收集各相机最新帧（单槽通道天然是"最新帧"）
-                    var frames = new Dictionary<string, CaptureFrame>();
-                    foreach (var (camId, ch) in _perCameraInferenceQueues)
-                    {
-                        if (ch.Reader.TryRead(out var bitmap))
-                        {
-                            // 替换保留的最近帧
-                            if (_lastInferenceFrames.TryGetValue(camId, out var old))
-                                old.Dispose();
-                            _lastInferenceFrames[camId] = bitmap;
-                        }
-                        if (_lastInferenceFrames.TryGetValue(camId, out var img))
-                        {
-                            frames[camId] = new CaptureFrame
-                            {
-                                CameraId = camId,
-                                Image = img,
-                                Timestamp = DateTime.Now,
-                                FrameNumber = _frameCount++
-                            };
-                        }
-                    }
-
-                    if (frames.Count > 0)
-                    {
-                        await PerformSOPDetectionAsync(frames);
-                    }
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                // 正常取消（包括TaskCanceledException），不输出异常
-                System.Diagnostics.Debug.WriteLine("[InferenceWorker] 工作线程正常取消");
-            }
-            catch (ChannelClosedException)
-            {
-                // Channel关闭，不输出异常
-                System.Diagnostics.Debug.WriteLine("[InferenceWorker] Channel已关闭");
-            }
-            catch (Exception ex)
-            {
-                // 其他异常记录
-                System.Diagnostics.Debug.WriteLine($"[InferenceWorker] 异常: {ex.GetType().Name}: {ex.Message}");
-            }
-            finally
-            {
-                // 释放保留的推理帧
-                foreach (var kv in _lastInferenceFrames)
-                {
-                    kv.Value?.Dispose();
-                }
-                _lastInferenceFrames.Clear();
-            }
-        }, _inferenceCts.Token);
-    }
-
-    /// <summary>
-    /// 为每个已连接槽位创建单槽推理通道
-    /// </summary>
-    private void CreateInferenceQueues()
-    {
-        foreach (var ch in _perCameraInferenceQueues.Values)
-        {
-            ch.Writer.TryComplete();
-        }
-        _perCameraInferenceQueues.Clear();
-
-        foreach (var slot in _cameraManager.Slots.Where(s => s.IsConnected))
-        {
-            _perCameraInferenceQueues.GetOrAdd(slot.CameraId, _ =>
-                Channel.CreateBounded<SKBitmap>(
-                    new BoundedChannelOptions(1)
-                    {
-                        FullMode = BoundedChannelFullMode.DropOldest
-                    }));
-        }
-    }
-
-    /// <summary>
-    /// 停止推理工作线程
-    /// </summary>
-    private async Task StopInferenceWorkerAsync()
-    {
-        try
-        {
-            _inferenceCts?.Cancel();
-            foreach (var ch in _perCameraInferenceQueues.Values)
-            {
-                ch.Writer.TryComplete();
-            }
-        }
-        catch (Exception)
-        {
-            // 忽略关闭时的异常
-        }
-        
-        if (_inferenceWorkerTask != null)
-        {
-            try
-            {
-                await _inferenceWorkerTask;
-            }
-            catch (OperationCanceledException)
-            {
-                // 正常取消（包括TaskCanceledException），不输出异常
-            }
-            catch (ChannelClosedException)
-            {
-                // Channel已关闭，忽略
-            }
-            catch (Exception ex)
-            {
-                // 其他异常记录但不抛出
-                System.Diagnostics.Debug.WriteLine($"[StopInference] 异常: {ex.GetType().Name}: {ex.Message}");
-            }
-            finally
-            {
-                _inferenceWorkerTask = null;
-            }
-        }
-        _perCameraInferenceQueues.Clear();
-    }
-    
-    /// <summary>
     /// 执行实时检测
     /// </summary>
+    private Task ProcessCameraFramesAsync(Dictionary<string, CaptureFrame> frames)
+    {
+        if (IsSOPDetecting) return PerformSOPDetectionAsync(frames);
+        if (IsRealTimeDetecting && frames.TryGetValue(CameraManager.PrimaryCameraId, out var primary))
+            return PerformRealTimeDetectionAsync(primary.Image);
+        return Task.CompletedTask;
+    }
+
     private async Task PerformRealTimeDetectionAsync(SKBitmap bitmap)
     {
-        // 使用信号量防止并发处理（支持异步）
-        if (!await _inferenceLock.WaitAsync(0))
-            return;
-
         try
         {
-            _isProcessingFrame = true;
 
             // 首帧诊断：输出当前推理使用的模型信息
             if (_inferenceFrameCount == 0)
@@ -743,13 +453,13 @@ public partial class MainViewModel : ViewModelBase, IDisposable
                     Height = r.GetBoundingBox().Height,
                     ShapeType = (Core.Services.ShapeType)(int)r.ShapeType
                 }).ToList();
-                
+
                 // 调试输出ROI信息
                 foreach (var roi in rois)
                 {
                     System.Diagnostics.Debug.WriteLine($"ROI: {roi.Name}, X={roi.X}, Y={roi.Y}, W={roi.Width}, H={roi.Height}");
                 }
-                
+
                 result = await _detectionService.DetectAsync(bitmap, rois);
             }
             else
@@ -776,9 +486,9 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             stopwatch.Stop();
 
             // 更新UI
-            System.Windows.Application.Current.Dispatcher.Invoke(() =>
+            _ = System.Windows.Application.Current.Dispatcher.BeginInvoke(new Action(() =>
             {
-                if (!_isDisposed)
+                if (!_isDisposed && IsRealTimeDetecting)
                 {
                     // 时序平滑：消除逐帧 bbox 闪烁/抖动（pose 关键点与 seg 掩膜一并保留，关键点也做 EMA 平滑）
                     _realtimeSmoother.Update(result.Objects);
@@ -802,121 +512,14 @@ public partial class MainViewModel : ViewModelBase, IDisposable
                         _lastInferenceTime = DateTime.Now;
                     }
                 }
-            });
+            }));
         }
         catch (Exception ex)
         {
             System.Diagnostics.Debug.WriteLine($"实时检测异常: {ex.Message}");
         }
-        finally
-        {
-            _isProcessingFrame = false;
-            _inferenceLock.Release();
-        }
     }
-    
-    /// <summary>
-    /// 绘制检测结果到图像
-    /// </summary>
-    private SKBitmap? DrawDetectionResults(SKBitmap sourceBitmap, DetectionResult result)
-    {
-        try
-        {
-            // 创建可变的bitmap副本
-            var resultBitmap = sourceBitmap.Copy();
-            
-            using (var canvas = new SKCanvas(resultBitmap))
-            {
-                var paint = new SKPaint
-                {
-                    Style = SKPaintStyle.Stroke,
-                    Color = SKColors.Red,
-                    StrokeWidth = 4,
-                    IsAntialias = true
-                };
-                
-                var textPaint = new SKPaint
-                {
-                    Color = SKColors.Yellow,
-                    TextSize = 64,
-                    IsAntialias = true,
-                    FakeBoldText = true
-                };
 
-                var bgPaint = new SKPaint
-                {
-                    Color = new SKColor(0, 0, 0, 180),
-                    Style = SKPaintStyle.Fill
-                };
-                
-                foreach (var obj in result.Objects)
-                {
-                    // 绘制边界框
-                    var rect = new SKRect(
-                        obj.BoundingBox[0],
-                        obj.BoundingBox[1],
-                        obj.BoundingBox[0] + obj.BoundingBox[2],
-                        obj.BoundingBox[1] + obj.BoundingBox[3]);
-                    canvas.DrawRect(rect, paint);
-                    
-                    // 绘制标签（带背景）
-                    var label = $"{obj.ClassName} {(obj.Confidence * 100):F1}%";
-                    
-                    // 计算文字尺寸
-                    var textBounds = new SKRect();
-                    textPaint.MeasureText(label, ref textBounds);
-                    
-                    // 标签位置（在边界框上方，如果空间不足则在框内）
-                    float labelX = obj.BoundingBox[0];
-                    float labelY = obj.BoundingBox[1] - 5;
-                    
-                    // 如果标签会超出图像顶部，则放在框内
-                    if (labelY - textBounds.Height < 0)
-                    {
-                        labelY = obj.BoundingBox[1] + textBounds.Height + 5;
-                    }
-                    
-                    // 绘制标签背景
-                    var bgRect = new SKRect(
-                        labelX - 2,
-                        labelY - textBounds.Height - 2,
-                        labelX + textBounds.Width + 4,
-                        labelY + 2);
-                    canvas.DrawRect(bgRect, bgPaint);
-                    
-                    // 绘制标签文字
-                    canvas.DrawText(label, labelX, labelY, textPaint);
-
-                    // 绘制人体姿态骨骼（仅姿态估计模型会带 KeyPoints）
-                    if (obj.KeyPoints != null && obj.KeyPoints.Count > 0)
-                    {
-                        DrawPoseSkeleton(canvas, obj.KeyPoints);
-                    }
-
-                    // 绘制实例分割掩膜（仅分割模型会带 Mask）
-                    if (obj.Mask != null)
-                    {
-                        var color = SEG_MASK_COLORS[obj.ClassId % SEG_MASK_COLORS.Length];
-                        // 掩膜按原始检测框尺寸位打包，绘制必须用 MaskBox（此处检测结果未经平滑，与 PixelBoundingBox 一致）
-                        var maskBox = obj.MaskBox ?? new SKRectI(
-                            (int)obj.BoundingBox[0], (int)obj.BoundingBox[1],
-                            (int)(obj.BoundingBox[0] + obj.BoundingBox[2]), (int)(obj.BoundingBox[1] + obj.BoundingBox[3]));
-                        DrawSegmentationMask(canvas, obj.Mask,
-                            maskBox.Left, maskBox.Top,
-                            maskBox.Width, maskBox.Height, color);
-                    }
-                }
-            }
-            
-            return resultBitmap;
-        }
-        catch (Exception ex)
-        {
-            System.Diagnostics.Debug.WriteLine($"绘制检测结果异常: {ex.Message}");
-            return null;
-        }
-    }
-    
     #region SOP实时检测
 
     /// <summary>
@@ -924,12 +527,6 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     /// </summary>
     private async Task PerformSOPDetectionAsync(Dictionary<string, CaptureFrame> frames)
     {
-        // 使用信号量防止并发
-        if (!await _sopInferenceLock.WaitAsync(0))
-        {
-            return;
-        }
-
         try
         {
             if (_sopModule == null)
@@ -946,40 +543,11 @@ public partial class MainViewModel : ViewModelBase, IDisposable
                 // 关键修复：之前这里会用"推理旧帧 + 检测框"覆盖 CurrentImage，
                 // 导致画面退回上一帧、看起来一卡一卡。
                 // 现在改为：缓存 sopResult，让 OnCameraFrameGrabbed 收到下一帧新画面时再叠加渲染。
-                System.Windows.Application.Current?.Dispatcher.BeginInvoke(new Action(() =>
+                _ = System.Windows.Application.Current?.Dispatcher.BeginInvoke(new Action(() =>
                 {
-                    if (_isDisposed) return;
+                    if (_isDisposed || !IsSOPDetecting) return;
 
-                    // 缓存 SOP 检测结果（供 OnCameraFrameGrabbed 在最新帧上叠加）
-                    _lastSopResult = sopResult;
-                    _noSopResultFrameCount = 0;
-
-                    // 缓存每路相机检测结果（供对应画面叠加渲染；ToList 拷贝防 Yolo 复用列表污染）
-                    _perCameraLastResults.Clear();
-                    foreach (var (camId, dets) in sopResult.PerCameraDetections)
-                    {
-                        _perCameraLastResults[camId] = dets.ToList();
-                    }
-
-                    // 更新检测框时序平滑器（仅在推理出新结果时更新，渲染时读取）
-                    _detectionSmoother.Update(sopResult.Detections);
-
-                    // 缓存手部骨架结果（保留原行为，作为 fallback）
-                    if (sopResult.HandPoseResult != null && sopResult.HandPoseResult.Hands.Count > 0)
-                    {
-                        _lastHandPoseResult = sopResult.HandPoseResult;
-                        // ⭐ 记录手部结果来自哪路相机，绘制时画到该相机画面
-                        _lastHandPoseCameraId = sopResult.HandPoseCameraId;
-                        _noHandsFrameCount = 0;
-                    }
-                    else
-                    {
-                        _noHandsFrameCount++;
-                        if (_noHandsFrameCount >= MaxNoHandsFrames)
-                        {
-                            _lastHandPoseResult = null;
-                        }
-                    }
+                    _overlayRenderer.UpdateSopResult(sopResult);
 
                     // 更新状态栏
                     SopStatus = sopResult.StepResults.Message;
@@ -991,17 +559,9 @@ public partial class MainViewModel : ViewModelBase, IDisposable
 
                     HighConfidenceCount = DetectionResults.Count(o => o.Confidence >= 0.5);
 
-                    // 区域监控：在标定区域内检测"未戴安全帽的人"，命中则播放 ng.wav
-                    EvaluateRegionMonitoring(sopResult);
-
-                    // 跨相机协同规则：多相机检测结果按规则组合评估，命中则报警
-                    EvaluateCrossCameraRules(sopResult);
-
                     // 不再在此处覆盖 RoiEditorViewModel.CurrentImage：
                     // 让 OnCameraFrameGrabbed 在收到下一帧新画面时统一叠加渲染，
                     // 画面永远是"最新相机帧 + 最新检测结果"，消除卡顿和上一帧残留。
-
-                    // 推理帧由 worker 线程统一管理生命周期（_lastInferenceFrames），此处不释放
 
                     // 计算推理 FPS
                     _inferenceFrameCount++;
@@ -1017,6 +577,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
                              $"检测到 {DetectionResults.Count} 个对象 | " +
                              $"FPS: {InferenceFps:F1} | " +
                              $"耗时: {sopResult.ElapsedMs}ms";
+                    PresentMonitoringAlerts(sopResult);
                 }));
             }
         }
@@ -1029,539 +590,24 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         {
             System.Diagnostics.Debug.WriteLine($"SOP实时检测异常: {ex.Message}");
         }
-        finally
-        {
-            _sopInferenceLock.Release();
-        }
     }
 
-    /// <summary>
-    /// 跨相机协同规则评估：多相机分别检测后按规则组合（全部条件满足）触发报警。
-    /// 命中 → 状态栏提示 + 播放 ng.wav + 对应画面格子红框闪烁。
-    /// 冷却由 CrossCameraEvaluator 按规则 Id 维护。
-    /// </summary>
-    private void EvaluateCrossCameraRules(SOPModuleResult sopResult)
+    private void PresentMonitoringAlerts(SOPModuleResult result)
     {
-        try
+        if (result.RegionAlert != null)
         {
-            var workflow = _sopModule?.CurrentWorkflow;
-            var cfg = workflow?.CrossCamera;
-            if (workflow == null || cfg == null || !cfg.Enabled || cfg.Rules.Count == 0) return;
-
-            var hit = _crossEvaluator.Evaluate(sopResult.PerCameraDetections, workflow.Regions, cfg, DateTime.Now);
-            if (hit == null) return;
-
+            SopStatus = "⚠ 区域监控: 未戴安全帽！";
+            Status = $"⚠ {result.RegionAlert}";
+            _audioFeedback.PlayNg();
+        }
+        if (result.CrossCameraAlert is { } hit)
+        {
             SopStatus = $"⚠ 跨相机规则: {hit.Rule.Name}";
             Status = $"⚠ 跨相机协同报警: {hit.Detail}";
-            DebugLog($"[CrossCamera] rule={hit.Rule.Id} {hit.Detail} -> 播放 ng.wav");
-            PlayNgSound();
-
-            // 对应画面格子红框闪烁（涉及的相机）
-            foreach (var cond in hit.Rule.Conditions)
-            {
-                var item = CameraViews.FirstOrDefault(v => string.Equals(v.CameraId, cond.CameraId, StringComparison.OrdinalIgnoreCase));
-                item?.MarkAlert(5);
-            }
-        }
-        catch (Exception ex)
-        {
-            System.Diagnostics.Debug.WriteLine($"跨相机规则评估异常: {ex.Message}");
-        }
-    }
-
-    /// <summary>
-    /// 区域监控：在「🎯 标定区域」标定的 ROI 区域内，若出现"未戴安全帽的人"，播放 ng.wav。
-    /// 判定标准：
-    ///   1. 人体框中心点落入任一监控区域 → 认为该区域出现人；
-    ///   2. 该人的头部区域（人体框上部 35%）没有与任何安全帽框相交 → 判为"未戴安全帽"。
-    /// 报警带冷却时间（SOPMonitoringConfig.CooldownSeconds），防止每帧连续播放造成噪音。
-    /// 人体/安全帽类别名由 YAML 的 sop.monitoring 配置（与模型 classes 一致）。
-    /// </summary>
-    private void EvaluateRegionMonitoring(SOPModuleResult sopResult)
-    {
-        try
-        {
-            var workflow = _sopModule?.CurrentWorkflow;
-            var cfg = workflow?.Monitoring;
-            if (workflow == null || cfg == null || !cfg.Enabled) return;
-            if (workflow.Regions == null || workflow.Regions.Count == 0) return;
-
-            // 过滤需要监控的区域（cfg.Regions 为空 = 监控全部标定区域）
-            var zones = workflow.Regions;
-            if (cfg.Regions is { Count: > 0 })
-            {
-                zones = zones
-                    .Where(z => cfg.Regions.Contains(z.ZoneId, StringComparer.OrdinalIgnoreCase))
-                    .ToList();
-            }
-            if (zones.Count == 0) return;
-
-            var personNames = cfg.PersonClasses ?? new List<string>();
-            var helmetNames = cfg.HelmetClasses ?? new List<string>();
-            if (personNames.Count == 0) return;
-
-            // 类别名匹配（不区分大小写）
-            static bool IsClass(string? name, List<string> names) =>
-                !string.IsNullOrEmpty(name) && names.Contains(name, StringComparer.OrdinalIgnoreCase);
-
-            var persons = sopResult.Detections
-                .Where(d => d.Confidence >= cfg.MinConfidence && IsClass(d.ClassName, personNames))
-                .ToList();
-            var helmets = sopResult.Detections
-                .Where(d => d.Confidence >= cfg.MinConfidence && IsClass(d.ClassName, helmetNames))
-                .ToList();
-
-            bool violation = false;
-            string detail = "";
-            foreach (var person in persons)
-            {
-                var pBox = person.PixelBoundingBox;
-                var centerX = pBox.MidX;
-                var centerY = pBox.MidY;
-
-                foreach (var zone in zones)
-                {
-                    var zoneRect = new SKRect(zone.X, zone.Y, zone.X + zone.Width, zone.Y + zone.Height);
-                    if (!zoneRect.Contains(centerX, centerY)) continue;
-
-                    // 头部区域 = 人体框上部 35%
-                    var headRect = new SKRect(
-                        pBox.Left,
-                        pBox.Top,
-                        pBox.Right,
-                        pBox.Top + pBox.Height * 0.35f);
-
-                    var hasHelmet = helmets.Any(h =>
-                    {
-                        var hBox = h.PixelBoundingBox;
-                        return new SKRect(hBox.Left, hBox.Top, hBox.Right, hBox.Bottom)
-                            .IntersectsWith(headRect);
-                    });
-
-                    if (!hasHelmet)
-                    {
-                        violation = true;
-                        detail = $"区域[{zone.Name}] 出现未戴安全帽的人(person={person.ClassName}, conf={person.Confidence:F2})";
-                        break;
-                    }
-                }
-                if (violation) break;
-            }
-
-            if (violation)
-            {
-                // 冷却时间内不重复报警，避免每帧连续播放 ng.wav
-                if (!_regionAlertActive ||
-                    (DateTime.Now - _regionAlertLastTime).TotalSeconds >= cfg.CooldownSeconds)
-                {
-                    _regionAlertLastTime = DateTime.Now;
-                    _regionAlertActive = true;
-                    SopStatus = "⚠ 区域监控: 未戴安全帽！";
-                    Status = $"⚠ {detail}";
-                    DebugLog($"[RegionMonitor] {detail} -> 播放 ng.wav");
-                    PlayNgSound();
-                }
-            }
-            else
-            {
-                _regionAlertActive = false;
-            }
-        }
-        catch (Exception ex)
-        {
-            System.Diagnostics.Debug.WriteLine($"区域监控异常: {ex.Message}");
-        }
-    }
-
-    /// <summary>
-    /// 绘制 SOP 检测结果（检测框 + 步骤状态 + 违规警告）
-    /// </summary>
-    private SKBitmap DrawSOPDetectionResults(SKBitmap sourceBitmap, SOPModuleResult sopResult)
-    {
-        try
-        {
-            // 修复：创建新的bitmap并绘制，避免canvas释放问题
-            var resultBitmap = sourceBitmap.Copy();
-            using var canvas = new SKCanvas(resultBitmap);
-            DrawSOPDetectionOverlay(canvas, resultBitmap.Info, sopResult);
-            return resultBitmap;
-        }
-        catch (Exception ex)
-        {
-            System.Diagnostics.Debug.WriteLine($"绘制SOP结果异常: {ex.Message}");
-            return sourceBitmap;
-        }
-    }
-
-    /// <summary>
-    /// 在已存在的 canvas 上叠加 SOP 检测结果（检测框 + 手部骨架 + 违规警告）。
-    /// 抽出此方法是为了让"最新相机帧到达时"也能复用同一份渲染逻辑，
-    /// 避免"推理旧帧 + 检测框覆盖 CurrentImage"导致的画面退回上一帧。
-    /// </summary>
-    private void DrawSOPDetectionOverlay(SKCanvas canvas, SKImageInfo info, SOPModuleResult sopResult)
-    {
-        try
-        {
-            float s = OverlayScale(canvas);
-            float stroke = 3.5f * s;
-
-            using var boxOutlinePaint = new SKPaint
-            {
-                Color = SKColors.Black.WithAlpha(170),
-                StrokeWidth = stroke + 2.5f * s,
-                IsAntialias = true,
-                Style = SKPaintStyle.Stroke
-            };
-
-            // 1. 绘制检测框（使用时序平滑后的轨迹，消除闪烁/跳动）
-            foreach (var track in _detectionSmoother.GetActiveBoxes())
-            {
-                var label = track.Label;
-                var conf = track.Confidence;
-                var box = track.Box;
-
-                // 框颜色：高置信度绿色，低置信度黄色
-                var color = conf > 0.7 ? SKColors.LimeGreen :
-                           conf > 0.5 ? SKColors.Yellow : SKColors.Orange;
-
-                using var boxPaint = new SKPaint
-                {
-                    Color = color,
-                    StrokeWidth = stroke,
-                    IsAntialias = true,
-                    Style = SKPaintStyle.Stroke
-                };
-                canvas.DrawRect(box, boxOutlinePaint);
-                canvas.DrawRect(box, boxPaint);
-
-                // 标签
-                var labelText = $"{label} {conf * 100:F0}%";
-                using var textPaint = new SKPaint
-                {
-                    Color = SKColors.White,
-                    TextSize = 18 * s,
-                    IsAntialias = true,
-                    FakeBoldText = true,
-                    Typeface = OverlayTypeface
-                };
-                using var bgPaint = new SKPaint
-                {
-                    Color = color.WithAlpha(210),
-                    Style = SKPaintStyle.Fill
-                };
-
-                var textBounds = new SKRect();
-                textPaint.MeasureText(labelText, ref textBounds);
-                float pad = 4f * s;
-                canvas.DrawRect(box.Left, box.Top - textBounds.Height - 2 * pad,
-                    textBounds.Width + 2 * pad, textBounds.Height + 2 * pad, bgPaint);
-                canvas.DrawText(labelText, box.Left + pad, box.Top - pad, textPaint);
-            }
-
-            // 2. 绘制手部关键点（如果启用了手部检测）
-            if (sopResult.HandPoseResult?.Hands.Count > 0)
-            {
-                try
-                {
-                    DrawHandPoses(canvas, sopResult.HandPoseResult);
-                }
-                catch (Exception ex)
-                {
-                    System.Diagnostics.Debug.WriteLine($"[DrawSOP] 手部绘制异常: {ex.Message}");
-                }
-            }
-
-            // 3. 违规警告（如果有）
-            if (sopResult.Violations.Count > 0)
-            {
-                var lastViolation = sopResult.Violations.Last();
-                using var warnBg = new SKPaint { Color = new SKColor(255, 0, 0, 160), Style = SKPaintStyle.Fill };
-                canvas.DrawRect(0, info.Height - 50, info.Width, 50, warnBg);
-
-                using var warnText = new SKPaint
-                {
-                    Color = SKColors.White,
-                    TextSize = 20,
-                    IsAntialias = true,
-                    FakeBoldText = true,
-                    Typeface = SKTypeface.FromFamilyName("Microsoft YaHei")
-                };
-                canvas.DrawText($"违规: {lastViolation.Description}", 15, info.Height - 18, warnText);
-            }
-        }
-        catch (Exception ex)
-        {
-            System.Diagnostics.Debug.WriteLine($"叠加SOP结果异常: {ex.Message}");
-        }
-    }
-
-    /// <summary>
-    /// 违规提示横幅：主相机画面顶部红色横幅显示最新违规内容（类型 + 描述），
-    /// 其下以小字列出更早的违规（最多 2 条）。最新违规出现后前 2 秒闪烁高亮，之后常驻
-    /// 直到停止/复位 SOP——违规提示必须醒目且不消失，符合工业场景"发生即告警"的要求。
-    /// 由 OnCameraFrameGrabbed（采集线程）逐帧调用，缓存读取加锁。
-    /// </summary>
-    private void DrawViolationBanner(SKCanvas canvas, SKImageInfo info)
-    {
-        List<ViolationToast> toasts;
-        lock (_violationToastLock)
-        {
-            if (_activeViolations.Count == 0) return;
-            toasts = new List<ViolationToast>(_activeViolations);
-        }
-
-        try
-        {
-            using var typeface = SKTypeface.FromFamilyName("Microsoft YaHei");
-            var latest = toasts[toasts.Count - 1];
-            double age = (DateTime.Now - latest.Time).TotalSeconds;
-
-            // 最新违规前 2 秒透明度闪烁（~1.25Hz）引起注意，之后稳定常驻
-            byte alpha = age < 2 ? (byte)(190 + 65 * Math.Abs(Math.Sin(age * Math.PI * 2.5))) : (byte)215;
-
-            const float bannerH = 56f;
-            using (var bg = new SKPaint { Color = new SKColor(204, 0, 0, alpha), Style = SKPaintStyle.Fill })
-            {
-                canvas.DrawRect(0, 0, info.Width, bannerH, bg);
-            }
-            // 左侧橙色警示竖条
-            using (var bar = new SKPaint { Color = new SKColor(255, 140, 0, alpha), Style = SKPaintStyle.Fill })
-            {
-                canvas.DrawRect(0, 0, 6, bannerH, bar);
-            }
-
-            string latestText = $"⚠ 违规（{latest.TypeName}）：{latest.Description}";
-            using (var big = new SKPaint
-            {
-                Color = SKColors.White,
-                TextSize = 26,
-                IsAntialias = true,
-                FakeBoldText = true,
-                Typeface = typeface
-            })
-            {
-                canvas.DrawText(latestText, 16, 37, big);
-            }
-
-            // 历史违规（更早的最多 2 条）：横幅下方小字，带时间
-            using (var small = new SKPaint
-            {
-                Color = new SKColor(255, 255, 255, 235),
-                TextSize = 17,
-                IsAntialias = true,
-                FakeBoldText = true,
-                Typeface = typeface
-            })
-            {
-                float y = bannerH + 22;
-                for (int i = toasts.Count - 2; i >= 0 && i >= toasts.Count - 3; i--)
-                {
-                    var t = toasts[i];
-                    canvas.DrawText($"{t.Time:HH:mm:ss} [{t.TypeName}] {t.Description}", 16, y, small);
-                    y += 24;
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            System.Diagnostics.Debug.WriteLine($"绘制违规横幅异常: {ex.Message}");
-        }
-    }
-
-    /// <summary>违规类型的中文显示名</summary>
-    private static string ViolationTypeText(ViolationType type) => type switch
-    {
-        ViolationType.SkipStep => "跳过工序",
-        ViolationType.WrongOrder => "顺序错误",
-        ViolationType.Timeout => "超时",
-        ViolationType.ForbiddenObject => "出现违禁物",
-        ViolationType.ObjectRemoved => "物体被移除",
-        ViolationType.ZoneIntrusion => "区域闯入",
-        ViolationType.MissingRequiredObject => "漏放/缺料",
-        _ => "违规"
-    };
-
-    /// <summary>
-    /// 手部 21 个关键点全画（MediaPipe 全部点位）。之前只画 11 个并刻意缩小半径，
-    /// 叠加层又被缩放到窗口，结果是"几乎看不见"。
-    /// </summary>
-    private static readonly HandKeypointType[] HandLandmarks = Enum.GetValues<HandKeypointType>();
-
-    /// <summary>MediaPipe 21 点标准骨架：每根手指 腕→MCP→PIP→DIP→指尖。</summary>
-    private static readonly (HandKeypointType, HandKeypointType)[] HandSkeleton = new[]
-    {
-        (HandKeypointType.Wrist, HandKeypointType.ThumbCMC),
-        (HandKeypointType.ThumbCMC, HandKeypointType.ThumbMCP),
-        (HandKeypointType.ThumbMCP, HandKeypointType.ThumbIP),
-        (HandKeypointType.ThumbIP, HandKeypointType.ThumbTip),
-        (HandKeypointType.Wrist, HandKeypointType.IndexFingerMCP),
-        (HandKeypointType.IndexFingerMCP, HandKeypointType.IndexFingerPIP),
-        (HandKeypointType.IndexFingerPIP, HandKeypointType.IndexFingerDIP),
-        (HandKeypointType.IndexFingerDIP, HandKeypointType.IndexFingerTip),
-        (HandKeypointType.Wrist, HandKeypointType.MiddleFingerMCP),
-        (HandKeypointType.MiddleFingerMCP, HandKeypointType.MiddleFingerPIP),
-        (HandKeypointType.MiddleFingerPIP, HandKeypointType.MiddleFingerDIP),
-        (HandKeypointType.MiddleFingerDIP, HandKeypointType.MiddleFingerTip),
-        (HandKeypointType.Wrist, HandKeypointType.RingFingerMCP),
-        (HandKeypointType.RingFingerMCP, HandKeypointType.RingFingerPIP),
-        (HandKeypointType.RingFingerPIP, HandKeypointType.RingFingerDIP),
-        (HandKeypointType.RingFingerDIP, HandKeypointType.RingFingerTip),
-        (HandKeypointType.Wrist, HandKeypointType.PinkyMCP),
-        (HandKeypointType.PinkyMCP, HandKeypointType.PinkyPIP),
-        (HandKeypointType.PinkyPIP, HandKeypointType.PinkyDIP),
-        (HandKeypointType.PinkyDIP, HandKeypointType.PinkyTip)
-    };
-
-    /// <summary>
-    /// 绘制手部姿态（21 点完整骨架，尺寸随帧分辨率缩放）
-    /// </summary>
-    private void DrawHandPoses(SKCanvas canvas, HandPoseEstimationResult handResult)
-    {
-        // 保存画布状态
-        canvas.Save();
-
-        // 注意：DWPose输出的坐标与SkiaSharp坐标系一致（原点在左上角）
-        // 不需要翻转Y轴
-
-        // 叠加层画在原始帧上、再整体缩放到窗口显示：所有尺寸必须随帧分辨率缩放，
-        // 否则 1080p/4K 帧缩到窗口后线宽只剩 1px（"姿态看不明显"的直接原因）。
-        float s = OverlayScale(canvas);
-
-        // 骨架线画笔（黑色底衬 + 亮绿线，保证任何背景都看得清）
-        using var skeletonOutlinePaint = new SKPaint
-        {
-            Color = SKColors.Black.WithAlpha(170),
-            StrokeWidth = 5f * s,
-            IsAntialias = true,
-            Style = SKPaintStyle.Stroke
-        };
-        using var skeletonPaint = new SKPaint
-        {
-            Color = SKColors.LimeGreen,
-            StrokeWidth = 3f * s,
-            IsAntialias = true,
-            Style = SKPaintStyle.Stroke
-        };
-
-        // 指尖关键点画笔（红色）
-        using var tipPaint = new SKPaint
-        {
-            Color = SKColors.Red,
-            IsAntialias = true,
-            Style = SKPaintStyle.Fill
-        };
-
-        // 关节关键点画笔（黄色）
-        using var jointPaint = new SKPaint
-        {
-            Color = SKColors.Yellow,
-            IsAntialias = true,
-            Style = SKPaintStyle.Fill
-        };
-
-        // 手腕关键点画笔（青色）
-        using var wristPaint = new SKPaint
-        {
-            Color = SKColors.Cyan,
-            IsAntialias = true,
-            Style = SKPaintStyle.Fill
-        };
-
-        // 关键点黑色外圈：亮色圆点在任何背景上都有轮廓
-        using var keypointOutlinePaint = new SKPaint
-        {
-            Color = SKColors.Black.WithAlpha(200),
-            StrokeWidth = 1.5f * s,
-            IsAntialias = true,
-            Style = SKPaintStyle.Stroke
-        };
-
-        // 关键点标签画笔
-        using var labelPaint = new SKPaint
-        {
-            Color = SKColors.Yellow,
-            TextSize = 13 * s,
-            IsAntialias = true,
-            FakeBoldText = true,
-            Typeface = OverlayTypeface
-        };
-
-        // 手部边界框画笔（青色）
-        using var handBoxPaint = new SKPaint
-        {
-            Color = SKColors.Cyan,
-            StrokeWidth = 2.5f * s,
-            IsAntialias = true,
-            Style = SKPaintStyle.Stroke
-        };
-        using var handBoxOutlinePaint = new SKPaint
-        {
-            Color = SKColors.Black.WithAlpha(170),
-            StrokeWidth = 4.5f * s,
-            IsAntialias = true,
-            Style = SKPaintStyle.Stroke
-        };
-
-        foreach (var hand in handResult.Hands)
-        {
-            // 绘制手部边界框
-            var bbox = hand.BoundingBox;
-            canvas.DrawRect(bbox, handBoxOutlinePaint);
-            canvas.DrawRect(bbox, handBoxPaint);
-
-            // 完整 21 点骨架
-            DrawHandSkeleton(canvas, hand, skeletonPaint, skeletonOutlinePaint);
-
-            foreach (var type in HandLandmarks)
-            {
-                var kp = hand.GetKeypoint(type);
-                if (kp == null || kp.Confidence < SkeletonConfidenceThreshold) continue;
-
-                bool isTip = type == HandKeypointType.ThumbTip ||
-                             type == HandKeypointType.IndexFingerTip ||
-                             type == HandKeypointType.MiddleFingerTip ||
-                             type == HandKeypointType.RingFingerTip ||
-                             type == HandKeypointType.PinkyTip;
-
-                bool isWrist = type == HandKeypointType.Wrist;
-
-                // 指尖/手腕画大一点，中间关节略小：既能看清手势，又不糊成一片
-                float radius = isTip ? 6 * s : (isWrist ? 7 * s : 4 * s);
-                var paint = isTip ? tipPaint : (isWrist ? wristPaint : jointPaint);
-
-                canvas.DrawCircle(kp.X, kp.Y, radius + 1.5f * s, keypointOutlinePaint);
-                canvas.DrawCircle(kp.X, kp.Y, radius, paint);
-
-                // 只在指尖旁边绘制标签，避免杂乱
-                if (isTip)
-                {
-                    canvas.DrawText(type.ToString(), kp.X + 12 * s, kp.Y, labelPaint);
-                }
-            }
-        }
-
-        // 恢复画布状态
-        canvas.Restore();
-    }
-
-    /// <summary>
-    /// 绘制手部骨架线（MediaPipe 21 点标准连接；先画黑色底衬再画彩色线）
-    /// </summary>
-    // 骨架绘制置信度阈值（低于此值的关键点不绘制，减少闪烁）
-    public float SkeletonConfidenceThreshold { get; set; } = 0.1f;
-
-    private void DrawHandSkeleton(SKCanvas canvas, HandPose hand, SKPaint paint, SKPaint outlinePaint)
-    {
-        foreach (var (startType, endType) in HandSkeleton)
-        {
-            var start = hand.GetKeypoint(startType);
-            var end = hand.GetKeypoint(endType);
-
-            if (start == null || end == null) continue;
-            if (start.Confidence < SkeletonConfidenceThreshold || end.Confidence < SkeletonConfidenceThreshold) continue;
-
-            canvas.DrawLine(start.X, start.Y, end.X, end.Y, outlinePaint);
-            canvas.DrawLine(start.X, start.Y, end.X, end.Y, paint);
+            _audioFeedback.PlayNg();
+            foreach (var condition in hit.Rule.Conditions)
+                CameraViews.FirstOrDefault(v => string.Equals(v.CameraId, condition.CameraId,
+                    StringComparison.OrdinalIgnoreCase))?.MarkAlert(5);
         }
     }
 
@@ -1575,7 +621,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         // 检查应用程序是否仍在运行
         if (System.Windows.Application.Current == null || _isDisposed)
             return;
-            
+
         System.Windows.Application.Current.Dispatcher.Invoke(() =>
         {
             if (!_isDisposed)
@@ -1597,31 +643,10 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             }
         });
     }
-    
+
     private void OnDetectionError(object? sender, string e)
     {
         _lastDetectionError = e;
-    }
-
-    /// <summary>
-    /// 保存SOP检测模式配置（由SOP配置界面调用）
-    /// </summary>
-    public void SaveSOPDetectionConfig(string detectionMode, bool enableHandPose, int maxNumHands = 2,
-        bool enableFaceFilter = true, float faceFilterUpperRatio = 0.38f,
-        bool enableHandStructureCheck = true, float handStructureWristTipRatio = 0.18f,
-        float detectionConfidenceThreshold = 0.08f, float minBoxAreaRatio = 0.0005f,
-        bool rotationAugmentation = true, string handBackend = "MediaPipe",
-        bool detectLeftHand = true, bool detectRightHand = true, float confidenceThreshold = 0.5f,
-        int inferenceInterval = 1, int smoothWindowSize = 1, float smoothAlpha = 0.7f,
-        float skeletonConfidenceThreshold = 0.3f)
-    {
-        _savedSOPDetectionConfig = (detectionMode, enableHandPose, maxNumHands,
-            enableFaceFilter, faceFilterUpperRatio,
-            enableHandStructureCheck, handStructureWristTipRatio,
-            detectionConfidenceThreshold, minBoxAreaRatio,
-            rotationAugmentation, handBackend, detectLeftHand, detectRightHand,
-            confidenceThreshold, inferenceInterval, smoothWindowSize, smoothAlpha, skeletonConfidenceThreshold);
-        Console.WriteLine($"[MainViewModel] SOP检测配置已保存: 模式={detectionMode}, 手部检测={enableHandPose}, 后端={handBackend}");
     }
 
     /// <summary>
@@ -1687,71 +712,39 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         }
     }
 
-    /// <summary>同步 SOP 模块的计算设备状态到界面，并订阅变化/失败事件</summary>
-    private void AttachSopModuleEvents(SOPModule module)
+    /// <summary>启动流程复用同一模块实例及一次事件订阅。</summary>
+    private async Task EnsureSopModuleAsync()
     {
-        UseGpu = module.IsUsingGpu;
-        module.UseGpuChanged += (_, gpu) => UseGpu = gpu;
-        module.GpuSwitchFailed += (_, _) => Status = "⚠️ 当前设备 CUDA 不可用，已回退到 CPU 运行";
-    }
-
-    [RelayCommand]
-    public async Task InitializeSOPModuleAsync()
-    {
-        var logFile = AppPaths.Log("sop_init_debug.log");
+        if (_sopModule != null) return;
+        var module = new SOPModule();
         try
         {
-            File.AppendAllText(logFile, $"{DateTime.Now:HH:mm:ss.fff} [MainViewModel] 开始初始化SOP模块...\n");
-            
-            IsBusy = true;
-            Status = "初始化SOP模块...";
-
-            // 配置文件位置交给 AppPaths（程序根 → 仓库根，从 bin 启动也能找到 configs/）
-            var configPath = AppPaths.Config("sop_config.json");
-            if (!File.Exists(configPath))
-            {
-                File.AppendAllText(logFile, $"{DateTime.Now:HH:mm:ss.fff} [MainViewModel] 未找到 {configPath}，使用代码内默认值\n");
-                Status = "未找到 sop_config.json，使用默认配置";
-            }
-
-            _sopModule = new SOPModule();
-            await _sopModule.InitializeAsync(BuildSopConfig(), _cameraManager.CurrentCameraService!);
-            AttachSopModuleEvents(_sopModule);
-            _sopModule.CurrentOperator = _currentOperator;
-
-            // 配方：优先上次使用的（configs/last_recipe.json）；没有就等操作员在「SOP」页选择。
-            // 原先这里写死加载 sop_phone_usage.yaml + phone_usage_regions.json，换产品必须改代码。
-            var recipe = RecipeFile.LoadLast();
-            if (recipe != null)
-            {
-                Status = $"加载配方 {Path.GetFileNameWithoutExtension(recipe)}...";
-                _sopModule.StartWorkflowFromYaml(recipe);
-            }
-            else
-            {
-                Status = "SOP模块已就绪，请在「SOP」页选择产品配方";
-            }
-
-            SopStatus = "SOP模块初始化成功";
-            Status = "SOP模块初始化完成";
+            await module.InitializeAsync(BuildSopConfig());
+            if (_savedHandPoseConfig != null)
+                await module.UpdateHandPoseConfigAsync(_savedHandPoseConfig);
         }
-        catch (Exception ex)
+        catch
         {
-            var fullError = $"SOP模块初始化失败: {ex.Message}\n\n堆栈跟踪:\n{ex.StackTrace}";
-            if (ex.InnerException != null)
-            {
-                fullError += $"\n\n内部异常: {ex.InnerException.Message}\n{ex.InnerException.StackTrace}";
-            }
-            Console.WriteLine($"[ERROR] {fullError}");
-            SopStatus = $"SOP模块初始化失败: {ex.Message}";
-            Status = $"错误: {ex.Message}";
-            MessageBox.Show(fullError, "SOP初始化错误", MessageBoxButton.OK, MessageBoxImage.Error);
+            module.Dispose();
+            throw;
         }
-        finally
-        {
-            IsBusy = false;
-        }
+        _sopModule = module;
+        module.CurrentOperator = _currentOperator;
+        UseGpu = module.IsUsingGpu;
+        module.UseGpuChanged += OnSopUseGpuChanged;
+        module.GpuSwitchFailed += OnSopGpuSwitchFailed;
+        module.StepChanged += OnSOPStepChanged;
+        module.StepCompleted += OnSOPStepCompleted;
+        module.ViolationDetected += OnSOPViolationDetected;
+        module.WorkflowCompleted += OnSOPWorkflowCompleted;
+        module.ModelWarning += OnSOPModelWarning;
     }
+
+    private void OnSopUseGpuChanged(object? sender, bool gpu)
+        => Application.Current?.Dispatcher.BeginInvoke(new Action(() => UseGpu = gpu));
+
+    private void OnSopGpuSwitchFailed(object? sender, EventArgs e)
+        => Application.Current?.Dispatcher.BeginInvoke(new Action(() => Status = "⚠️ 当前设备 CUDA 不可用，已回退到 CPU 运行"));
 
     /// <summary>
     /// 构建 SOP 模块配置：唯一来源是 configs/sop_config.json（缺失时为空配置，
@@ -1810,7 +803,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
                 return;
             }
 
-            var result = await _sopModule.ProcessAsync(frames);
+            var result = await Task.Run(() => _sopModule.ProcessAsync(frames));
             if (!result.Success)
             {
                 // 常见：工作流未启动（"SOP未在运行状态"）、没有主相机帧
@@ -1826,6 +819,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
                 // 单次判定也要更新结果列表，否则界面看不出跑过
                 DetectionResults = sopResult.Detections.ToList();
                 HighConfidenceCount = DetectionResults.Count(o => o.Confidence >= 0.5);
+                PresentMonitoringAlerts(sopResult);
             }
 
             Status = $"SOP检测完成（{frames.Count} 路相机）";
@@ -1849,7 +843,10 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     /// 初始化并启动 SOP 实时检测
     /// </summary>
     [RelayCommand]
-    public async Task StartSOPDetectionAsync()
+    public Task StartSOPDetectionAsync()
+        => _sopStartTask is { IsCompleted: false } ? _sopStartTask : _sopStartTask = StartSopDetectionCoreAsync();
+
+    private async Task StartSopDetectionCoreAsync()
     {
         try
         {
@@ -1869,77 +866,14 @@ public partial class MainViewModel : ViewModelBase, IDisposable
 
             Status = "正在初始化 SOP 模块...";
 
-            // 2. 初始化 SOP 模块（如果还没初始化）
-            if (_sopModule == null)
-            {
-                var config = BuildSopConfig();
-
-                _sopModule = new SOPModule();
-                await _sopModule.InitializeAsync(config, _cameraManager.CurrentCameraService!);
-                AttachSopModuleEvents(_sopModule);
-                _sopModule.CurrentOperator = _currentOperator;
-
-                Console.WriteLine($"[MainViewModel] SOP模块创建完成，当前模式: {_sopModule.DetectionMode}");
-                Console.WriteLine($"[MainViewModel] 保存的配置: {(_savedSOPDetectionConfig.HasValue ? "存在" : "不存在")}");
-
-                // 应用保存的检测模式配置（如果存在）
-                if (_savedSOPDetectionConfig.HasValue)
-                {
-                    var savedConfig = _savedSOPDetectionConfig.Value;
-                    Console.WriteLine($"[MainViewModel] 应用保存配置: 模式={savedConfig.DetectionMode}, 手部检测={savedConfig.EnableHandPose}");
-
-                    // 统一检测模式：所有配置都映射到 UnifiedDetection
-                    var mode = SOPDetectionMode.UnifiedDetection;
-                    _sopModule.UpdateDetectionMode(mode, savedConfig.EnableHandPose);
-                    Console.WriteLine($"[MainViewModel] UpdateDetectionMode后，模式: {_sopModule.DetectionMode}");
-
-                    if (savedConfig.EnableHandPose)
-                    {
-                        _sopModule.UpdateHandPoseConfig(new HandPoseEstimationConfig
-                        {
-                            Backend = System.Enum.TryParse<HandDetectionBackend>(savedConfig.HandBackend, true, out var parsedBackend)
-                                ? parsedBackend : HandDetectionBackend.MediaPipe,
-                            MaxNumHands = savedConfig.MaxNumHands,
-                            ConfidenceThreshold = savedConfig.ConfidenceThreshold,
-                            UseGpu = true,
-                            EnableFaceFilter = savedConfig.EnableFaceFilter,
-                            FaceFilterUpperRatio = savedConfig.FaceFilterUpperRatio,
-                            EnableHandStructureCheck = savedConfig.EnableHandStructureCheck,
-                            HandStructureWristTipRatio = savedConfig.HandStructureWristTipRatio,
-                            DetectionConfidenceThreshold = savedConfig.DetectionConfidenceThreshold,
-                            MinBoxAreaRatio = savedConfig.MinBoxAreaRatio,
-                            RotationAugmentation = savedConfig.RotationAugmentation,
-                            DetectLeftHand = savedConfig.DetectLeftHand,
-                            DetectRightHand = savedConfig.DetectRightHand
-                        });
-                    }
-                }
-            }
-
-            // 确保 MainViewModel 侧事件订阅始终挂上（无论 SOP 模块是新建还是复用）。
-            // 之前这些订阅写在 if (_sopModule == null) 块内，模块已存在走复用分支时不执行，
-            // 导致跳步违规事件无法到达 OnSOPViolationDetected -> 不播 ng.wav。
-            // 先退订再订阅，避免多次启动检测造成重复订阅、重复播放音频。
-            _sopModule.StepChanged -= OnSOPStepChanged;
-            _sopModule.ViolationDetected -= OnSOPViolationDetected;
-            _sopModule.WorkflowCompleted -= OnSOPWorkflowCompleted;
-            _sopModule.StepCompleted -= OnSOPStepCompleted;
-            _sopModule.ModelWarning -= OnSOPModelWarning;
-            _sopModule.StepChanged += OnSOPStepChanged;
-            _sopModule.ViolationDetected += OnSOPViolationDetected;
-            _sopModule.WorkflowCompleted += OnSOPWorkflowCompleted;
-            // 步骤完成时若本步无违规 → 清空画面违规横幅（流程恢复正常，红提示消失）
-            _sopModule.StepCompleted += OnSOPStepCompleted;
-            _sopModule.ModelWarning += OnSOPModelWarning;
-            Console.WriteLine($"[SOP-Audio][DEBUG] MainViewModel 已(重新)订阅 SOP 事件(含 ViolationDetected)，实例={_sopModule?.GetHashCode()}");
+            await EnsureSopModuleAsync();
 
             // 3. 确保手部姿态估计服务已准备好（等待异步初始化完成）
             Console.WriteLine($"[MainViewModel] 确保手部服务准备就绪...");
-            await _sopModule.EnsureHandPoseServiceReadyAsync();
-            Console.WriteLine($"[MainViewModel] 手部服务已就绪, 模式: {_sopModule.DetectionMode}");
+            await _sopModule!.EnsureHandPoseServiceReadyAsync();
 
             // 3.5 模型缺失时明确提示（否则表现是"检测不到任何目标"，很难自查）
-            if (!_sopModule.IsModelLoaded)
+            if (!_sopModule!.IsModelLoaded)
             {
                 MessageBox.Show(
                     "SOP 物体检测模型未加载：找不到 ONNX 模型文件。\n\n" +
@@ -1954,7 +888,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             if (!string.IsNullOrEmpty(SopWorkflowPath) && File.Exists(SopWorkflowPath))
             {
                 DebugLog($"[StartSOP] 从YAML加载工作流: {SopWorkflowPath}");
-                _sopModule.StartWorkflowFromYaml(SopWorkflowPath);
+                await Task.Run(() => _sopModule!.StartWorkflowFromYaml(SopWorkflowPath));
             }
             else
             {
@@ -1967,7 +901,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
                     Steps = new List<SOPStep>(),
                     Regions = new List<ZoneDefinition>()
                 };
-                _sopModule.StartWorkflow(workflow);
+                await Task.Run(() => _sopModule!.StartWorkflow(workflow));
             }
             DebugLog($"[StartSOP] StartWorkflow 完成");
 
@@ -1991,13 +925,13 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             IsRealTimeDetecting = false; // 关闭通用检测，避免冲突
             _inferenceFrameCount = 0;
             _lastInferenceTime = DateTime.Now;
-            
+
             // 修复：启动推理工作线程
-            StartInferenceWorker();
+            _framePipeline.StartInference();
             DebugLog($"[StartSOP] 推理工作线程已启动");
 
             SopStatus = "SOP 实时检测运行中";
-            Status = $"SOP 实时检测已启动 | 模式: {_sopModule.DetectionMode}";
+            Status = "SOP 实时检测已启动";
             DebugLog($"[StartSOP] SOP启动完成，等待相机帧...");
         }
         catch (Exception ex)
@@ -2019,26 +953,20 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     public async Task StopSOPDetectionAsync()
     {
         IsSOPDetecting = false;
-        
+
         // 修复：停止推理工作线程
-        await StopInferenceWorkerAsync();
+        await _framePipeline.StopInferenceAsync();
         DebugLog($"[StopSOP] 推理工作线程已停止");
-        
+
         _sopModule?.StopWorkflow();
-        _detectionSmoother.Clear();
-        _lastSopResult = null;
-        _noSopResultFrameCount = 0;
         // 清空画面违规横幅缓存（停止检测即不再提示）
-        lock (_violationToastLock) _activeViolations.Clear();
+        _overlayRenderer.ResetSop();
         // 清空多相机检测结果缓存与告警标记
-        _perCameraLastResults.Clear();
         foreach (var item in CameraViews)
         {
             item.IsAlerting = false;
         }
         // 重置区域监控报警状态
-        _regionAlertActive = false;
-        _regionAlertLastTime = DateTime.MinValue;
         InferenceFps = 0;
         SopStatus = "SOP 检测已停止";
         Status = "SOP 检测已停止";
@@ -2052,7 +980,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     {
         _sopModule?.ResetWorkflow();
         // 复位即清空画面违规横幅（新一轮流程从干净状态开始）
-        lock (_violationToastLock) _activeViolations.Clear();
+        _overlayRenderer.ResetSop();
         SopStatus = "SOP 工作流已重置";
         Status = "SOP 工作流已重置，从第一步重新开始";
     }
@@ -2081,7 +1009,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
 
     private void OnSOPStepChanged(object? sender, StepChangedEventArgs e)
     {
-        System.Windows.Application.Current?.Dispatcher.Invoke(() =>
+        System.Windows.Application.Current?.Dispatcher.BeginInvoke(new Action(() =>
         {
             if (_isDisposed) return;
             CurrentStep = e.CurrentStepId;
@@ -2089,35 +1017,27 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             Status = $"SOP 步骤推进: {e.PreviousStepId} → {e.CurrentStepId} ({e.StepName})";
             // 每步完成后播放 ok.wav（初始 0→1 是"开始"，不算完成，不播）
             if (e.PreviousStepId != 0)
-                PlayOkSound();
-        });
+                _audioFeedback.PlayOk();
+        }));
     }
 
     private void OnSOPViolationDetected(object? sender, ViolationEventArgs e)
     {
         Console.WriteLine($"[SOP-Audio][DEBUG] OnSOPViolationDetected 触发: type={e.Violation.Type} desc={e.Violation.Description} | Application.Current={(System.Windows.Application.Current == null ? "NULL(不播)" : "OK")}");
-        System.Windows.Application.Current?.Dispatcher.Invoke(() =>
+        System.Windows.Application.Current?.Dispatcher.BeginInvoke(new Action(() =>
         {
             if (_isDisposed) return;
 
-            // 违规即时入栈（最多保留 3 条，新的顶掉最旧的），供画面横幅绘制
-            lock (_violationToastLock)
-            {
-                _activeViolations.Add(new ViolationToast(
-                    DateTime.Now, ViolationTypeText(e.Violation.Type), e.Violation.Description));
-                if (_activeViolations.Count > 3) _activeViolations.RemoveAt(0);
-            }
+            _overlayRenderer.AddViolation(e.Violation);
 
             SopStatus = $"⚠ 违规: {e.Violation.Description}";
             Status = $"⚠ SOP 违规: [{e.Violation.Type}] {e.Violation.Description}";
             // 跳步（中间跳了工序）→ 播放 ng.wav
             if (e.Violation.Type == ViolationType.SkipStep)
             {
-                EnsureSopAudioPaths();
-                Console.WriteLine($"[SOP-Audio][DEBUG] 跳步 -> 请求播放 ng.wav | _ngWavPath='{_ngWavPath}' exists={(_ngWavPath != null && File.Exists(_ngWavPath))}");
-                PlayNgSound();
+                _audioFeedback.PlayNg();
             }
-        });
+        }));
     }
 
     /// <summary>
@@ -2129,180 +1049,45 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     {
         if (e.HasViolations) return;
 
-        System.Windows.Application.Current?.Dispatcher.Invoke(() =>
+        System.Windows.Application.Current?.Dispatcher.BeginInvoke(new Action(() =>
         {
             if (_isDisposed) return;
-            lock (_violationToastLock)
-            {
-                _activeViolations.Clear();
-            }
-        });
+            _overlayRenderer.ClearViolations();
+        }));
     }
 
     private void OnSOPWorkflowCompleted(object? sender, SOPCompletedEventArgs e)
     {
-        System.Windows.Application.Current?.Dispatcher.Invoke(() =>
+        System.Windows.Application.Current?.Dispatcher.BeginInvoke(new Action(() =>
         {
             if (_isDisposed) return;
             var isPass = !e.HasViolations;
             if (isPass)
             {
                 // 整个流程无违规 → 清空横幅（兜底，正常情况下步骤完成时已清）
-                lock (_violationToastLock) _activeViolations.Clear();
+                _overlayRenderer.ClearViolations();
             }
             SopStatus = isPass ? "✅ SOP 全部通过" : "❌ SOP 检测不通过";
             Status = isPass
                 ? $"SOP 完成: 全部 {TotalSteps} 步通过"
                 : $"SOP 完成: 有 {e.Violations.Count} 个违规";
             // 最后一步完成也播放 ok.wav
-            PlayOkSound();
-        });
+            _audioFeedback.PlayOk();
+        }));
     }
-
-    #region SOP 音频反馈（每步完成 ok.wav / 跳步 ng.wav）
-
-    private string? _okWavPath;
-    private string? _ngWavPath;
-
-    /// <summary>
-    /// 音频播放器缓存：基于 NAudio 的 WaveOutEvent + AudioFileReader，支持任意位深 PCM
-    /// （8/16/24/32-bit）及 IEEE float，因此 24-bit/44100Hz/立体声的 WAV 也能原生播放，
-    /// 不再需要事先转成 16-bit。播放器常驻缓存、永不释放，避免重复创建与截断。
-    /// </summary>
-    private readonly object _sopAudioLock = new();
-    private readonly Dictionary<string, (WaveOutEvent output, AudioFileReader reader)> _sopAudioCache
-        = new(StringComparer.OrdinalIgnoreCase);
-
-    /// <summary>
-    /// 定位 ok.wav / ng.wav：构建时已复制到输出目录；开发期由 AppPaths 从程序目录向上找到仓库根。
-    /// </summary>
-    private void EnsureSopAudioPaths()
-    {
-        _okWavPath ??= AppPaths.FindFile("ok.wav");
-        _ngWavPath ??= AppPaths.FindFile("ng.wav");
-    }
-
-    /// <summary>
-    /// 播放音频（NAudio WaveOutEvent 异步播放，不阻塞 UI）。文件不存在时静默跳过。
-    /// 设计要点：
-    /// 1. 用 NAudio.WaveOutEvent + AudioFileReader 播放——底层走 WaveOut / Media Foundation，
-    ///    原生支持 8/16/24/32-bit PCM 与 IEEE float，无需把 24-bit WAV 预先转成 16-bit。
-    /// 2. 播放器（output+reader）常驻缓存 _sopAudioCache，重复播放只需 reader.Position=0 后
-    ///    Play()，避免重复创建；若正在播放则先 Stop() 再重播，不会叠加成杂音。
-    /// 3. [调试] 打印 WAV 格式信息（任意位深 PCM 均支持）。
-    /// </summary>
-    private void PlaySopSound(string? path)
-    {
-        if (string.IsNullOrEmpty(path))
-        {
-            Console.WriteLine("[SOP-Audio][DEBUG] 跳过播放：音频路径为空（EnsureSopAudioPaths 未解析到文件）");
-            return;
-        }
-        if (!File.Exists(path))
-        {
-            Console.WriteLine($"[SOP-Audio][DEBUG] 跳过播放：文件不存在 -> {path}");
-            return;
-        }
-        try
-        {
-            // 调试：打印 WAV 格式与是否被播放器支持
-            var info = GetWavFormatInfo(path);
-            long size = new FileInfo(path).Length;
-            Console.WriteLine($"[SOP-Audio][DEBUG] 准备播放: {path} | 大小={size}字节 | {info}");
-
-            (WaveOutEvent output, AudioFileReader reader) entry;
-            lock (_sopAudioLock)
-            {
-                if (!_sopAudioCache.TryGetValue(path, out entry))
-                {
-                    var afReader = new AudioFileReader(path);
-                    var waveOut = new WaveOutEvent();
-                    waveOut.Init(afReader);
-                    entry = (waveOut, afReader);
-                    _sopAudioCache[path] = entry;
-                    Console.WriteLine($"[SOP-Audio][DEBUG] 创建播放器成功（支持任意位深 PCM）");
-                }
-
-                // 重置到开头，避免上次播放到结尾后无法再播；若正在播放则先停再重播
-                if (entry.reader.Position != 0) entry.reader.Position = 0;
-                if (entry.output.PlaybackState == PlaybackState.Playing)
-                    entry.output.Stop();
-                entry.output.Play();
-            }
-            Console.WriteLine($"[SOP-Audio][DEBUG] 已发起 Play() 调用（等待设备出声）");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[SOP-Audio][ERROR] 播放失败 '{path}': {ex}");
-        }
-    }
-
-    /// <summary>
-    /// 解析 WAV 的 fmt 块，返回可读格式信息及播放器支持性提示（调试用）。
-    /// </summary>
-    private static string GetWavFormatInfo(string path)
-    {
-        try
-        {
-            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
-            using var br = new BinaryReader(fs);
-            if (br.ReadInt32() != 0x46464952) return "非RIFF/WAV头";
-            br.ReadInt32(); // RIFF size
-            if (br.ReadInt32() != 0x45564157) return "非WAVE";
-            while (fs.Position < fs.Length - 8)
-            {
-                int chunkId = br.ReadInt32();
-                int chunkSize = br.ReadInt32();
-                if (chunkId == 0x20746D66) // 'fmt '
-                {
-                    short audioFormat = br.ReadInt16(); // 1=PCM
-                    short channels = br.ReadInt16();
-                    int sampleRate = br.ReadInt32();
-                    br.ReadInt32(); // byteRate
-                    br.ReadInt16(); // blockAlign
-                    short bits = br.ReadInt16();
-                    string fmt = audioFormat == 1 ? "PCM" : (audioFormat == 3 ? "IEEE-float" : $"fmt={audioFormat}");
-                    // NAudio（WaveOutEvent+AudioFileReader）原生支持 PCM 任意位深与 IEEE float；
-                    // 仅非 PCM 的压缩格式（如 MP3/AAC，audioFormat 不为 1 也不为 3）才无法直接播放。
-                    bool supported = audioFormat == 1 || audioFormat == 3;
-                    return $"{fmt} {channels}ch {bits}bit {sampleRate}Hz {(supported ? "[播放器支持]" : "[播放器不支持:非PCM压缩格式]")}";
-                }
-                fs.Seek(chunkSize, SeekOrigin.Current);
-            }
-            return "未找到fmt块";
-        }
-        catch (Exception ex)
-        {
-            return $"解析失败:{ex.Message}";
-        }
-    }
-
-    private void PlayOkSound()
-    {
-        EnsureSopAudioPaths();
-        PlaySopSound(_okWavPath);
-    }
-
-    private void PlayNgSound()
-    {
-        EnsureSopAudioPaths();
-        PlaySopSound(_ngWavPath);
-    }
-
-    #endregion
 
     /// <summary>
     /// 模型加载告警：专用模型缺失/回退时弹窗提示，避免"什么都没识别到却无提示"
     /// </summary>
     private void OnSOPModelWarning(object? sender, string message)
     {
-        System.Windows.Application.Current?.Dispatcher.Invoke(() =>
+        System.Windows.Application.Current?.Dispatcher.BeginInvoke(new Action(() =>
         {
             if (_isDisposed) return;
             SopStatus = "⚠ 模型告警: " + message;
             Status = "⚠ SOP 模型告警（见弹窗）";
             MessageBox.Show(message, "SOP 模型告警", MessageBoxButton.OK, MessageBoxImage.Warning);
-        });
+        }));
     }
 
     #endregion
@@ -2330,7 +1115,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
                     using var stream = new FileStream(openFileDialog.FileName, FileMode.Open, FileAccess.Read);
                     CurrentImage = SKBitmap.Decode(stream);
                 });
-                
+
                 RoiEditorViewModel.CurrentImage = CurrentImage;
                 Status = $"图像加载成功: {Path.GetFileName(openFileDialog.FileName)}";
             }
@@ -2497,7 +1282,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             HighConfidenceCount = result.Objects.Count(o => o.Confidence >= 0.5);
 
             // 绘制检测结果到图像
-            DetectionResultImage = DrawDetectionResults(CurrentImage, result.Objects);
+            DetectionResultImage = _overlayRenderer.DrawDetectionResults(CurrentImage, result.Objects);
 
             // 更新显示
             RoiEditorViewModel.CurrentImage = DetectionResultImage;
@@ -2513,269 +1298,6 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         {
             IsBusy = false;
         }
-    }
-
-    /// <summary>
-    /// 绘制检测结果到图像
-    /// </summary>
-    // COCO 17关键点骨骼连接（0-indexed：nose, left_eye, right_eye, left_ear, right_ear,
-    // left_shoulder, right_shoulder, left_elbow, right_elbow, left_wrist, right_wrist,
-    // left_hip, right_hip, left_knee, right_knee, left_ankle, right_ankle）
-    private static readonly int[][] COCO_SKELETON =
-    {
-        new[] { 15, 13 }, new[] { 13, 11 }, new[] { 16, 14 }, new[] { 14, 12 },
-        new[] { 11, 12 }, new[] { 5, 11 }, new[] { 6, 12 }, new[] { 5, 6 },
-        new[] { 5, 7 }, new[] { 7, 9 }, new[] { 6, 8 }, new[] { 8, 10 },
-        new[] { 1, 3 }, new[] { 0, 2 }, new[] { 0, 1 }, new[] { 2, 4 }, new[] { 3, 5 }
-    };
-    // 关键点绘制的最低置信度
-    private const float POSE_KEYPOINT_CONF = 0.3f;
-    // 分割掩膜颜色调色板（按类别索引取色，半透明叠加）
-    private static readonly SKColor[] SEG_MASK_COLORS =
-    {
-        new SKColor(0, 200, 255, 110),   // 青
-        new SKColor(255, 120, 0, 110),   // 橙
-        new SKColor(0, 220, 120, 110),   // 绿
-        new SKColor(255, 80, 160, 110),  // 粉
-        new SKColor(180, 120, 255, 110), // 紫
-        new SKColor(255, 220, 0, 110),   // 黄
-        new SKColor(80, 160, 255, 110),  // 蓝
-        new SKColor(255, 80, 80, 110)    // 红
-    };
-
-    private SKBitmap DrawDetectionResults(SKBitmap originalImage, List<DetectedObject> objects, float textSize = 24f)
-    {
-        // 创建副本
-        var resultBitmap = originalImage.Copy();
-        using var canvas = new SKCanvas(resultBitmap);
-        DrawDetectedObjects(canvas, objects, textSize);
-        return resultBitmap;
-    }
-
-    /// <summary>
-    /// 叠加层统一缩放系数。
-    /// <para>
-    /// 叠加层是画在<b>原始帧</b>上、再被整体缩放到窗口显示的：
-    /// 1920/3072 宽的帧缩到 ~1000px 宽的画面区只剩 1/2~1/3。
-    /// 所以线宽/半径/字号必须是"相对帧宽"的，按 1280 宽为基准换算，
-    /// 否则画面里的框和骨架会细到 1px（这是"检测框/姿态不突出"的根因，与模型无关）。
-    /// </para>
-    /// </summary>
-    private static float OverlayScale(SKCanvas canvas)
-    {
-        var width = canvas.LocalClipBounds.Width;
-        if (width <= 0) width = 1280;
-        return Math.Clamp(width / 1280f, 1f, 4f);
-    }
-
-    /// <summary>叠加层文字字体（首选带中文字形的字体，避免中文类别名变方块）</summary>
-    private static readonly SKTypeface OverlayTypeface = ResolveOverlayTypeface();
-
-    private static SKTypeface ResolveOverlayTypeface()
-    {
-        foreach (var name in new[] { "Microsoft YaHei", "PingFang SC", "Segoe UI", "Arial" })
-        {
-            var typeface = SKTypeface.FromFamilyName(name);
-            if (typeface != null) return typeface;
-        }
-        return SKTypeface.Default;
-    }
-
-    /// <summary>
-    /// 在已有画布上叠加绘制检测结果（边界框 + 标签 + 姿态骨骼 + 分割掩膜）。
-    /// <para>提取自 <see cref="DrawDetectionResults"/>，便于在相机最新帧上直接叠加（与 SOP 渲染架构一致），
-    /// 避免「无框原始帧」与「有框帧」交替造成的实时检测闪烁。</para>
-    /// </summary>
-    private void DrawDetectedObjects(SKCanvas canvas, List<DetectedObject> objects, float textSize = 24f)
-    {
-        float s = OverlayScale(canvas);
-        float stroke = 3.5f * s;
-
-        // 黑色底衬：浅色/花色背景上也能看清框线
-        using var outlinePaint = new SKPaint
-        {
-            Color = SKColors.Black.WithAlpha(170),
-            StrokeWidth = stroke + 2.5f * s,
-            IsAntialias = true,
-            Style = SKPaintStyle.Stroke
-        };
-
-        foreach (var obj in objects)
-        {
-            // 根据置信度选择颜色
-            var color = obj.Confidence > 0.7 ? SKColors.LimeGreen :
-                       obj.Confidence > 0.5 ? SKColors.Yellow : SKColors.Red;
-
-            using var paint = new SKPaint
-            {
-                Color = color,
-                StrokeWidth = stroke,
-                IsAntialias = true,
-                Style = SKPaintStyle.Stroke
-            };
-
-            // 绘制边界框（使用PixelBoundingBox）
-            canvas.DrawRect(obj.PixelBoundingBox, outlinePaint);
-            canvas.DrawRect(obj.PixelBoundingBox, paint);
-
-            // 标签（字号随分辨率缩放）
-            using var textPaint = new SKPaint
-            {
-                Color = color,
-                TextSize = textSize * s,
-                IsAntialias = true,
-                FakeBoldText = true,
-                Typeface = OverlayTypeface
-            };
-
-            var label = $"{obj.ClassName} {obj.Confidence:P0}";
-            var textBounds = new SKRect();
-            textPaint.MeasureText(label, ref textBounds);
-
-            float pad = 4f * s;
-            var box = obj.PixelBoundingBox;
-            var bgRect = new SKRect(
-                box.Left,
-                box.Top - textBounds.Height - 2 * pad,
-                box.Left + textBounds.Width + 2 * pad,
-                box.Top);
-
-            using var bgPaint = new SKPaint
-            {
-                Color = color.WithAlpha(210),
-                Style = SKPaintStyle.Fill
-            };
-            canvas.DrawRect(bgRect, bgPaint);
-
-            // 绘制标签文字
-            textPaint.Color = SKColors.White;
-            canvas.DrawText(label, box.Left + pad, box.Top - pad, textPaint);
-
-            // 绘制人体姿态骨骼（仅姿态估计模型会带 KeyPoints）
-            if (obj.KeyPoints != null && obj.KeyPoints.Count > 0)
-            {
-                DrawPoseSkeleton(canvas, obj.KeyPoints);
-            }
-
-            // 绘制实例分割掩膜（仅分割模型会带 Mask）
-            if (obj.Mask != null)
-            {
-                var maskColor = SEG_MASK_COLORS[obj.ClassId % SEG_MASK_COLORS.Length];
-                // 掩膜按原始检测框尺寸位打包，必须用 MaskBox（而非平滑后的 PixelBoundingBox）绘制，否则错位/变形
-                var maskBox = obj.MaskBox ?? obj.PixelBoundingBox;
-                DrawSegmentationMask(canvas, obj.Mask,
-                    maskBox.Left, maskBox.Top,
-                    maskBox.Width, maskBox.Height, maskColor);
-            }
-        }
-    }
-
-    /// <summary>
-    /// 在画布上绘制 COCO 姿态关键点与骨骼连线
-    /// </summary>
-    private void DrawPoseSkeleton(SKCanvas canvas, List<VisionInspection.Core.Services.KeyPoint> kps)
-    {
-        // 按置信度过滤不可靠的关键点
-        var valid = kps.Where(k => k.Confidence >= POSE_KEYPOINT_CONF).ToList();
-        if (valid.Count == 0) return;
-
-        float s = OverlayScale(canvas);
-        float lineWidth = 3f * s;
-
-        // 先绘制骨骼连线（黑色底衬 + 亮绿线）
-        using var lineOutline = new SKPaint
-        {
-            Color = SKColors.Black.WithAlpha(170),
-            StrokeWidth = lineWidth + 2.5f * s,
-            IsAntialias = true,
-            Style = SKPaintStyle.Stroke
-        };
-        using var linePaint = new SKPaint
-        {
-            Color = SKColors.Lime,
-            StrokeWidth = lineWidth,
-            IsAntialias = true,
-            Style = SKPaintStyle.Stroke
-        };
-        foreach (var pair in COCO_SKELETON)
-        {
-            var a = valid.FirstOrDefault(k => k.Index == pair[0]);
-            var b = valid.FirstOrDefault(k => k.Index == pair[1]);
-            if (a != null && b != null)
-            {
-                canvas.DrawLine(a.X, a.Y, b.X, b.Y, lineOutline);
-                canvas.DrawLine(a.X, a.Y, b.X, b.Y, linePaint);
-            }
-        }
-
-        // 再绘制关键点（黄点 + 黑色描边）
-        using var pointPaint = new SKPaint
-        {
-            Color = SKColors.Yellow,
-            IsAntialias = true,
-            Style = SKPaintStyle.Fill
-        };
-        using var pointOutline = new SKPaint
-        {
-            Color = SKColors.Black,
-            StrokeWidth = 1.5f * s,
-            IsAntialias = true,
-            Style = SKPaintStyle.Stroke
-        };
-        float radius = 4f * s;
-        foreach (var k in valid)
-        {
-            canvas.DrawCircle(k.X, k.Y, radius, pointPaint);
-            canvas.DrawCircle(k.X, k.Y, radius, pointOutline);
-        }
-    }
-
-    /// <summary>
-    /// 在画布上叠加实例分割掩膜（半透明着色区域）
-    /// </summary>
-    private void DrawSegmentationMask(SKCanvas canvas, byte[]? packedMask, int boxX, int boxY, int boxW, int boxH, SKColor color)
-    {
-        if (packedMask == null || packedMask.Length == 0 || boxW <= 0 || boxH <= 0)
-            return;
-
-        // 将位打包掩膜解包为彩色半透明位图，并绘制到边界框位置
-        using var maskBmp = UnpackSegmentationMask(packedMask, boxW, boxH, color);
-        canvas.DrawBitmap(maskBmp, boxX, boxY);
-    }
-
-    /// <summary>
-    /// 把位打包的像素掩膜解包为彩色半透明 SKBitmap（尺寸 = 边界框宽高）。
-    /// 位序：byteIndex = i&gt;&gt;3, bitIndex = i &amp; 7（沿用原 YoloDotNet 输出格式）。
-    /// </summary>
-    private unsafe SKBitmap UnpackSegmentationMask(byte[] packed, int w, int h, SKColor color)
-    {
-        var bmp = new SKBitmap(w, h, SKColorType.Bgra8888, SKAlphaType.Premul);
-        int total = w * h;
-        byte* ptr = (byte*)bmp.GetPixels().ToPointer();
-
-        for (int i = 0; i < total; i++)
-        {
-            int byteIndex = i >> 3;     // i / 8
-            int bitIndex = i & 7;       // i % 8
-            bool isOn = (packed[byteIndex] & (1 << bitIndex)) != 0;
-
-            int offset = i * 4;
-            if (isOn)
-            {
-                ptr[offset] = color.Blue;
-                ptr[offset + 1] = color.Green;
-                ptr[offset + 2] = color.Red;
-                ptr[offset + 3] = color.Alpha;
-            }
-            else
-            {
-                ptr[offset] = 0;
-                ptr[offset + 1] = 0;
-                ptr[offset + 2] = 0;
-                ptr[offset + 3] = 0;
-            }
-        }
-        return bmp;
     }
 
     [RelayCommand]
@@ -2953,7 +1475,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             if (!_detectionService.InitializeVideoInference(options))
             {
                 IsVideoPlaying = false;
-                
+
                 // 视频解码现在由程序内置的 OpenCV 完成，不再依赖外部 ffmpeg/ffprobe
                 Status = $"视频推理初始化失败: {_lastDetectionError}";
                 MessageBox.Show(
@@ -3023,7 +1545,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             // 绘制检测结果。e.Frame 是解码器复用的缓冲（不能释放）；
             // 自己画出来的副本必须释放上一张，否则分辨率 1080p 时每帧泄漏 8MB。
             var drawn = e.DetectionResult.Objects.Count > 0
-                ? DrawDetectionResults(e.Frame, e.DetectionResult.Objects)
+                ? _overlayRenderer.DrawDetectionResults(e.Frame, e.DetectionResult.Objects)
                 : null;
 
             var previous = _videoDrawnImage;
@@ -3076,6 +1598,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
                 return;
             }
 
+            _framePipeline.StartInference();
             IsRealTimeDetecting = true;
             _inferenceFrameCount = 0;
             _lastInferenceTime = DateTime.Now;
@@ -3121,9 +1644,10 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         if (!_isDisposed)
         {
             _isDisposed = true;
-            
+            // MainWindow 在后台线程调用 Dispose，等待完整启动流程后再释放其创建的服务。
+            _sopStartTask?.GetAwaiter().GetResult();
+
             // 取消订阅相机/检测/SOP 事件，避免关闭过程中收到回调
-            _cameraManager.FrameGrabbed -= OnCameraFrameGrabbed;
             _cameraManager.SlotStatusChanged -= OnCameraSlotStatusChanged;
             _cameraManager.ConnectionStatusChanged -= OnCameraConnectionStatusChanged;
             _detectionService.DetectionError -= OnDetectionError;
@@ -3132,37 +1656,15 @@ public partial class MainViewModel : ViewModelBase, IDisposable
                 _sopModule.StepChanged -= OnSOPStepChanged;
                 _sopModule.ViolationDetected -= OnSOPViolationDetected;
                 _sopModule.WorkflowCompleted -= OnSOPWorkflowCompleted;
+                _sopModule.StepCompleted -= OnSOPStepCompleted;
+                _sopModule.ModelWarning -= OnSOPModelWarning;
+                _sopModule.UseGpuChanged -= OnSopUseGpuChanged;
+                _sopModule.GpuSwitchFailed -= OnSopGpuSwitchFailed;
             }
 
-            // ⭐ 先停预览线程（它还会派发 UI 更新），再停相机
-            try
-            {
-                _previewCts?.Cancel();
-                _previewQueue.Writer.TryComplete();
-                _previewWorkerTask?.Wait(TimeSpan.FromSeconds(2));
-            }
-            catch (Exception)
-            {
-                // 忽略取消失败
-            }
-
-            // ⭐ 先停止相机抓取，避免持续产生新帧
-            try { SafeShutdownCamera(); } catch (Exception) { }
-
-            // ⭐ 再停止后台推理任务，并等待其真正结束，避免原生会话被释放后仍被线程访问
-            try
-            {
-                _inferenceCts?.Cancel();
-                foreach (var ch in _perCameraInferenceQueues.Values)
-                {
-                    ch.Writer.TryComplete();
-                }
-                _inferenceWorkerTask?.Wait(TimeSpan.FromSeconds(3));
-            }
-            catch (Exception)
-            {
-                // 忽略等待/取消异常
-            }
+            _framePipeline.Dispose();
+            SafeShutdownCamera();
+            _audioFeedback.Dispose();
 
             // 释放 SOP 模块（内部 StopWorkflow 并释放 _yolo / 手部服务），此时推理线程已停止
             if (_sopModule != null)
@@ -3195,7 +1697,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             try { _detectionService?.Dispose(); } catch (Exception) { }
         }
     }
-    
+
     /// <summary>
     /// 安全关闭相机 - 确保相机正确停止并断开连接
     /// </summary>
@@ -3204,10 +1706,10 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         try
         {
             System.Diagnostics.Debug.WriteLine("开始安全关闭相机...");
-            
+
             // 使用CameraManager的Shutdown方法进行完整关闭
             _cameraManager.Shutdown();
-            
+
             System.Diagnostics.Debug.WriteLine("相机已安全关闭");
         }
         catch (Exception ex)

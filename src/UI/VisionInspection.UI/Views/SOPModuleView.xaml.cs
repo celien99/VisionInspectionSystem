@@ -40,15 +40,6 @@ namespace VisionInspection.UI.Views
         // YAML工作流路径
         private string _currentYamlPath = "";
 
-        // SOP检测模式配置 - 默认启用手部检测，最大手数为2
-        private SOPDetectionModeConfig _detectionModeConfig = new()
-        {
-            DetectionMode = "UnifiedDetection",
-            EnableHandPoseEstimation = true,
-            MaxNumHands = 2,
-            UseGpu = true
-        };
-
         public SOPModuleView()
         {
             InitializeComponent();
@@ -1287,14 +1278,16 @@ namespace VisionInspection.UI.Views
             }
         }
 
-        private void ConfigButton_Click(object sender, RoutedEventArgs e)
+        private async void ConfigButton_Click(object sender, RoutedEventArgs e)
         {
             // 打开 SOP 流程预览与编辑窗口：传入当前配方 YAML，保存后自动重载
             var configWindow = new SOPConfigWindow(string.IsNullOrEmpty(_currentYamlPath) ? null : _currentYamlPath);
             configWindow.Owner = Window.GetWindow(this);
 
             // 传递当前运行时检测配置（手部检测等）
-            configWindow.SetDetectionModeConfig(_detectionModeConfig);
+            var viewModel = GetMainViewModel();
+            if (viewModel == null) return;
+            configWindow.SetHandPoseConfig(viewModel.GetHandPoseConfig());
 
             if (configWindow.ShowDialog() == true)
             {
@@ -1307,28 +1300,6 @@ namespace VisionInspection.UI.Views
                         _currentYamlPath = configWindow.SavedYamlPath;
                         AddLog($"SOP流程已修改并重载: {System.IO.Path.GetFileName(_currentYamlPath)}");
 
-                        var vm = GetMainViewModel();
-
-                        // P4-2: 同步到主视图的启动路径，使「运行」按钮加载的是新配方
-                        // （对照 MainViewModel.RecipeComboBox_SelectionChanged 的同步逻辑，
-                        //  配置窗口原只设 _currentYamlPath 却漏同步，导致"另存为"后运行仍加载旧配方）
-                        if (vm != null)
-                            vm.SopWorkflowPath = _currentYamlPath;
-
-                        // P4-1: SOP 正在运行时，热重载配置到运行中的 SOPModule（复用复位同款的状态机重启路径，不重启相机线程）。
-                        // 否则运行中改超时/区域/模型界面看着变了，实际跑的还是旧 workflow，必须停止再启动。
-                        if (vm != null && vm.IsSOPDetecting && vm.SOPModuleInstance != null)
-                        {
-                            try
-                            {
-                                vm.SOPModuleInstance.StartWorkflowFromYaml(_currentYamlPath);
-                                AddLog($"SOP 运行中已热重载配置: {System.IO.Path.GetFileName(_currentYamlPath)}");
-                            }
-                            catch (Exception ex)
-                            {
-                                AddLog($"运行中热重载失败（请先停止 SOP 再启动以应用）: {ex.Message}");
-                            }
-                        }
                     }
                     catch (Exception ex)
                     {
@@ -1337,80 +1308,11 @@ namespace VisionInspection.UI.Views
                 }
 
                 // 应用运行时检测配置
-                _detectionModeConfig = configWindow.GetDetectionModeConfig();
-                UpdateSOPDetectionMode();
-                UpdateStepDisplay();
+                await viewModel.ApplySopConfigurationAsync(_currentYamlPath, configWindow.GetHandPoseConfig());
+
             }
         }
 
-        /// <summary>
-        /// 更新SOP模块检测模式
-        /// </summary>
-        private void UpdateSOPDetectionMode()
-        {
-            var viewModel = GetMainViewModel();
-
-            // 统一检测模式：所有配置都映射到 UnifiedDetection
-            var mode = SOPDetectionMode.UnifiedDetection;
-
-            // 重要：无论 SOPModule 是否已创建，都要保存配置到 MainViewModel
-            // 这样当 SOPModule 稍后被创建时可以应用正确的模式
-            if (viewModel != null)
-            {
-                Console.WriteLine($"[SOPModuleView] 保存检测配置到MainViewModel: {_detectionModeConfig.DetectionMode}, 手部检测={_detectionModeConfig.EnableHandPoseEstimation}");
-                viewModel.SaveSOPDetectionConfig(
-                    _detectionModeConfig.DetectionMode,
-                    _detectionModeConfig.EnableHandPoseEstimation,
-                    _detectionModeConfig.MaxNumHands,
-                    _detectionModeConfig.EnableFaceFilter,
-                    _detectionModeConfig.FaceFilterUpperRatio,
-                    _detectionModeConfig.EnableHandStructureCheck,
-                    _detectionModeConfig.HandStructureWristTipRatio,
-                    _detectionModeConfig.DetectionConfidenceThreshold,
-                    _detectionModeConfig.MinBoxAreaRatio,
-                    _detectionModeConfig.RotationAugmentation,
-                    _detectionModeConfig.HandBackend,
-                    _detectionModeConfig.DetectLeftHand,
-                    _detectionModeConfig.DetectRightHand,
-                    _detectionModeConfig.ConfidenceThreshold
-                );
-            }
-
-            // 如果 SOPModule 已创建，立即更新它的配置
-            if (viewModel?.SOPModuleInstance != null)
-            {
-                Console.WriteLine($"[SOPModuleView] 更新已存在的SOPModule实例: {mode}");
-
-                // 更新SOP模块配置
-                viewModel.SOPModuleInstance.UpdateDetectionMode(mode, _detectionModeConfig.EnableHandPoseEstimation);
-
-                // 如果启用手部检测，更新手部检测配置
-                if (_detectionModeConfig.EnableHandPoseEstimation)
-                {
-                    viewModel.SOPModuleInstance.UpdateHandPoseConfig(new VisionInspection.Modules.SOP.Models.HandPoseEstimationConfig
-                    {
-                        Backend = System.Enum.TryParse<VisionInspection.Modules.SOP.Models.HandDetectionBackend>(_detectionModeConfig.HandBackend, true, out var parsedBackend)
-                            ? parsedBackend : VisionInspection.Modules.SOP.Models.HandDetectionBackend.MediaPipe,
-                        MaxNumHands = _detectionModeConfig.MaxNumHands,
-                        UseGpu = _detectionModeConfig.UseGpu,
-                        ConfidenceThreshold = _detectionModeConfig.ConfidenceThreshold,
-                        EnableFaceFilter = _detectionModeConfig.EnableFaceFilter,
-                        FaceFilterUpperRatio = _detectionModeConfig.FaceFilterUpperRatio,
-                        EnableHandStructureCheck = _detectionModeConfig.EnableHandStructureCheck,
-                        HandStructureWristTipRatio = _detectionModeConfig.HandStructureWristTipRatio,
-                        DetectionConfidenceThreshold = _detectionModeConfig.DetectionConfidenceThreshold,
-                        MinBoxAreaRatio = _detectionModeConfig.MinBoxAreaRatio,
-                        RotationAugmentation = _detectionModeConfig.RotationAugmentation,
-                        DetectLeftHand = _detectionModeConfig.DetectLeftHand,
-                        DetectRightHand = _detectionModeConfig.DetectRightHand,
-                        InferenceInterval = _detectionModeConfig.InferenceInterval,
-                        SmoothWindowSize = _detectionModeConfig.SmoothWindowSize,
-                        SmoothAlpha = _detectionModeConfig.SmoothAlpha,
-                        SkeletonConfidenceThreshold = _detectionModeConfig.SkeletonConfidenceThreshold
-                    });
-                }
-            }
-        }
 
         /// <summary>
         /// 运行按钮点击
@@ -1428,7 +1330,7 @@ namespace VisionInspection.UI.Views
             // 如果已经在运行，则停止
             if (viewModel.IsSOPDetecting)
             {
-                _ = viewModel.StopSOPDetectionAsync();
+                await viewModel.StopSOPDetectionAsync();
                 SetStatus("检测已停止", new SolidColorBrush(Colors.Gray));
                 SetResult("--", new SolidColorBrush(Colors.Gray));
                 StopTimer();
@@ -1436,20 +1338,6 @@ namespace VisionInspection.UI.Views
                 ThumbnailPlaceholder.Visibility = Visibility.Visible;
                 UpdateRunButtonState(false);
                 AddLog("SOP 实时检测已停止");
-                return;
-            }
-
-            // 检查相机状态 - 直接使用 CameraManager 单例
-            var cameraManager = CameraManager.Instance;
-            if (!cameraManager.IsConnected)
-            {
-                MessageBox.Show("请先连接相机", "提示", MessageBoxButton.OK, MessageBoxImage.Warning);
-                return;
-            }
-
-            if (!cameraManager.IsGrabbing)
-            {
-                MessageBox.Show("请先开始相机采集", "提示", MessageBoxButton.OK, MessageBoxImage.Warning);
                 return;
             }
 
@@ -1470,7 +1358,7 @@ namespace VisionInspection.UI.Views
                 ClearStepDurations();
                 StartTimer();
                 UpdateRunButtonState(true);
-                AddLog($"SOP 实时检测已启动 | 模式: {viewModel.SOPModuleInstance?.DetectionMode}");
+                AddLog("SOP 实时检测已启动");
             }
             else
             {

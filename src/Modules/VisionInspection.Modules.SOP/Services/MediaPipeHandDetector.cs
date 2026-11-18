@@ -578,8 +578,6 @@ public class MediaPipeHandDetector : IDisposable
         return outList;
     }
 
-
-
     /// <summary>
     /// 平滑单个值
     /// </summary>
@@ -1185,75 +1183,6 @@ public class MediaPipeHandDetector : IDisposable
         }
 
         return cropped;
-    }
-
-    /// <summary>
-    /// 模拟手部检测（用于测试）
-    /// </summary>
-    private List<HandPose> SimulateHandDetection(SKBitmap image)
-    {
-        var hands = new List<HandPose>();
-
-        // 在图像中心生成模拟手部
-        float centerX = image.Width / 2f;
-        float centerY = image.Height / 2f;
-        float scale = Math.Min(image.Width, image.Height) / 4f;
-
-        var handPose = new HandPose
-        {
-            TrackId = 1,
-            HandType = HandType.Right,
-            Keypoints = GenerateSimulatedKeypoints(centerX, centerY, scale),
-            BoundingBox = new SKRect(centerX - scale, centerY - scale, centerX + scale, centerY + scale),
-            Timestamp = DateTime.Now
-        };
-
-        hands.Add(handPose);
-        return hands;
-    }
-
-    /// <summary>
-    /// 生成模拟关键点（用于测试）
-    /// </summary>
-    private List<HandKeypoint> GenerateSimulatedKeypoints(float centerX, float centerY, float scale)
-    {
-        var keypoints = new List<HandKeypoint>();
-
-        // 模拟21个关键点（张开的手掌姿势）
-        // 手腕
-        keypoints.Add(new HandKeypoint(HandKeypointType.Wrist, centerX, centerY + scale * 0.8f, 0, 0.95f));
-
-        // 拇指
-        keypoints.Add(new HandKeypoint(HandKeypointType.ThumbCMC, centerX - scale * 0.3f, centerY + scale * 0.6f, 0, 0.95f));
-        keypoints.Add(new HandKeypoint(HandKeypointType.ThumbMCP, centerX - scale * 0.5f, centerY + scale * 0.4f, 0, 0.95f));
-        keypoints.Add(new HandKeypoint(HandKeypointType.ThumbIP, centerX - scale * 0.7f, centerY + scale * 0.2f, 0, 0.95f));
-        keypoints.Add(new HandKeypoint(HandKeypointType.ThumbTip, centerX - scale * 0.9f, centerY, 0, 0.95f));
-
-        // 食指
-        keypoints.Add(new HandKeypoint(HandKeypointType.IndexFingerMCP, centerX - scale * 0.2f, centerY + scale * 0.3f, 0, 0.95f));
-        keypoints.Add(new HandKeypoint(HandKeypointType.IndexFingerPIP, centerX - scale * 0.2f, centerY, 0, 0.95f));
-        keypoints.Add(new HandKeypoint(HandKeypointType.IndexFingerDIP, centerX - scale * 0.2f, centerY - scale * 0.3f, 0, 0.95f));
-        keypoints.Add(new HandKeypoint(HandKeypointType.IndexFingerTip, centerX - scale * 0.2f, centerY - scale * 0.6f, 0, 0.95f));
-
-        // 中指
-        keypoints.Add(new HandKeypoint(HandKeypointType.MiddleFingerMCP, centerX, centerY + scale * 0.3f, 0, 0.95f));
-        keypoints.Add(new HandKeypoint(HandKeypointType.MiddleFingerPIP, centerX, centerY, 0, 0.95f));
-        keypoints.Add(new HandKeypoint(HandKeypointType.MiddleFingerDIP, centerX, centerY - scale * 0.35f, 0, 0.95f));
-        keypoints.Add(new HandKeypoint(HandKeypointType.MiddleFingerTip, centerX, centerY - scale * 0.7f, 0, 0.95f));
-
-        // 无名指
-        keypoints.Add(new HandKeypoint(HandKeypointType.RingFingerMCP, centerX + scale * 0.2f, centerY + scale * 0.3f, 0, 0.95f));
-        keypoints.Add(new HandKeypoint(HandKeypointType.RingFingerPIP, centerX + scale * 0.2f, centerY, 0, 0.95f));
-        keypoints.Add(new HandKeypoint(HandKeypointType.RingFingerDIP, centerX + scale * 0.2f, centerY - scale * 0.3f, 0, 0.95f));
-        keypoints.Add(new HandKeypoint(HandKeypointType.RingFingerTip, centerX + scale * 0.2f, centerY - scale * 0.6f, 0, 0.95f));
-
-        // 小指
-        keypoints.Add(new HandKeypoint(HandKeypointType.PinkyMCP, centerX + scale * 0.4f, centerY + scale * 0.3f, 0, 0.95f));
-        keypoints.Add(new HandKeypoint(HandKeypointType.PinkyPIP, centerX + scale * 0.5f, centerY + scale * 0.05f, 0, 0.95f));
-        keypoints.Add(new HandKeypoint(HandKeypointType.PinkyDIP, centerX + scale * 0.6f, centerY - scale * 0.2f, 0, 0.95f));
-        keypoints.Add(new HandKeypoint(HandKeypointType.PinkyTip, centerX + scale * 0.7f, centerY - scale * 0.45f, 0, 0.95f));
-
-        return keypoints;
     }
 
     /// <summary>
