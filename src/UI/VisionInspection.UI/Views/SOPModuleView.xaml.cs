@@ -7,8 +7,6 @@ using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
-using System.Windows.Shapes;
-using System.Windows.Threading;
 using VisionInspection.Core.Models;
 using VisionInspection.Core.Services;
 using VisionInspection.UI.Services;
@@ -24,18 +22,7 @@ namespace VisionInspection.UI.Views
     /// </summary>
     public partial class SOPModuleView : UserControl
     {
-        private List<SOPStepItem> _steps = new();
-        private int _currentStepIndex = -1;
-
-        // 生产统计（面板级，程序重启归零；完整历史以 sop_records/*.jsonl 为准）
-        private int _cycleCount;        // 已完成的完整 SOP 周期数（PASS + NG）
-        private int _ngCycleCount;      // 其中 NG（含违规）的周期数
-        private int _violationCount;    // 累计违规事件次数（一个周期可能多次违规）
-
-        // 计时器相关
-        private DispatcherTimer? _timer;
-        private DateTime _timerStartTime;
-        private bool _isTimerRunning = false;
+        public SopPanelViewModel Panel { get; } = new();
 
         // YAML工作流路径
         private string _currentYamlPath = "";
@@ -45,31 +32,6 @@ namespace VisionInspection.UI.Views
             InitializeComponent();
             LoadDefaultWorkflow();
             LoadRecipeList();
-            InitializeTimer();
-        }
-
-        /// <summary>
-        /// 初始化计时器
-        /// </summary>
-        private void InitializeTimer()
-        {
-            _timer = new DispatcherTimer
-            {
-                Interval = TimeSpan.FromMilliseconds(100) // 100ms更新一次
-            };
-            _timer.Tick += Timer_Tick;
-        }
-
-        /// <summary>
-        /// 计时器Tick事件
-        /// </summary>
-        private void Timer_Tick(object? sender, EventArgs e)
-        {
-            if (_isTimerRunning)
-            {
-                var elapsed = DateTime.Now - _timerStartTime;
-                TimerTextBlock.Text = FormatTimeSpan(elapsed);
-            }
         }
 
         /// <summary>
@@ -147,59 +109,6 @@ namespace VisionInspection.UI.Views
         }
 
         /// <summary>
-        /// 格式化时间显示
-        /// </summary>
-        private static string FormatTimeSpan(TimeSpan time)
-        {
-            if (time.TotalHours >= 1)
-                return $"{time.Hours:D2}:{time.Minutes:D2}:{time.Seconds:D2}";
-            else
-                return $"{time.Minutes:D2}:{time.Seconds:D2}";
-        }
-
-        /// <summary>
-        /// 格式化单步耗时（小于1秒显示毫秒，否则显示秒）
-        /// </summary>
-        private static string FormatStepDuration(TimeSpan duration)
-        {
-            if (duration.TotalSeconds < 1)
-                return $"{duration.TotalMilliseconds:F0}ms";
-            return $"{duration.TotalSeconds:F1}s";
-        }
-
-        /// <summary>
-        /// 开始计时
-        /// </summary>
-        public void StartTimer()
-        {
-            _timerStartTime = DateTime.Now;
-            _isTimerRunning = true;
-            _timer?.Start();
-            TimerTextBlock.Text = "00:00";
-            TimerTextBlock.Foreground = new SolidColorBrush(Color.FromRgb(250, 140, 22));
-        }
-
-        /// <summary>
-        /// 停止计时
-        /// </summary>
-        public void StopTimer()
-        {
-            _isTimerRunning = false;
-            _timer?.Stop();
-        }
-
-        /// <summary>
-        /// 重置计时器
-        /// </summary>
-        public void ResetTimer()
-        {
-            _isTimerRunning = false;
-            _timer?.Stop();
-            TimerTextBlock.Text = "00:00";
-            TimerTextBlock.Foreground = new SolidColorBrush(Colors.Gray);
-        }
-
-        /// <summary>
         /// 获取主视图模型
         /// </summary>
         private MainViewModel? GetMainViewModel()
@@ -264,9 +173,9 @@ namespace VisionInspection.UI.Views
         private void ShowNoRecipeHint(string reason)
         {
             _currentYamlPath = "";
-            _steps.Clear();
-            AddStep("!", "未加载任何 SOP 配方", reason, "⚠️", "no_recipe");
-            UpdateStepDisplay();
+            Panel.Steps.Clear();
+            AddStep("!", "未加载任何 SOP 配方", reason, "no_recipe");
+
             AddLog(reason);
         }
 
@@ -728,7 +637,7 @@ namespace VisionInspection.UI.Views
         /// </summary>
         private void LoadWorkflowSteps(SOPWorkflow workflow)
         {
-            _steps.Clear();
+            Panel.Steps.Clear();
 
             foreach (var step in workflow.Steps.OrderBy(s => s.Order))
             {
@@ -736,37 +645,15 @@ namespace VisionInspection.UI.Views
                     step.StepId.ToString(),
                     step.StepName,
                     step.Description ?? "",
-                    GetStepIcon(step.Order),
                     step.StepId.ToString()
                 );
             }
-
-            UpdateStepDisplay();
-        }
-
-        /// <summary>
-        /// 获取步骤图标
-        /// </summary>
-        private static string GetStepIcon(int order)
-        {
-            return order switch
-            {
-                1 => "1️⃣",
-                2 => "2️⃣",
-                3 => "3️⃣",
-                4 => "4️⃣",
-                5 => "5️⃣",
-                6 => "6️⃣",
-                7 => "7️⃣",
-                8 => "8️⃣",
-                _ => "📋"
-            };
         }
 
         /// <summary>
         /// 添加步骤
         /// </summary>
-        public void AddStep(string stepNumber, string name, string description, string icon, string? id = null)
+        public void AddStep(string stepNumber, string name, string description, string? id = null)
         {
             var stepItem = new SOPStepItem
             {
@@ -774,407 +661,9 @@ namespace VisionInspection.UI.Views
                 StepNumber = stepNumber,
                 Name = name,
                 Description = description,
-                Icon = icon,
                 Status = StepStatus.Pending
             };
-            _steps.Add(stepItem);
-        }
-
-        /// <summary>
-        /// 更新步骤显示
-        /// </summary>
-        private void UpdateStepDisplay()
-        {
-            StepsPanel.Children.Clear();
-
-            for (int i = 0; i < _steps.Count; i++)
-            {
-                var step = _steps[i];
-                var stepControl = CreateStepControl(step, i == _steps.Count - 1);
-                StepsPanel.Children.Add(stepControl);
-            }
-        }
-
-        /// <summary>
-        /// 创建步骤控件 - 水平列表样式
-        /// </summary>
-        private Border CreateStepControl(SOPStepItem step, bool isLast)
-        {
-            var border = new Border
-            {
-                Background = GetStepBackground(step.Status),
-                BorderBrush = GetStepBorderBrush(step.Status),
-                BorderThickness = new Thickness(1),
-                CornerRadius = new CornerRadius(6),
-                Margin = new Thickness(0, 0, 0, isLast ? 0 : 8),
-                Padding = new Thickness(12, 10, 12, 10),
-                Cursor = System.Windows.Input.Cursors.Hand
-            };
-
-            var grid = new Grid();
-            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });      // 编号
-            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) }); // 名称
-            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });      // 状态
-
-            // 左侧：步骤编号圆形背景
-            var numberBorder = new Border
-            {
-                Background = GetStepNumberBackground(step.Status),
-                Width = 28,
-                Height = 28,
-                CornerRadius = new CornerRadius(14),
-                Child = new TextBlock
-                {
-                    Text = step.StepNumber,
-                    FontSize = 13,
-                    FontWeight = FontWeights.Bold,
-                    Foreground = GetStepNumberForeground(step.Status),
-                    HorizontalAlignment = HorizontalAlignment.Center,
-                    VerticalAlignment = VerticalAlignment.Center
-                },
-                VerticalAlignment = VerticalAlignment.Center
-            };
-            Grid.SetColumn(numberBorder, 0);
-            grid.Children.Add(numberBorder);
-
-            // 中间：步骤名称和描述
-            var contentPanel = new StackPanel 
-            { 
-                Margin = new Thickness(12, 0, 0, 0),
-                VerticalAlignment = VerticalAlignment.Center
-            };
-            var nameText = new TextBlock
-            {
-                Text = step.Name,
-                FontSize = 14,
-                FontWeight = FontWeights.Bold,
-                Foreground = GetStepForeground(step.Status)
-            };
-            var descText = new TextBlock
-            {
-                Text = step.Description,
-                FontSize = 11,
-                Foreground = new SolidColorBrush(Colors.Gray),
-                TextTrimming = TextTrimming.CharacterEllipsis,
-                Margin = new Thickness(0, 2, 0, 0)
-            };
-            contentPanel.Children.Add(nameText);
-            contentPanel.Children.Add(descText);
-            Grid.SetColumn(contentPanel, 1);
-            grid.Children.Add(contentPanel);
-
-            // 右侧：状态指示器 + 单步耗时
-            var rightPanel = new StackPanel
-            {
-                Orientation = Orientation.Vertical,
-                HorizontalAlignment = HorizontalAlignment.Center,
-                VerticalAlignment = VerticalAlignment.Center
-            };
-            var statusIndicator = CreateHorizontalStatusIndicator(step.Status);
-            rightPanel.Children.Add(statusIndicator);
-
-            if (step.Duration > TimeSpan.Zero)
-            {
-                var durationText = new TextBlock
-                {
-                    Text = FormatStepDuration(step.Duration),
-                    FontSize = 10,
-                    Foreground = new SolidColorBrush(Colors.Gray),
-                    HorizontalAlignment = HorizontalAlignment.Center,
-                    Margin = new Thickness(0, 4, 0, 0)
-                };
-                rightPanel.Children.Add(durationText);
-            }
-            Grid.SetColumn(rightPanel, 2);
-            grid.Children.Add(rightPanel);
-
-            border.Child = grid;
-            return border;
-        }
-
-        /// <summary>
-        /// 创建水平状态指示器
-        /// </summary>
-        private UIElement CreateHorizontalStatusIndicator(StepStatus status)
-        {
-            var panel = new StackPanel 
-            { 
-                Orientation = Orientation.Horizontal,
-                VerticalAlignment = VerticalAlignment.Center
-            };
-
-            switch (status)
-            {
-                case StepStatus.Completed:
-                    panel.Children.Add(new Border
-                    {
-                        Background = new SolidColorBrush(Color.FromRgb(82, 196, 26)),
-                        CornerRadius = new CornerRadius(10),
-                        Padding = new Thickness(8, 3, 8, 3),
-                        Child = new TextBlock
-                        {
-                            Text = "OK",
-                            FontSize = 11,
-                            Foreground = new SolidColorBrush(Colors.White),
-                            FontWeight = FontWeights.Bold
-                        }
-                    });
-                    break;
-                case StepStatus.Running:
-                    panel.Children.Add(new Border
-                    {
-                        Background = new SolidColorBrush(Color.FromRgb(24, 144, 255)),
-                        CornerRadius = new CornerRadius(10),
-                        Padding = new Thickness(8, 3, 8, 3),
-                        Child = new TextBlock
-                        {
-                            Text = "进行中",
-                            FontSize = 11,
-                            Foreground = new SolidColorBrush(Colors.White),
-                            FontWeight = FontWeights.Bold
-                        }
-                    });
-                    break;
-                case StepStatus.Failed:
-                    panel.Children.Add(new Border
-                    {
-                        Background = new SolidColorBrush(Color.FromRgb(255, 77, 79)),
-                        CornerRadius = new CornerRadius(10),
-                        Padding = new Thickness(8, 3, 8, 3),
-                        Child = new TextBlock
-                        {
-                            Text = "NG",
-                            FontSize = 11,
-                            Foreground = new SolidColorBrush(Colors.White),
-                            FontWeight = FontWeights.Bold
-                        }
-                    });
-                    break;
-                default:
-                    panel.Children.Add(new TextBlock
-                    {
-                        Text = "待执行",
-                        FontSize = 11,
-                        Foreground = new SolidColorBrush(Colors.Gray),
-                        VerticalAlignment = VerticalAlignment.Center
-                    });
-                    break;
-            }
-
-            return panel;
-        }
-
-        /// <summary>
-        /// 获取步骤编号背景色
-        /// </summary>
-        private Brush GetStepNumberBackground(StepStatus status)
-        {
-            return status switch
-            {
-                StepStatus.Completed => new SolidColorBrush(Color.FromRgb(82, 196, 26)),
-                StepStatus.Running => new SolidColorBrush(Color.FromRgb(24, 144, 255)),
-                StepStatus.Failed => new SolidColorBrush(Color.FromRgb(255, 77, 79)),
-                _ => new SolidColorBrush(Color.FromRgb(217, 217, 217))
-            };
-        }
-
-        /// <summary>
-        /// 获取步骤编号前景色
-        /// </summary>
-        private Brush GetStepNumberForeground(StepStatus status)
-        {
-            return status switch
-            {
-                StepStatus.Pending => new SolidColorBrush(Colors.Gray),
-                _ => new SolidColorBrush(Colors.White)
-            };
-        }
-
-        /// <summary>
-        /// 创建紧凑状态指示器
-        /// </summary>
-        private UIElement CreateCompactStatusIndicator(StepStatus status)
-        {
-            return status switch
-            {
-                StepStatus.Completed => new TextBlock
-                {
-                    Text = "OK",
-                    FontSize = 11,
-                    Foreground = new SolidColorBrush(Color.FromRgb(82, 196, 26)),
-                    FontWeight = FontWeights.Bold,
-                    VerticalAlignment = VerticalAlignment.Center
-                },
-                StepStatus.Running => new Border
-                {
-                    Width = 8,
-                    Height = 8,
-                    Background = new SolidColorBrush(Color.FromRgb(24, 144, 255)),
-                    CornerRadius = new CornerRadius(4)
-                },
-                StepStatus.Failed => new TextBlock
-                {
-                    Text = "NG",
-                    FontSize = 11,
-                    Foreground = new SolidColorBrush(Color.FromRgb(255, 77, 79)),
-                    FontWeight = FontWeights.Bold,
-                    VerticalAlignment = VerticalAlignment.Center
-                },
-                _ => new TextBlock
-                {
-                    Text = "待",
-                    FontSize = 11,
-                    Foreground = new SolidColorBrush(Colors.Gray),
-                    VerticalAlignment = VerticalAlignment.Center
-                }
-            };
-        }
-
-        /// <summary>
-        /// 创建状态指示器
-        /// </summary>
-        private UIElement CreateStatusIndicator(StepStatus status)
-        {
-            return status switch
-            {
-                StepStatus.Completed => new TextBlock
-                {
-                    Text = "✓",
-                    FontSize = 24,
-                    Foreground = new SolidColorBrush(Colors.Green),
-                    FontWeight = FontWeights.Bold
-                },
-                StepStatus.Running => CreateProgressRing(),
-                StepStatus.Failed => new TextBlock
-                {
-                    Text = "✗",
-                    FontSize = 24,
-                    Foreground = new SolidColorBrush(Colors.Red),
-                    FontWeight = FontWeights.Bold
-                },
-                _ => new TextBlock
-                {
-                    Text = "○",
-                    FontSize = 24,
-                    Foreground = new SolidColorBrush(Colors.LightGray)
-                }
-            };
-        }
-
-        /// <summary>
-        /// 创建进度环
-        /// </summary>
-        private UIElement CreateProgressRing()
-        {
-            // 使用简单的旋转动画替代ProgressBarRing样式
-            var grid = new Grid
-            {
-                Width = 40,
-                Height = 40
-            };
-
-            // 外圈
-            var ellipse = new System.Windows.Shapes.Ellipse
-            {
-                Width = 32,
-                Height = 32,
-                Stroke = new SolidColorBrush(Color.FromRgb(24, 144, 255)),
-                StrokeThickness = 3,
-                StrokeDashArray = new DoubleCollection { 10, 5 },
-                HorizontalAlignment = HorizontalAlignment.Center,
-                VerticalAlignment = VerticalAlignment.Center
-            };
-
-            // 旋转动画
-            var rotateTransform = new RotateTransform(0, 16, 16);
-            ellipse.RenderTransform = rotateTransform;
-
-            var animation = new System.Windows.Media.Animation.DoubleAnimation
-            {
-                From = 0,
-                To = 360,
-                Duration = TimeSpan.FromSeconds(1),
-                RepeatBehavior = System.Windows.Media.Animation.RepeatBehavior.Forever
-            };
-
-            rotateTransform.BeginAnimation(RotateTransform.AngleProperty, animation);
-
-            grid.Children.Add(ellipse);
-            return grid;
-        }
-
-        /// <summary>
-        /// 获取步骤背景色
-        /// </summary>
-        private Brush GetStepBackground(StepStatus status)
-        {
-            return status switch
-            {
-                StepStatus.Completed => new SolidColorBrush(Color.FromRgb(246, 255, 237)),
-                StepStatus.Running => new SolidColorBrush(Color.FromRgb(230, 247, 255)),
-                StepStatus.Failed => new SolidColorBrush(Color.FromRgb(255, 241, 240)),
-                _ => new SolidColorBrush(Colors.White)
-            };
-        }
-
-        /// <summary>
-        /// 获取步骤边框颜色
-        /// </summary>
-        private Brush GetStepBorderBrush(StepStatus status)
-        {
-            return status switch
-            {
-                StepStatus.Completed => new SolidColorBrush(Color.FromRgb(183, 235, 143)),
-                StepStatus.Running => new SolidColorBrush(Color.FromRgb(145, 213, 255)),
-                StepStatus.Failed => new SolidColorBrush(Color.FromRgb(255, 163, 158)),
-                _ => new SolidColorBrush(Color.FromRgb(217, 217, 217))
-            };
-        }
-
-        /// <summary>
-        /// 获取步骤前景色
-        /// </summary>
-        private Brush GetStepForeground(StepStatus status)
-        {
-            return status switch
-            {
-                StepStatus.Completed => new SolidColorBrush(Color.FromRgb(82, 196, 26)),
-                StepStatus.Running => new SolidColorBrush(Color.FromRgb(24, 144, 255)),
-                StepStatus.Failed => new SolidColorBrush(Color.FromRgb(255, 77, 79)),
-                _ => new SolidColorBrush(Color.FromRgb(102, 102, 102))
-            };
-        }
-
-        /// <summary>
-        /// 设置当前步骤
-        /// </summary>
-        public void SetCurrentStep(int stepIndex)
-        {
-            _currentStepIndex = stepIndex;
-            for (int i = 0; i < _steps.Count; i++)
-            {
-                if (i < stepIndex)
-                    _steps[i].Status = StepStatus.Completed;
-                else if (i == stepIndex)
-                    _steps[i].Status = StepStatus.Running;
-                else
-                    _steps[i].Status = StepStatus.Pending;
-            }
-            UpdateStepDisplay();
-            StepTextBlock.Text = $"{stepIndex + 1}/{_steps.Count}";
-        }
-
-        /// <summary>
-        /// 设置步骤结果
-        /// </summary>
-        public void SetStepResult(int stepIndex, bool success, string message = "")
-        {
-            if (stepIndex >= 0 && stepIndex < _steps.Count)
-            {
-                _steps[stepIndex].Status = success ? StepStatus.Completed : StepStatus.Failed;
-                _steps[stepIndex].ResultMessage = message;
-                UpdateStepDisplay();
-            }
+            Panel.Steps.Add(stepItem);
         }
 
         /// <summary>
@@ -1186,30 +675,6 @@ namespace VisionInspection.UI.Views
         {
             var timestamp = DateTime.Now.ToString("HH:mm:ss");
             SopRunLog.Instance.Append($"[{timestamp}] {message}");
-        }
-
-        /// <summary>
-        /// 设置状态
-        /// </summary>
-        public void SetStatus(string status, Brush? foreground = null)
-        {
-            StatusTextBlock.Text = status;
-            if (foreground != null)
-            {
-                StatusTextBlock.Foreground = foreground;
-            }
-        }
-
-        /// <summary>
-        /// 设置检测结果
-        /// </summary>
-        public void SetResult(string result, Brush? foreground = null)
-        {
-            ResultTextBlock.Text = result;
-            if (foreground != null)
-            {
-                ResultTextBlock.Foreground = foreground;
-            }
         }
 
         /// <summary>
@@ -1313,7 +778,6 @@ namespace VisionInspection.UI.Views
             }
         }
 
-
         /// <summary>
         /// 运行按钮点击
         /// </summary>
@@ -1331,9 +795,9 @@ namespace VisionInspection.UI.Views
             if (viewModel.IsSOPDetecting)
             {
                 await viewModel.StopSOPDetectionAsync();
-                SetStatus("检测已停止", new SolidColorBrush(Colors.Gray));
-                SetResult("--", new SolidColorBrush(Colors.Gray));
-                StopTimer();
+                Panel.SetStatus("检测已停止", new SolidColorBrush(Colors.Gray));
+                Panel.SetResult("--", new SolidColorBrush(Colors.Gray));
+                Panel.StopTimer();
                 ThumbnailImage.Source = null;
                 ThumbnailPlaceholder.Visibility = Visibility.Visible;
                 UpdateRunButtonState(false);
@@ -1342,7 +806,7 @@ namespace VisionInspection.UI.Views
             }
 
             // 启动 SOP 实时检测
-            SetStatus("启动中...", new SolidColorBrush(Color.FromRgb(24, 144, 255)));
+            Panel.SetStatus("启动中...", new SolidColorBrush(Color.FromRgb(24, 144, 255)));
             AddLog("正在启动 SOP 实时检测...");
 
             // 传递当前YAML工作流路径给MainViewModel
@@ -1353,17 +817,17 @@ namespace VisionInspection.UI.Views
             // 更新 UI 状态
             if (viewModel.IsSOPDetecting)
             {
-                SetStatus("实时检测中", new SolidColorBrush(Color.FromRgb(82, 196, 26)));
-                SetResult("检测中...", new SolidColorBrush(Colors.Gray));
+                Panel.SetStatus("实时检测中", new SolidColorBrush(Color.FromRgb(82, 196, 26)));
+                Panel.SetResult("检测中...", new SolidColorBrush(Colors.Gray));
                 ClearStepDurations();
-                StartTimer();
+                Panel.StartTimer();
                 UpdateRunButtonState(true);
                 AddLog("SOP 实时检测已启动");
             }
             else
             {
-                SetStatus("启动失败", new SolidColorBrush(Colors.Red));
-                SetResult("NG", new SolidColorBrush(Colors.Red));
+                Panel.SetStatus("启动失败", new SolidColorBrush(Colors.Red));
+                Panel.SetResult("NG", new SolidColorBrush(Colors.Red));
                 UpdateRunButtonState(false);
                 AddLog("SOP 实时检测启动失败");
             }
@@ -1450,11 +914,11 @@ namespace VisionInspection.UI.Views
 
                 // 3) 复位界面：步骤状态、耗时、计时器、结果与总状态
                 ResetStepDisplayState();
-                _currentStepIndex = -1;
-                ResetTimer();
 
-                SetStatus("已复位", new SolidColorBrush(Colors.Gray));
-                SetResult("--", new SolidColorBrush(Colors.Gray));
+                Panel.ResetTimer();
+
+                Panel.SetStatus("已复位", new SolidColorBrush(Colors.Gray));
+                Panel.SetResult("--", new SolidColorBrush(Colors.Gray));
 
                 UpdateRunButtonState(false);
                 AddLog("🔄 SOP 流程已复位，从第一步重新开始");
@@ -1475,13 +939,11 @@ namespace VisionInspection.UI.Views
         /// </summary>
         private void ResetStepDisplayState()
         {
-            foreach (var step in _steps)
+            foreach (var step in Panel.Steps)
             {
                 step.Status = StepStatus.Pending;
-                step.ResultMessage = string.Empty;
                 step.Duration = TimeSpan.Zero;
             }
-            UpdateStepDisplay();
         }
 
         /// <summary>
@@ -1494,31 +956,30 @@ namespace VisionInspection.UI.Views
         /// </summary>
         private void OnSOPWorkflowCompleted(object? sender, VisionInspection.Modules.SOP.Models.SOPCompletedEventArgs e)
         {
-            Dispatcher.Invoke(() =>
+            Dispatcher.BeginInvoke(() =>
             {
-                StopTimer();
+                Panel.StopTimer();
                 // 将步骤时间轴的耗时统计合并到上方流程卡片
-                SyncStepDurationsFromStateMachine();
+                Panel.SyncDurations(e.StepHistory);
                 var isPass = !e.HasViolations;
 
                 // ⭐ 统计：一个完整周期结束（PASS / NG 都计入循环次数）
-                _cycleCount++;
-                if (!isPass) _ngCycleCount++;
-                UpdateCycleStats();
+                Panel.CycleCount++;
+                if (!isPass) Panel.NgCycleCount++;
 
                 if (isPass)
                 {
-                    SetResult("PASS", new SolidColorBrush(Color.FromRgb(82, 196, 26)));
-                    SetStatus("检测完成", new SolidColorBrush(Color.FromRgb(82, 196, 26)));
-                    AddLog($"✅ SOP 检测全部通过 | 总耗时: {TimerTextBlock.Text}");
+                    Panel.SetResult("PASS", new SolidColorBrush(Color.FromRgb(82, 196, 26)));
+                    Panel.SetStatus("检测完成", new SolidColorBrush(Color.FromRgb(82, 196, 26)));
+                    AddLog($"✅ SOP 检测全部通过 | 总耗时: {Panel.ElapsedText}");
                     // 缩略图由各步成功事件 OnSOPStepCompleted 逐步刷新（末步成功也会刷新），
                     // 此处不再整体刷新，避免重复。
                 }
                 else
                 {
-                    SetResult("FAIL", new SolidColorBrush(Colors.Red));
-                    SetStatus("检测失败", new SolidColorBrush(Colors.Red));
-                    AddLog($"❌ SOP 检测不通过，违规数: {e.Violations.Count} | 总耗时: {TimerTextBlock.Text}");
+                    Panel.SetResult("FAIL", new SolidColorBrush(Colors.Red));
+                    Panel.SetStatus("检测失败", new SolidColorBrush(Colors.Red));
+                    AddLog($"❌ SOP 检测不通过，违规数: {e.Violations.Count} | 总耗时: {Panel.ElapsedText}");
                     // 违规（NG）自动保存当前帧截图，作为证据留存
                     SaveViolationSnapshot(e);
                 }
@@ -1526,9 +987,9 @@ namespace VisionInspection.UI.Views
                 // ⭐ 修复：最后一步完成时 SOPStateMachine.CompleteCurrentStep 走 Completed 分支，
                 // 不会触发 StepChanged 事件；这里手动把最后一步 UI 标为 Completed，
                 // 否则步骤 5 会一直显示"进行中"。
-                if (_steps.Count > 0)
+                if (Panel.Steps.Count > 0)
                 {
-                    SetStepResult(_steps.Count - 1, isPass);
+                    Panel.SetStepResult(Panel.Steps.Count - 1, isPass);
                 }
             });
         }
@@ -1538,32 +999,15 @@ namespace VisionInspection.UI.Views
         /// </summary>
         private void OnSOPViolationDetected(object? sender, VisionInspection.Modules.SOP.Models.ViolationEventArgs e)
         {
-            Dispatcher.Invoke(() =>
+            Dispatcher.BeginInvoke(() =>
             {
-                SetResult("NG", new SolidColorBrush(Colors.Red));
+                Panel.SetResult("NG", new SolidColorBrush(Colors.Red));
 
                 // ⭐ 统计：违规事件累计（同一周期可能触发多次）
-                _violationCount++;
-                UpdateCycleStats();
+                Panel.ViolationCount++;
 
                 AddLog($"⚠ 违规: [{e.Violation.Type}] {e.Violation.Description}");
             });
-        }
-
-        /// <summary>
-        /// 刷新「循环次数 / 违规次数」显示，并在 ToolTip 里给出 OK/NG 细分。
-        /// </summary>
-        private void UpdateCycleStats()
-        {
-            CycleCountTextBlock.Text = _cycleCount.ToString();
-            ViolationCountTextBlock.Text = _violationCount.ToString();
-
-            int okCycles = _cycleCount - _ngCycleCount;
-            double yield = _cycleCount > 0 ? okCycles * 100.0 / _cycleCount : 0;
-            string tip = $"完成周期 {_cycleCount} 次（OK {okCycles} / NG {_ngCycleCount}，良率 {yield:F1}%）\n" +
-                         $"违规事件 {_violationCount} 次\n双击可清零统计（复位不清零，换配方自动清零）";
-            CycleCountTextBlock.ToolTip = tip;
-            ViolationCountTextBlock.ToolTip = tip;
         }
 
         /// <summary>
@@ -1572,10 +1016,10 @@ namespace VisionInspection.UI.Views
         /// </summary>
         private void ResetCycleStats(bool silent = false)
         {
-            _cycleCount = 0;
-            _ngCycleCount = 0;
-            _violationCount = 0;
-            UpdateCycleStats();
+            Panel.CycleCount = 0;
+            Panel.NgCycleCount = 0;
+            Panel.ViolationCount = 0;
+
             if (!silent) AddLog("🧮 循环/违规统计已清零");
         }
 
@@ -1638,12 +1082,13 @@ namespace VisionInspection.UI.Views
         /// </summary>
         private void OnSOPStepChanged(object? sender, VisionInspection.Modules.SOP.Models.StepChangedEventArgs e)
         {
-            Dispatcher.Invoke(() =>
+            var history = ((SOPModule)sender!).StateMachine!.StepHistory.ToArray();
+            Dispatcher.BeginInvoke(() =>
             {
-                SetCurrentStep(e.CurrentStepId - 1); // 转换为0-based索引
+                Panel.SetCurrentStep(e.CurrentStepId);
                 AddLog($"步骤推进: {e.PreviousStepId} → {e.CurrentStepId} ({e.StepName})");
                 // 同步已结束步骤的耗时到对应卡片
-                SyncStepDurationsFromStateMachine();
+                Panel.SyncDurations(history);
             });
         }
 
@@ -1654,7 +1099,7 @@ namespace VisionInspection.UI.Views
         /// </summary>
         private void OnSOPStepCompleted(object? sender, VisionInspection.Modules.SOP.Models.StepCompletedEventArgs e)
         {
-            Dispatcher.Invoke(() =>
+            Dispatcher.BeginInvoke(() =>
             {
                 if (e.HasViolations) return;
                 RefreshThumbnailFromCurrentFrame();
@@ -1662,118 +1107,17 @@ namespace VisionInspection.UI.Views
             });
         }
 
-        /// <summary>
-        /// 运行模拟
-        /// </summary>
-        private async void RunSimulation()
-        {
-            SetStatus("运行中", new SolidColorBrush(Color.FromRgb(24, 144, 255)));
-            SetResult("检测中...", new SolidColorBrush(Colors.Gray));
-            AddLog("开始SOP检测流程...");
-
-            for (int i = 0; i < _steps.Count; i++)
-            {
-                SetCurrentStep(i);
-                AddLog($"执行步骤 {i + 1}: {_steps[i].Name}...");
-
-                // 模拟处理时间
-                await System.Threading.Tasks.Task.Delay(1500);
-
-                // 模拟结果（90%成功率）
-                var success = new Random().Next(10) > 0;
-                SetStepResult(i, success, success ? "成功" : "失败");
-
-                if (success)
-                {
-                    AddLog($"步骤 {i + 1} 完成: {_steps[i].Name}");
-                }
-                else
-                {
-                    AddLog($"步骤 {i + 1} 失败: {_steps[i].Name}");
-                    SetStatus("检测失败", new SolidColorBrush(Colors.Red));
-                    SetResult("NG", new SolidColorBrush(Colors.Red));
-                    return;
-                }
-            }
-
-            SetStatus("检测完成", new SolidColorBrush(Color.FromRgb(82, 196, 26)));
-            SetResult("OK", new SolidColorBrush(Color.FromRgb(82, 196, 26)));
-            AddLog("SOP检测流程完成，结果: OK");
-        }
-
         #region 步骤耗时同步
-
-        /// <summary>
-        /// 从 SOP 状态机 StepHistory 同步各步骤实际耗时到上方流程卡片
-        /// </summary>
-        private void SyncStepDurationsFromStateMachine()
-        {
-            var vm = GetMainViewModel();
-            var history = vm?.SOPModuleInstance?.StateMachine?.StepHistory;
-            if (history == null) return;
-
-            bool changed = false;
-            foreach (var record in history)
-            {
-                var idx = record.StepId - 1;
-                if (idx >= 0 && idx < _steps.Count && _steps[idx].Duration != record.Duration)
-                {
-                    _steps[idx].Duration = record.Duration;
-                    changed = true;
-                }
-            }
-
-            if (changed)
-                UpdateStepDisplay();
-        }
 
         /// <summary>
         /// 清空所有步骤的耗时显示（每次重新运行前调用）
         /// </summary>
         private void ClearStepDurations()
         {
-            bool changed = false;
-            foreach (var step in _steps)
-            {
-                if (step.Duration > TimeSpan.Zero)
-                {
-                    step.Duration = TimeSpan.Zero;
-                    changed = true;
-                }
-            }
-
-            if (changed)
-                UpdateStepDisplay();
+            foreach (var step in Panel.Steps) step.Duration = TimeSpan.Zero;
         }
 
         #endregion
-    }
-
-    /// <summary>
-    /// SOP步骤项
-    /// </summary>
-    public class SOPStepItem
-    {
-        public string Id { get; set; } = "";
-        public string StepNumber { get; set; } = "";
-        public string Name { get; set; } = "";
-        public string Description { get; set; } = "";
-        public string Icon { get; set; } = "";
-        public StepStatus Status { get; set; }
-        public string ResultMessage { get; set; } = "";
-        /// <summary>该步骤实际耗时（从状态机 StepHistory 同步）</summary>
-        public TimeSpan Duration { get; set; }
-    }
-
-    /// <summary>
-    /// 步骤状态
-    /// </summary>
-    public enum StepStatus
-    {
-        Pending,
-        Running,
-        Completed,
-        Failed
     }
 
     /// <summary>
