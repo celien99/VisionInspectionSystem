@@ -71,14 +71,15 @@ The intended boundary is that SOP/UI consume domain types (`DetectedObject`, `Ha
 
 ## Runtime architecture
 
-**Startup:** `App.xaml.cs` installs crash handlers, writes `logs/startup.log` (`AppPaths.Describe()`), opens `LoginWindow` (SQLite users in `data/users.db`), then `MainWindow`/`MainViewModel`, then starts the Modbus singleton. There is no DI container; `MainViewModel` constructs services, and `CameraManager.Instance` / `ModbusService.Instance` / `RegionConfigManager.Instance` are singletons.
+**Startup:** `App.xaml.cs` installs crash handlers, writes `logs/startup.log` (`AppPaths.Describe()`), opens `LoginWindow` (SQLite users in `data/users.db`), then `MainWindow`/`MainViewModel`, then starts the Modbus singleton. There is no DI container; `MainViewModel` constructs services, shares one in-flight SOP startup task and waits for it during background disposal, and `CameraManager.Instance` / `ModbusService.Instance` / `RegionConfigManager.Instance` are singletons.
 
 **Frame pipeline (the non-obvious part):**
 
-1. Camera SDK callback (`OnCameraFrameGrabbed`) only enqueues into a capacity-1 `DropOldest` preview channel.
-2. `StartPreviewWorker` converts to `SKBitmap`, fans each frame into a per-camera capacity-1 inference channel, and renders the latest frame with cached overlays.
-3. `StartInferenceWorker` consumes per-camera frames, builds `Dictionary<string, CaptureFrame>`, and calls `SOPModule.ProcessAsync`.
-4. Results are cached (`_lastSopResult`, `_perCameraLastResults`, `_lastHandPoseResult`) and drawn onto the **next newest camera frame**, never onto the old inference frame. This avoids flicker/backtracking. `DetectionTrackSmoother` does IOU tracking + EMA smoothing before rendering.
+1. `CameraFramePipeline` owns the camera callback subscription, capacity-1 preview channel and preview worker (25 fps cap).
+2. `MainViewModel.RenderPreview` converts to `SKBitmap`, submits a copy for inference, and renders the newest frame with cached overlays.
+3. The pipeline keeps one pending bitmap per camera; replacement disposes the previous bitmap immediately. A single inference worker updates the latest per-camera frames and calls `MainViewModel.ProcessCameraFramesAsync` for SOP or regular detection. Stop waits for the worker before disposing its frames.
+4. `DetectionOverlayRenderer` owns SOP overlay caches and draws them onto the **next newest camera frame**. `DetectionTrackSmoother` handles regular detection tracking and EMA smoothing. `SopAudioFeedback` owns cached NAudio players and releases them at shutdown.
+5. `SopPanelViewModel` owns step-card state, elapsed time and production counters; `SOPModuleView` binds cards through an `ItemsControl` template. Workflow-completion events hold snapshots so automatic reset cannot erase queued UI results.
 
 Do not block the camera callback thread, and remember that YoloDotNet reuses its result `List` — copy detection results immediately (`ToList()`) before caching.
 
@@ -94,9 +95,9 @@ Important engine semantics:
 - The state machine evaluates against the **current step's designated camera** (`step.camera`, default `main_camera`) with **no cross-camera fallback**.
 - `hand_action` in YAML maps onto `HandMoveFromTo`; `pickup` means "the hand holds the target object while the hand or the object is currently in `from_region`", `putdown` means "the object (or the hand carrying it) reached `to_region` after visiting `from_region`".
 
-**Hand detection:** `HandDetectionBackend` is `MediaPipe` (default, two-stage palm→landmark), `YoloPose` (YOLOv8-pose wrist + MediaPipe landmark), or `Auto`. The service is lazily initialized on first use, with a 10-second retry backoff after failure. Hand defaults live in `configs/sop_config.json`. In-app edits go through `UpdateHandPoseConfig` and take effect at runtime, but the hand-params window does not persist them (only the GPU toggle writes `sop_config.json` back). `SOPModule` clones the full config when rebuilding the service — partial clones previously caused UI-tuned parameters to silently revert to defaults.
+**Hand detection:** `HandDetectionBackend` is `MediaPipe` (default, two-stage palm→landmark), `YoloPose` (YOLOv8-pose wrist + MediaPipe landmark), or `Auto`. The service is lazily initialized on first use, with a 10-second retry backoff after failure. Hand defaults live in `configs/sop_config.json`. In-app edits pass the same `HandPoseEstimationConfig` through the view and `MainViewModel.ApplySopConfigurationAsync`; `UpdateHandPoseConfigAsync` waits for the old service to shut down before rebuilding it. The UI retains a complete config snapshot for the current session; only the main GPU toggle writes `sop_config.json` back. `SOPModule` clones the full config when rebuilding the service — partial clones previously caused UI-tuned parameters to silently revert to defaults.
 
-**Multi-camera:** slots are `main_camera`, `cam_2`…`cam_4` (max 4). Each step may specify `camera` and `model`, and `SOPModule` lazily caches per-model `YoloModel` instances. `cross_camera` rules in YAML are evaluated by `CrossCameraEvaluator` against `PerCameraDetections`; `monitoring` (helmet) rules are evaluated in `MainViewModel`.
+**Multi-camera:** slots are `main_camera`, `cam_2`…`cam_4` (max 4). Each step may specify `camera` and `model`, and `SOPModule` lazily caches per-model `YoloModel` instances. `cross_camera` rules in YAML are evaluated by `CrossCameraEvaluator` against `PerCameraDetections`; `monitoring` (helmet) rules are evaluated by `RegionMonitoringEvaluator`. `SOPModule.ProcessAsync` owns both evaluations and returns alerts for UI presentation; monitoring alerts do not change step violations.
 
 **Modbus:** `ModbusService` is a singleton. Rising edge on input X1 (register 0) starts the loaded workflow when idle. Step-level `modbus_trigger` writes FC06 to Y1–Y8 with pulse/latch semantics; latched outputs are released via `ReleaseLatch`/`ReleaseAllLatches`.
 
@@ -126,7 +127,9 @@ Runtime output locations (not in git):
 
 | Concern | Primary file(s) |
 |---|---|
-| UI state, frame pipeline, alarms, audio | `src/UI/VisionInspection.UI/ViewModels/MainViewModel.cs` |
+| UI commands and detection control | `src/UI/VisionInspection.UI/ViewModels/MainViewModel.cs` |
+| Camera workers, overlays, audio | `src/UI/VisionInspection.UI/Services/CameraFramePipeline.cs`, `DetectionOverlayRenderer.cs`, `SopAudioFeedback.cs` |
+| SOP panel state and counters | `src/UI/VisionInspection.UI/ViewModels/SopPanelViewModel.cs` |
 | SOP module façade: model cache, hand init, workflow start | `src/Modules/VisionInspection.Modules.SOP/SOPModule.cs` |
 | State machine / conditions / violations | `src/Modules/VisionInspection.Modules.SOP/Models/SOPStateMachine.cs`, `.../Services/StepConditionEvaluator.cs`, `.../Services/ViolationDetector.cs` |
 | YAML DTOs and two-way conversion | `src/Modules/VisionInspection.Modules.SOP/Models/SOPYamlConfig.cs` |
