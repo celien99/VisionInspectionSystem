@@ -244,7 +244,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         bool isPrimary = string.Equals(e.CameraId, CameraManager.PrimaryCameraId, StringComparison.OrdinalIgnoreCase);
 
         if (IsSOPDetecting || IsRealTimeDetecting)
-            _framePipeline.EnqueueInference(e.CameraId, skBitmap);
+            _framePipeline.EnqueueInference(e.CameraId, skBitmap, e.Timestamp);
 
         if (IsSOPDetecting)
         {

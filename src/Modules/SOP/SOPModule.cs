@@ -544,23 +544,14 @@ public class SOPModule : IDetectionModule
                     return Task.FromResult<ModuleResult>(result);
                 }
 
-                var mainFrame = frames.FirstOrDefault(f => f.Key == "main_camera").Value;
-                if (mainFrame == null)
-                {
-                    result.Success = false;
-                    result.ErrorMessage = "未找到主相机帧";
-                    result.Level = DefectLevel.Critical;
-                    return Task.FromResult<ModuleResult>(result);
-                }
-
-                ProcessMultiCameraFrames(frames, result);
+                var timestamp = frames.Values.Max(frame => frame.Timestamp);
+                ProcessMultiCameraFrames(frames, result, timestamp);
                 if (_currentWorkflow is { } workflow)
                 {
-                    var now = DateTime.Now;
-                    result.RegionAlert = _regionMonitoring.Evaluate(result.Detections, workflow, now);
+                    result.RegionAlert = _regionMonitoring.Evaluate(result.PerCameraDetections, workflow, timestamp);
                     if (workflow.CrossCamera is { } crossCamera)
                         result.CrossCameraAlert = _crossEvaluator.Evaluate(result.PerCameraDetections,
-                            workflow.Regions, crossCamera, now);
+                            workflow.Regions, crossCamera, timestamp);
                 }
 
                 stopwatch.Stop();
@@ -589,17 +580,14 @@ public class SOPModule : IDetectionModule
     /// 注意：底层推理库复用实例级结果 List，并发调用会互相覆盖；
     /// 这里串行推理，且 YoloModel.Detect 内部立即拷贝成领域对象。
     /// </summary>
-    private void ProcessMultiCameraFrames(Dictionary<string, CaptureFrame> frames, SOPModuleResult result)
+    private void ProcessMultiCameraFrames(Dictionary<string, CaptureFrame> frames, SOPModuleResult result, DateTime timestamp)
     {
-        var timestamp = DateTime.Now;
-
         // 0) 当前步骤 → 该步使用的 (相机, 模型)
         var step = GetCurrentStep();
         string stepCamera = string.IsNullOrWhiteSpace(step?.CameraId) ? "main_camera" : step.CameraId;
-        string? stepModel = string.IsNullOrWhiteSpace(step?.ModelPath) ? null : step.ModelPath;
 
-        // 1) 为每路相机确定"该相机使用的模型"（工作流中该相机首次指定；无则全局模型）
-        var cameraModelMap = BuildCameraModelMap();
+        // 1) 当前步骤的模型优先；其它相机继续使用其工作流默认模型。
+        var cameraModelMap = BuildCameraModelMap(step);
 
         // 2) 每路独立 YOLO 推理（串行，防底层结果 List 被覆盖）
         foreach (var (cameraId, frame) in frames)
@@ -618,34 +606,20 @@ public class SOPModule : IDetectionModule
         //    - 状态机检测结果严格取"当前步骤指定相机"的检测（不做跨相机 fallback，
         //      否则 cam_2 步骤会错误地拿主相机检测评估，导致无杯子也通过等误判）；
         //    - 手部检测同样使用当前步骤相机的画面，该相机无帧则不做手部。
-        var mainFrame = frames.TryGetValue("main_camera", out var mf) ? mf : frames.Values.FirstOrDefault();
-
-        List<DetectedObject> stateDetections;
-        if (frames.ContainsKey(stepCamera))
+        if (!frames.TryGetValue(stepCamera, out var handFrame))
         {
-            // 步骤相机帧在：取该相机本轮检测（可能为空，但语义正确）
-            stateDetections = result.PerCameraDetections.TryGetValue(stepCamera, out var stepDets)
-                ? stepDets
-                : new List<DetectedObject>();
-        }
-        else if (stepCamera == CameraManager.PrimaryCameraId && result.Detections != null)
-        {
-            // 主相机帧缺失时的兜底（兼容旧单相机路径）
-            stateDetections = result.Detections;
-        }
-        else
-        {
-            // 步骤相机无帧：不通过
-            stateDetections = new List<DetectedObject>();
+            DebugLog($"步骤评估跳过: 当前步骤相机 {stepCamera} 没有新鲜帧");
+            UpdateStateMachineResult(result);
+            return;
         }
 
-        var handFrame = frames.TryGetValue(stepCamera, out var hf) ? hf : mainFrame;
-        var handResult = handFrame != null
-            ? RunHandPoseDetection(handFrame, result, timestamp, stepCamera)
-            : null;
+        var stateDetections = result.PerCameraDetections.TryGetValue(stepCamera, out var stepDets)
+            ? stepDets
+            : new List<DetectedObject>();
+        var handResult = RunHandPoseDetection(handFrame, result, timestamp, stepCamera);
 
         DebugLog($"步骤评估: step={step?.StepName}({stepCamera}) frames=[{string.Join(",", frames.Keys)}] perCam=[{string.Join(",", result.PerCameraDetections.Select(kv => $"{kv.Key}:{kv.Value.Count}"))}] stateDet={stateDetections.Count}");
-        _stateMachine?.ProcessFrame(stateDetections, handResult, timestamp);
+        _stateMachine?.ProcessFrame(stateDetections, handResult, timestamp, stepCamera);
 
         // 4) 状态机结果回填
         UpdateStateMachineResult(result);
@@ -674,12 +648,13 @@ public class SOPModule : IDetectionModule
             var sm = _stateMachine;
             if (sm == null) return;
 
-            var step = GetCurrentStep();
+            var step = sm.Workflow?.Steps.FirstOrDefault(s => s.StepId == sm.LastEvaluatedStepId)
+                ?? GetCurrentStep();
             var snapshot = new SOPStateMachineSnapshot
             {
                 Timestamp = timestamp,
-                StepId = sm.CurrentStepId,
-                StepName = step?.StepName ?? "",
+                StepId = sm.LastEvaluatedStepId > 0 ? sm.LastEvaluatedStepId : sm.CurrentStepId,
+                StepName = sm.LastEvaluatedStepName.Length > 0 ? sm.LastEvaluatedStepName : step?.StepName ?? "",
                 State = sm.CurrentState.ToString(),
                 IsPass = sm.LastEvaluation?.IsPass ?? false,
                 // NextSteps 是步骤 id 的字符串列表（YAML transitions）
@@ -694,6 +669,8 @@ public class SOPModule : IDetectionModule
                 for (int i = 0; i < step.PassConditions.Count; i++)
                 {
                     var key = step.PassConditions[i].Type.ToString();
+                    if (snapshot.Conditions.ContainsKey(key))
+                        key = $"{key}#{i}";
                     // 评估器 AND 短路时可能只返回部分结果，未评估的记 false
                     bool met = i < eval.CheckResults.Count && eval.CheckResults[i].IsMet;
                     snapshot.Conditions[key] = met;
@@ -726,12 +703,18 @@ public class SOPModule : IDetectionModule
     }
 
     /// <summary>
-    /// 构建"相机 → 模型路径"映射：取工作流中每路相机首次被步骤指定的模型（无则全局）。
+    /// 构建"相机 → 模型路径"映射：当前步骤的模型优先，其它相机取首个显式模型。
     /// </summary>
-    private Dictionary<string, string?> BuildCameraModelMap()
+    private Dictionary<string, string?> BuildCameraModelMap(SOPStep? currentStep)
     {
         var map = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
         if (_currentWorkflow == null) return map;
+
+        if (currentStep != null)
+        {
+            var currentCamera = string.IsNullOrWhiteSpace(currentStep.CameraId) ? "main_camera" : currentStep.CameraId;
+            map[currentCamera] = string.IsNullOrWhiteSpace(currentStep.ModelPath) ? null : currentStep.ModelPath;
+        }
 
         foreach (var s in _currentWorkflow.Steps.OrderBy(s => s.Order))
         {
@@ -904,17 +887,16 @@ public class SOPModule : IDetectionModule
                 throw new InvalidOperationException("状态机未初始化");
 
             _currentWorkflow = workflow;
+            _regionMonitoring.Reset();
+            _crossEvaluator.Reset();
 
             // 注入区域域定义（已有）
-            if (workflow.Regions != null && workflow.Regions.Count > 0)
-            {
-                _stateMachine.UpdateZones(workflow.Regions);
-                Log($"已加载载 {workflow.Regions.Count} 个区域域定义");
-            }
+            var workflowZones = workflow.Regions ?? new List<ZoneDefinition>();
+            _stateMachine.UpdateZones(workflowZones);
+            if (workflowZones.Count > 0)
+                Log($"已加载载 {workflowZones.Count} 个区域域定义");
             else
-            {
                 Log("警告: 工作作流中没有区域域定义，object_in_zone 条件将无法工作作");
-            }
 
             // 检测查并切换 YOLO 模式型
             if (workflow.Model != null && !string.IsNullOrWhiteSpace(workflow.Model.Path))

@@ -33,7 +33,8 @@ public class StepConditionEvaluator
     public StepConditionEvaluator(SOPStateMachine stateMachine, IReadOnlyList<ZoneDefinition>? zones = null)
     {
         _stateMachine = stateMachine;
-        _zones = (zones ?? new List<ZoneDefinition>()).ToDictionary(z => z.ZoneId, StringComparer.OrdinalIgnoreCase);
+        _zones = (zones ?? new List<ZoneDefinition>())
+            .ToDictionary(z => ZoneKey(z.CameraId, z.ZoneId), StringComparer.OrdinalIgnoreCase);
     }
 
     /// <summary>
@@ -51,19 +52,25 @@ public class StepConditionEvaluator
         _zones.Clear();
         foreach (var zone in zones)
         {
-            _zones[zone.ZoneId] = zone;
+            _zones[ZoneKey(zone.CameraId, zone.ZoneId)] = zone;
         }
     }
 
     /// <summary>
     /// 评估步骤的所有条件（物体 + 手部姿态）
     /// </summary>
-    public ConditionEvaluationResult EvaluateConditions(SOPStep step, List<DetectedObject> detections, HandPoseEstimationResult? handResult = null, bool ignoreFromRegion = false)
+    public ConditionEvaluationResult EvaluateConditions(
+        SOPStep step,
+        List<DetectedObject> detections,
+        HandPoseEstimationResult? handResult,
+        DateTime timestamp,
+        string cameraId = "main_camera",
+        bool ignoreFromRegion = false)
     {
         // 先更新手部跨帧跟踪状态（用于稳定/移动判断）
-        UpdateHandTracks(handResult);
+        UpdateHandTracks(handResult, cameraId);
         // 同步更新物体跨帧区域访问记录（用于放回等步骤的 from_region 约束）
-        UpdateObjectRegions(detections);
+        UpdateObjectRegions(detections, cameraId);
 
         // 跳步检测（ViolationDetector.DetectSkipStep）会用同一实例评估"下一步"的意图，
         // 这类对非当前步骤的评估：① 不参与稳定帧门控（跳步是单帧意图判定）；
@@ -107,7 +114,7 @@ public class StepConditionEvaluator
         int conditionIndex = 0;
         foreach (var condition in step.PassConditions)
         {
-            var result = CheckCondition(condition, detections, handResult, ignoreFromRegion);
+            var result = CheckCondition(condition, detections, handResult, timestamp, cameraId, ignoreFromRegion);
             // P0-2：对未自管理帧计数的条件施加通用稳定帧门控（仅对当前步骤生效）
             if (isCurrentStep)
             {
@@ -136,7 +143,13 @@ public class StepConditionEvaluator
         };
     }
 
-    private ConditionCheckResult CheckCondition(StepCondition condition, List<DetectedObject> detections, HandPoseEstimationResult? handResult, bool ignoreFromRegion = false)
+    private ConditionCheckResult CheckCondition(
+        StepCondition condition,
+        List<DetectedObject> detections,
+        HandPoseEstimationResult? handResult,
+        DateTime timestamp,
+        string cameraId,
+        bool ignoreFromRegion = false)
     {
         // 手部动作条件分支
         if (condition.Type == ConditionType.HandInRegion ||
@@ -144,7 +157,7 @@ public class StepConditionEvaluator
             condition.Type == ConditionType.HandStable ||
             condition.Type == ConditionType.HandMoveFromTo)
         {
-            return CheckHandCondition(condition, detections, handResult, ignoreFromRegion);
+            return CheckHandCondition(condition, detections, handResult, cameraId, ignoreFromRegion);
         }
 
         if (condition.Type == ConditionType.HandNearObject)
@@ -156,11 +169,11 @@ public class StepConditionEvaluator
         return condition.Type switch
         {
             ConditionType.ObjectPresent => CheckObjectPresent(condition, detections),
-            ConditionType.ObjectInZone => CheckObjectInZone(condition, detections),
-            ConditionType.ObjectStable => CheckObjectStable(condition),
+            ConditionType.ObjectInZone => CheckObjectInZone(condition, detections, cameraId),
+            ConditionType.ObjectStable => CheckObjectStable(condition, cameraId),
             ConditionType.ObjectAbsent => CheckObjectAbsent(condition, detections),
             ConditionType.SequenceComplete => CheckSequenceComplete(condition),
-            ConditionType.TimeElapsed => CheckTimeElapsed(condition),
+            ConditionType.TimeElapsed => CheckTimeElapsed(condition, timestamp),
             _ => new ConditionCheckResult { IsMet = false, Message = $"未知条件类型: {condition.Type}" }
         };
     }
@@ -217,7 +230,7 @@ public class StepConditionEvaluator
         public const int MaxHistory = 30;
     }
 
-    private readonly Dictionary<int, HandTrackState> _handTracks = new();
+    private readonly Dictionary<string, HandTrackState> _handTracks = new(StringComparer.OrdinalIgnoreCase);
 
     // 物体（按标签）最近访问过的区域记录——用于 HandMoveFromTo 的 from_region 约束。
     // 例如喝水步骤里判定的是"杯子到达嘴边"（物体而非手），所以 from_region(mouth_region)
@@ -235,26 +248,31 @@ public class StepConditionEvaluator
     /// 清空稳定帧计数（工作流 Start/Reset 时调用）。
     /// 防止上一轮残留计数让新一轮的步骤"秒过"，绕过防抖。
     /// </summary>
-    public void ResetStableCounts()
+    public void Reset()
     {
+        _handTracks.Clear();
+        _objectVisitedRegions.Clear();
         _stablePassCounts.Clear();
         _lastEvaluatedStepId = -1;
     }
 
-    private void UpdateHandTracks(HandPoseEstimationResult? handResult)
+    public void ResetStableCounts() => Reset();
+
+    private void UpdateHandTracks(HandPoseEstimationResult? handResult, string cameraId)
     {
         if (handResult == null) return;
 
-        var alive = new HashSet<int>();
+        var alive = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var hand in handResult.Hands)
         {
             if (hand.TrackId < 0) continue;
-            alive.Add(hand.TrackId);
+            var trackKey = TrackKey(cameraId, hand.TrackId);
+            alive.Add(trackKey);
 
-            if (!_handTracks.TryGetValue(hand.TrackId, out var track))
+            if (!_handTracks.TryGetValue(trackKey, out var track))
             {
                 track = new HandTrackState();
-                _handTracks[hand.TrackId] = track;
+                _handTracks[trackKey] = track;
             }
 
             var center = hand.GetCenter();
@@ -287,18 +305,20 @@ public class StepConditionEvaluator
     /// 物体没有稳定 TrackId，按标签聚合即可（同一场景通常只有一种物料）。
     /// 判定标准与 CheckObjectInZone 的 IsInZone 一致：bbox 与区域相交即记为访问过。
     /// </summary>
-    private void UpdateObjectRegions(List<DetectedObject> detections)
+    private void UpdateObjectRegions(List<DetectedObject> detections, string cameraId)
     {
         foreach (var det in detections)
         {
             var label = det.ClassName;
             if (string.IsNullOrEmpty(label)) continue;
-            if (!_objectVisitedRegions.TryGetValue(label, out var set))
+            var objectKey = ObjectKey(cameraId, label);
+            if (!_objectVisitedRegions.TryGetValue(objectKey, out var set))
             {
                 set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                _objectVisitedRegions[label] = set;
+                _objectVisitedRegions[objectKey] = set;
             }
-            foreach (var zone in _zones.Values)
+            foreach (var zone in _zones.Values.Where(zone =>
+                string.Equals(zone.CameraId, cameraId, StringComparison.OrdinalIgnoreCase)))
             {
                 var zoneRect = new SKRectI((int)zone.X, (int)zone.Y, (int)(zone.X + zone.Width), (int)(zone.Y + zone.Height));
                 if (det.PixelBoundingBox.IntersectsWith(zoneRect))
@@ -328,7 +348,7 @@ public class StepConditionEvaluator
         return chosen;
     }
 
-    private ConditionCheckResult CheckHandCondition(StepCondition condition, List<DetectedObject> detections, HandPoseEstimationResult? handResult, bool ignoreFromRegion = false)
+    private ConditionCheckResult CheckHandCondition(StepCondition condition, List<DetectedObject> detections, HandPoseEstimationResult? handResult, string cameraId, bool ignoreFromRegion = false)
     {
         var hand = SelectHand(condition, handResult);
         if (hand == null)
@@ -343,7 +363,7 @@ public class StepConditionEvaluator
         {
             case ConditionType.HandInRegion:
             {
-                var zone = GetZoneDefinition(condition.ZoneId ?? "");
+                var zone = GetZoneDefinition(condition.ZoneId ?? "", cameraId);
                 if (zone == null) return new ConditionCheckResult { IsMet = false, Message = $"未找到区域: {condition.ZoneId}" };
                 var zoneRect = new SKRect(zone.X, zone.Y, zone.X + zone.Width, zone.Y + zone.Height);
                 return zoneRect.Contains(center)
@@ -352,7 +372,7 @@ public class StepConditionEvaluator
             }
             case ConditionType.HandNotInRegion:
             {
-                var zone = GetZoneDefinition(condition.ZoneId ?? "");
+                var zone = GetZoneDefinition(condition.ZoneId ?? "", cameraId);
                 if (zone == null) return new ConditionCheckResult { IsMet = false, Message = $"未找到区域: {condition.ZoneId}" };
                 var zoneRect = new SKRect(zone.X, zone.Y, zone.X + zone.Width, zone.Y + zone.Height);
                 return !zoneRect.Contains(center)
@@ -364,7 +384,7 @@ public class StepConditionEvaluator
                 // 若指定了区域，要求手部中心必须位于该区域内（P0-5 修复：原 hand_stable 丢弃 region）
                 if (!string.IsNullOrEmpty(condition.ZoneId))
                 {
-                    var zone = GetZoneDefinition(condition.ZoneId);
+                    var zone = GetZoneDefinition(condition.ZoneId, cameraId);
                     if (zone == null)
                         return new ConditionCheckResult { IsMet = false, Message = $"未找到区域: {condition.ZoneId}" };
                     var zoneRect = new SKRect(zone.X, zone.Y, zone.X + zone.Width, zone.Y + zone.Height);
@@ -372,7 +392,7 @@ public class StepConditionEvaluator
                         return new ConditionCheckResult { IsMet = false, Message = $"手部未位于区域 {condition.ZoneId} 内，稳定判定取消" };
                 }
 
-                if (!_handTracks.TryGetValue(hand.TrackId, out var track) || track.CenterHistory.Count < condition.StableFrames)
+                if (!_handTracks.TryGetValue(TrackKey(cameraId, hand.TrackId), out var track) || track.CenterHistory.Count < condition.StableFrames)
                     return new ConditionCheckResult { IsMet = false, Message = $"手部稳定帧不足（已跟踪 {track?.CenterHistory.Count ?? 0}/{condition.StableFrames}）" };
 
                 var tolerance = condition.Parameters.GetValueOrDefault("Tolerance", 20f);
@@ -396,8 +416,8 @@ public class StepConditionEvaluator
                 bool hasFrom = !string.IsNullOrEmpty(fromRegion);
                 bool hasTo = !string.IsNullOrEmpty(toRegion);
 
-                var zoneFrom = hasFrom ? GetZoneDefinition(fromRegion) : null;
-                var zoneTo = hasTo ? GetZoneDefinition(toRegion) : null;
+                var zoneFrom = hasFrom ? GetZoneDefinition(fromRegion, cameraId) : null;
+                var zoneTo = hasTo ? GetZoneDefinition(toRegion, cameraId) : null;
                 if (hasFrom && zoneFrom == null) return new ConditionCheckResult { IsMet = false, Message = $"未找到起始区域: {fromRegion}" };
                 if (hasTo && zoneTo == null) return new ConditionCheckResult { IsMet = false, Message = $"未找到目标区域: {toRegion}" };
 
@@ -410,10 +430,10 @@ public class StepConditionEvaluator
                 // 例如喝水 SOP 里起始区域是 mouth_region，但"喝水"这一步判定的是
                 // "杯子到达嘴边"（物体而非手），手轨迹里可能没有 mouth_region，
                 // 必须借助物体区域访问记录，否则放回步骤会一直卡在 visitedFrom=false。
-                bool visitedFromByHand = _handTracks.TryGetValue(hand.TrackId, out var t2)
+                bool visitedFromByHand = _handTracks.TryGetValue(TrackKey(cameraId, hand.TrackId), out var t2)
                     && t2.RecentRegions.Contains(fromRegion);
                 bool visitedFromByObject = !string.IsNullOrEmpty(condition.TargetObject)
-                    && _objectVisitedRegions.TryGetValue(condition.TargetObject, out var objRegions)
+                    && _objectVisitedRegions.TryGetValue(ObjectKey(cameraId, condition.TargetObject), out var objRegions)
                     && objRegions.Contains(fromRegion);
                 // 跳步检测(ignoreFromRegion)时忽略 from_region 的历史访问约束——
                 // 跳步场景本就跳过了中间步骤，物体自然没经过起始区域（如没到嘴边），
@@ -680,7 +700,7 @@ public class StepConditionEvaluator
     /// <summary>
     /// 检查目标是否在指定区域内
     /// </summary>
-    private ConditionCheckResult CheckObjectInZone(StepCondition condition, List<DetectedObject> detections)
+    private ConditionCheckResult CheckObjectInZone(StepCondition condition, List<DetectedObject> detections, string cameraId)
     {
         if (string.IsNullOrEmpty(condition.ZoneId))
         {
@@ -691,7 +711,7 @@ public class StepConditionEvaluator
             };
         }
 
-        var zone = GetZoneDefinition(condition.ZoneId);
+        var zone = GetZoneDefinition(condition.ZoneId, cameraId);
         if (zone == null)
         {
             return new ConditionCheckResult
@@ -727,9 +747,10 @@ public class StepConditionEvaluator
     /// <summary>
     /// 检查目标是否稳定
     /// </summary>
-    private ConditionCheckResult CheckObjectStable(StepCondition condition)
+    private ConditionCheckResult CheckObjectStable(StepCondition condition, string cameraId)
     {
         var trackedObjects = _stateMachine.TrackedObjects
+            .Where(kv => kv.Value.CameraId.Equals(cameraId, StringComparison.OrdinalIgnoreCase))
             .Where(kv => kv.Value.ClassName.Equals(condition.TargetObject, StringComparison.OrdinalIgnoreCase))
             .Select(kv => kv.Value)
             .ToList();
@@ -822,9 +843,9 @@ public class StepConditionEvaluator
     /// <summary>
     /// 检查时间是否满足
     /// </summary>
-    private ConditionCheckResult CheckTimeElapsed(StepCondition condition)
+    private ConditionCheckResult CheckTimeElapsed(StepCondition condition, DateTime timestamp)
     {
-        var elapsedSeconds = (DateTime.Now - _stateMachine.StepStartTime).TotalSeconds;
+        var elapsedSeconds = (timestamp - _stateMachine.StepStartTime).TotalSeconds;
         var requiredSecondsValue = condition.Parameters.GetValueOrDefault("RequiredSeconds", 0.0);
         double requiredSeconds = requiredSecondsValue is double d ? d : Convert.ToDouble(requiredSecondsValue);
 
@@ -844,16 +865,26 @@ public class StepConditionEvaluator
         };
     }
 
-    private ZoneDefinition? GetZoneDefinition(string zoneId)
+    private ZoneDefinition? GetZoneDefinition(string zoneId, string cameraId)
     {
-        if (_zones.TryGetValue(zoneId, out var zone))
+        if (_zones.TryGetValue(ZoneKey(cameraId, zoneId), out var zone))
         {
             return zone;
         }
 
+        var matches = _zones.Values
+            .Where(candidate => candidate.ZoneId.Equals(zoneId, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        if (matches.Count == 1)
+            return matches[0];
+
         Console.WriteLine($"[SOP] 警告: 未找到区域定义 '{zoneId}'，请检查 YAML 配置中的 regions 字段");
         return null;
     }
+
+    private static string TrackKey(string cameraId, int trackId) => $"{cameraId}:{trackId}";
+    private static string ObjectKey(string cameraId, string className) => $"{cameraId}:{className}";
+    private static string ZoneKey(string cameraId, string zoneId) => $"{cameraId}:{zoneId}";
 
     private static bool IsInZone(SKRect objectBox, ZoneDefinition zone)
     {

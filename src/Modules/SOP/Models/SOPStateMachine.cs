@@ -17,6 +17,8 @@ public class SOPStateMachine
     private readonly List<ViolationRecord> _violations = new();
     private readonly StepConditionEvaluator _conditionEvaluator;
     private readonly ViolationDetector _violationDetector;
+    private readonly HashSet<string> _seenObjects = new(StringComparer.OrdinalIgnoreCase);
+    private CancellationTokenSource? _autoResetCts;
 
     public SOPExecutionState CurrentState { get; private set; } = SOPExecutionState.Idle;
     public int CurrentStepId { get; private set; } = 0;
@@ -26,6 +28,8 @@ public class SOPStateMachine
     public IReadOnlyList<StepExecutionRecord> StepHistory => _stepHistory.AsReadOnly();
     public IReadOnlyList<ViolationRecord> Violations => _violations.AsReadOnly();
     public IReadOnlyDictionary<string, TrackedObject> TrackedObjects => _trackedObjects;
+    public int LastEvaluatedStepId { get; private set; }
+    public string LastEvaluatedStepName { get; private set; } = "";
 
     /// <summary>
     /// 【黄金数据集录制专用】最近一帧的逐条件判定快照。
@@ -60,21 +64,27 @@ public class SOPStateMachine
 
     public void Start(SOPWorkflow workflow)
     {
+        CancelAutoReset();
         _workflow = workflow;
         _stepHistory.Clear();
         _violations.Clear();
         _trackedObjects.Clear();
-        _conditionEvaluator.ResetStableCounts(); // 清上一轮残留的稳定帧计数，防止新一轮步骤"秒过"
+        _seenObjects.Clear();
+        _conditionEvaluator.Reset();
+        _violationDetector.Reset();
         // ⭐ 修复：起始步骤取工作流中最小的 StepId（配方步骤不一定从 1 开始，
         // 例如配置窗口重排后 id 可能是 2,3,4...；硬编码 1 会导致找不到步骤而卡在第一步）。
         var firstStep = workflow.Steps.OrderBy(s => s.StepId).FirstOrDefault();
         CurrentStepId = firstStep?.StepId ?? 1;
-        StepStartTime = DateTime.Now;
+        StepStartTime = default;
+        LastEvaluatedStepId = 0;
+        LastEvaluatedStepName = "";
+        LastEvaluation = null;
         ChangeState(SOPExecutionState.Running);
         StepChanged?.Invoke(this, new StepChangedEventArgs(0, CurrentStepId, workflow.Steps.FirstOrDefault(s => s.StepId == CurrentStepId)?.StepName ?? ""));
     }
 
-    public void ProcessFrame(List<DetectedObject> detections, HandPoseEstimationResult? handResult, DateTime timestamp)
+    public void ProcessFrame(List<DetectedObject> detections, HandPoseEstimationResult? handResult, DateTime timestamp, string cameraId = "main_camera")
     {
         if (_workflow == null || CurrentState != SOPExecutionState.Running)
             return;
@@ -83,11 +93,19 @@ public class SOPStateMachine
         if (currentStep == null)
             return;
 
+        if (StepStartTime == default)
+            StepStartTime = timestamp;
+
         // 更新对象跟踪
-        UpdateTrackedObjects(detections, timestamp);
+        UpdateTrackedObjects(detections, timestamp, cameraId);
+        foreach (var detection in detections)
+        {
+            if (!string.IsNullOrWhiteSpace(detection.ClassName))
+                _seenObjects.Add(ObjectKey(cameraId, detection.ClassName));
+        }
 
         // 检测违规
-        var violations = _violationDetector.DetectViolations(currentStep, detections, handResult, timestamp);
+        var violations = _violationDetector.DetectViolations(currentStep, detections, handResult, timestamp, cameraId);
         foreach (var violation in violations)
         {
             RecordViolation(violation);
@@ -95,7 +113,9 @@ public class SOPStateMachine
         }
 
         // 评估步骤条件（物体 + 手部姿态）
-        var evaluation = _conditionEvaluator.EvaluateConditions(currentStep, detections, handResult);
+        LastEvaluatedStepId = currentStep.StepId;
+        LastEvaluatedStepName = currentStep.StepName;
+        var evaluation = _conditionEvaluator.EvaluateConditions(currentStep, detections, handResult, timestamp, cameraId);
 
         // 黄金数据集录制：只做只读快照，不参与任何判定分支
         LastEvaluation = evaluation;
@@ -142,12 +162,19 @@ public class SOPStateMachine
 
     public void Reset()
     {
+        CancelAutoReset();
         _workflow = null;
         _stepHistory.Clear();
         _violations.Clear();
         _trackedObjects.Clear();
-        _conditionEvaluator.ResetStableCounts();
+        _seenObjects.Clear();
+        _conditionEvaluator.Reset();
+        _violationDetector.Reset();
         CurrentStepId = 0;
+        StepStartTime = default;
+        LastEvaluatedStepId = 0;
+        LastEvaluatedStepName = "";
+        LastEvaluation = null;
         ChangeState(SOPExecutionState.Idle);
     }
 
@@ -156,14 +183,20 @@ public class SOPStateMachine
     /// </summary>
     public void Stop()
     {
+        CancelAutoReset();
         ChangeState(SOPExecutionState.Idle);
         _workflow = null;
         CurrentStepId = 0;
+        StepStartTime = default;
+        LastEvaluation = null;
     }
 
     private int _nextTrackId = 0;
 
-    private void UpdateTrackedObjects(List<DetectedObject> detections, DateTime timestamp)
+    public bool HasSeenObject(string className, string cameraId)
+        => _seenObjects.Contains(ObjectKey(cameraId, className));
+
+    private void UpdateTrackedObjects(List<DetectedObject> detections, DateTime timestamp, string cameraId)
     {
         var matchedKeys = new HashSet<string>();
         var matchedDetections = new HashSet<int>();
@@ -180,6 +213,7 @@ public class SOPStateMachine
             foreach (var (key, tracked) in _trackedObjects)
             {
                 if (matchedKeys.Contains(key)) continue;
+                if (!tracked.CameraId.Equals(cameraId, StringComparison.OrdinalIgnoreCase)) continue;
                 if (!tracked.ClassName.Equals(labelName, StringComparison.OrdinalIgnoreCase)) continue;
 
                 float iou = CalculateIOU(tracked.BoundingBox, detection.PixelBoundingBox);
@@ -206,8 +240,8 @@ public class SOPStateMachine
 
             var detection = detections[i];
             var labelName = detection.ClassName;
-            var newKey = $"{labelName}_{_nextTrackId++}";
-            _trackedObjects[newKey] = new TrackedObject(labelName, detection.PixelBoundingBox, timestamp);
+            var newKey = $"{cameraId}_{labelName}_{_nextTrackId++}";
+            _trackedObjects[newKey] = new TrackedObject(cameraId, labelName, detection.PixelBoundingBox, timestamp);
         }
 
         // 清理过期跟踪（2秒未更新的对象视为离开画面）
@@ -282,11 +316,9 @@ public class SOPStateMachine
                 // CurrentState != Running 直接 return，导致即使配了 AutoResetOnComplete
                 // 也不会真的循环。改为先 Reset 清空状态，然后重新 Start 同一 workflow。
                 var workflow = _workflow;
-                Task.Delay(TimeSpan.FromSeconds(_workflow.Settings.ResetDelaySec)).ContinueWith(_ =>
-                {
-                    Reset();
-                    if (workflow != null) Start(workflow);
-                });
+                var resetCts = new CancellationTokenSource();
+                _autoResetCts = resetCts;
+                _ = AutoResetAsync(workflow, resetCts);
             }
         }
         else
@@ -309,6 +341,42 @@ public class SOPStateMachine
         CurrentState = newState;
         StateChanged?.Invoke(this, new StateChangedEventArgs(oldState, newState));
     }
+
+    private async Task AutoResetAsync(SOPWorkflow workflow, CancellationTokenSource resetCts)
+    {
+        try
+        {
+            await Task.Delay(TimeSpan.FromSeconds(workflow.Settings.ResetDelaySec), resetCts.Token);
+            if (resetCts.IsCancellationRequested || !ReferenceEquals(_autoResetCts, resetCts) ||
+                CurrentState != SOPExecutionState.Completed || !ReferenceEquals(_workflow, workflow))
+                return;
+
+            Reset();
+            Start(workflow);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        finally
+        {
+            if (ReferenceEquals(_autoResetCts, resetCts))
+            {
+                _autoResetCts = null;
+                resetCts.Dispose();
+            }
+        }
+    }
+
+    private void CancelAutoReset()
+    {
+        var cts = _autoResetCts;
+        _autoResetCts = null;
+        cts?.Cancel();
+        cts?.Dispose();
+    }
+
+    private static string ObjectKey(string cameraId, string className) =>
+        $"{cameraId}:{className}";
 }
 
 /// <summary>
@@ -328,6 +396,7 @@ public enum SOPExecutionState
 /// </summary>
 public class TrackedObject
 {
+    public string CameraId { get; }
     public string ClassName { get; }
     public SKRect BoundingBox { get; private set; }
     public DateTime FirstSeen { get; }
@@ -335,8 +404,9 @@ public class TrackedObject
     public int FrameCount { get; private set; }
     public List<SKRect> PositionHistory { get; } = new();
 
-    public TrackedObject(string className, SKRect boundingBox, DateTime timestamp)
+    public TrackedObject(string cameraId, string className, SKRect boundingBox, DateTime timestamp)
     {
+        CameraId = cameraId;
         ClassName = className;
         BoundingBox = boundingBox;
         FirstSeen = timestamp;

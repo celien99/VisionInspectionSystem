@@ -3,6 +3,7 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.Json;
+using System.Diagnostics;
 using Modules.SOP;
 using Modules.SOP.Models;
 
@@ -26,11 +27,13 @@ public class SopRunRecorder
     private readonly string _recordsDir;
     private readonly object _writeLock = new();
     private readonly JsonSerializerOptions _jsonOptions = new() { WriteIndented = false };
+    private readonly Dictionary<string, int> _nextSequenceByDate = new(StringComparer.Ordinal);
 
     public SopRunRecorder(string? baseDir = null)
     {
         _recordsDir = Path.Combine(baseDir ?? AppDomain.CurrentDomain.BaseDirectory, "sop_records");
-        try { Directory.CreateDirectory(_recordsDir); } catch { }
+        try { Directory.CreateDirectory(_recordsDir); }
+        catch (Exception ex) { Debug.WriteLine($"[SOP记录] 创建目录失败: {ex.Message}"); }
     }
 
     public void Subscribe(SOPModule module)
@@ -80,9 +83,9 @@ public class SopRunRecorder
 
             AppendRecord(record);
         }
-        catch
+        catch (Exception ex)
         {
-            // 记录失败不影响检测主流程
+            Debug.WriteLine($"[SOP记录] 周期写入失败: {ex.Message}");
         }
     }
 
@@ -94,13 +97,18 @@ public class SopRunRecorder
 
         lock (_writeLock)
         {
-            // 当天周期序号（第几次），跨重启也能连续（基于已有行数）
-            int sequence = 1;
-            if (File.Exists(jsonlPath))
+            // 每天只在本进程首次写入时读取一次历史行数，避免每个周期 O(n) 扫描文件。
+            if (!_nextSequenceByDate.TryGetValue(dateStr, out var sequence))
             {
-                try { sequence = File.ReadAllLines(jsonlPath).Length + 1; } catch { }
+                sequence = 1;
+                if (File.Exists(jsonlPath))
+                {
+                    try { sequence = File.ReadLines(jsonlPath).Count() + 1; }
+                    catch (Exception ex) { Debug.WriteLine($"[SOP记录] 读取周期序号失败: {ex.Message}"); }
+                }
             }
             record.CycleIndex = sequence;
+            _nextSequenceByDate[dateStr] = sequence + 1;
 
             // 1) JSONL：一行一个周期
             var jsonLine = JsonSerializer.Serialize(record, _jsonOptions);

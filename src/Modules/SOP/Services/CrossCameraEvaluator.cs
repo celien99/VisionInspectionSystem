@@ -13,6 +13,12 @@ public sealed class CrossCameraEvaluator
     private readonly Dictionary<string, DateTime> _lastFireTimes = new();
     private readonly Dictionary<string, bool> _activeStates = new();
 
+    public void Reset()
+    {
+        _lastFireTimes.Clear();
+        _activeStates.Clear();
+    }
+
     /// <summary>
     /// 评估所有跨相机规则，返回首个命中的规则（含冷却过滤）。
     /// </summary>

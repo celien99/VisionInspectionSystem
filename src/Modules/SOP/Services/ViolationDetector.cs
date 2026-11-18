@@ -18,7 +18,7 @@ public class ViolationDetector
     {
         _stateMachine = stateMachine;
         _conditionEvaluator = conditionEvaluator;
-        _zones = (zones ?? new List<ZoneDefinition>()).ToDictionary(z => z.ZoneId, StringComparer.OrdinalIgnoreCase);
+        _zones = (zones ?? new List<ZoneDefinition>()).ToDictionary(z => ZoneKey(z.CameraId, z.ZoneId), StringComparer.OrdinalIgnoreCase);
     }
 
     /// <summary>
@@ -29,14 +29,14 @@ public class ViolationDetector
         _zones.Clear();
         foreach (var zone in zones)
         {
-            _zones[zone.ZoneId] = zone;
+            _zones[ZoneKey(zone.CameraId, zone.ZoneId)] = zone;
         }
     }
 
     /// <summary>
     /// 检测违规
     /// </summary>
-    public List<ViolationRecord> DetectViolations(SOPStep currentStep, List<DetectedObject> detections, HandPoseEstimationResult? handResult, DateTime timestamp)
+    public List<ViolationRecord> DetectViolations(SOPStep currentStep, List<DetectedObject> detections, HandPoseEstimationResult? handResult, DateTime timestamp, string cameraId = "main_camera")
     {
         var violations = new List<ViolationRecord>();
 
@@ -46,17 +46,17 @@ public class ViolationDetector
             {
                 ViolationType.Timeout => DetectTimeout(currentStep, timestamp),
                 ViolationType.ForbiddenObject => DetectForbiddenObject(currentStep, detections, timestamp),
-                ViolationType.ObjectRemoved => DetectObjectRemoved(currentStep, detections, timestamp),
-                ViolationType.ZoneIntrusion => DetectZoneIntrusion(currentStep, detections, timestamp),
+                ViolationType.ObjectRemoved => DetectObjectRemoved(currentStep, detections, timestamp, cameraId),
+                ViolationType.ZoneIntrusion => DetectZoneIntrusion(currentStep, detections, timestamp, cameraId),
                 ViolationType.WrongOrder => DetectWrongOrder(currentStep, timestamp),
-                ViolationType.MissingRequiredObject => DetectMissingRequiredObject(currentStep, detections, timestamp),
+                ViolationType.MissingRequiredObject => DetectMissingRequiredObject(currentStep, detections, timestamp, cameraId),
                 _ => null
             };
 
-            if (violation != null && !IsOnCooldown(violation))
+            if (violation != null && !IsOnCooldown(violation, timestamp))
             {
                 violations.Add(violation);
-                SetCooldown(violation);
+                SetCooldown(violation, timestamp);
             }
         }
 
@@ -64,10 +64,10 @@ public class ViolationDetector
         if (_stateMachine.Workflow?.Settings.EnableTimeoutDetection == true)
         {
             var timeoutViolation = DetectTimeout(currentStep, timestamp);
-            if (timeoutViolation != null && !IsOnCooldown(timeoutViolation))
+            if (timeoutViolation != null && !IsOnCooldown(timeoutViolation, timestamp))
             {
                 violations.Add(timeoutViolation);
-                SetCooldown(timeoutViolation);
+                SetCooldown(timeoutViolation, timestamp);
             }
         }
 
@@ -80,11 +80,11 @@ public class ViolationDetector
                 : 0;
             if (currentStep.StepId > minStepId)
             {
-                var skip = DetectSkipStep(currentStep, detections, handResult, timestamp);
-                if (skip != null && !IsOnCooldown(skip))
+                var skip = DetectSkipStep(currentStep, detections, handResult, timestamp, cameraId);
+                if (skip != null && !IsOnCooldown(skip, timestamp))
                 {
                     violations.Add(skip);
-                    SetCooldown(skip);
+                    SetCooldown(skip, timestamp);
                 }
             }
         }
@@ -159,7 +159,7 @@ public class ViolationDetector
     /// <summary>
     /// 检测对象被移除
     /// </summary>
-    private ViolationRecord? DetectObjectRemoved(SOPStep step, List<DetectedObject> detections, DateTime timestamp)
+    private ViolationRecord? DetectObjectRemoved(SOPStep step, List<DetectedObject> detections, DateTime timestamp, string cameraId)
     {
         var mustKeepClasses = step.ViolationRules
             .Where(r => r.Type == ViolationType.ObjectRemoved)
@@ -175,10 +175,8 @@ public class ViolationDetector
 
         foreach (var mustKeepClass in mustKeepClasses)
         {
-            // 检查历史记录中是否有该对象
-            var wasPresent = _stateMachine.StepHistory.Any(h =>
-                h.StepId < step.StepId &&
-                h.IsPass);
+            // 只有本运行周期确实见过该类别，当前缺失才算被移除。
+            var wasPresent = _stateMachine.HasSeenObject(mustKeepClass, cameraId);
 
             if (wasPresent)
             {
@@ -209,7 +207,7 @@ public class ViolationDetector
     /// 这是通用的数据驱动规则——每个配方在 YAML 中声明自己的必放物料，切换产品即复用同一引擎。
     /// 防误报：若画面中完全没有任何必放物料出现，视为"成品尚未入框"，暂不判定漏放。
     /// </summary>
-    private ViolationRecord? DetectMissingRequiredObject(SOPStep step, List<DetectedObject> detections, DateTime timestamp)
+    private ViolationRecord? DetectMissingRequiredObject(SOPStep step, List<DetectedObject> detections, DateTime timestamp, string cameraId)
     {
         var reqRules = step.ViolationRules
             .Where(r => r.Type == ViolationType.MissingRequiredObject)
@@ -262,7 +260,7 @@ public class ViolationDetector
 
             if (!string.IsNullOrEmpty(zone))
             {
-                var z = GetZoneDefinition(zone);
+                var z = GetZoneDefinition(zone, cameraId);
                 if (z != null) matches = matches.Where(d => IsInZone(d.PixelBoundingBox, z));
             }
 
@@ -287,7 +285,7 @@ public class ViolationDetector
     /// <summary>
     /// 检测区域入侵
     /// </summary>
-    private ViolationRecord? DetectZoneIntrusion(SOPStep step, List<DetectedObject> detections, DateTime timestamp)
+    private ViolationRecord? DetectZoneIntrusion(SOPStep step, List<DetectedObject> detections, DateTime timestamp, string cameraId)
     {
         var zoneRules = step.ViolationRules.Where(r => r.Type == ViolationType.ZoneIntrusion).ToList();
 
@@ -302,7 +300,7 @@ public class ViolationDetector
             if (string.IsNullOrEmpty(zoneId))
                 continue;
 
-            var zone = GetZoneDefinition(zoneId);
+            var zone = GetZoneDefinition(zoneId, cameraId);
             if (zone == null)
                 continue;
 
@@ -335,7 +333,7 @@ public class ViolationDetector
     /// 检测跳步：若"下一个"步骤（按 StepId 顺序）的条件已经满足，而当前步骤尚未通过，
     /// 说明当前步骤被跳过。只检查下一步，避免把更后面的 time_elapsed 等条件误报为跳步。
     /// </summary>
-    private ViolationRecord? DetectSkipStep(SOPStep step, List<DetectedObject> detections, HandPoseEstimationResult? handResult, DateTime timestamp)
+    private ViolationRecord? DetectSkipStep(SOPStep step, List<DetectedObject> detections, HandPoseEstimationResult? handResult, DateTime timestamp, string cameraId)
     {
         if (_stateMachine.Workflow?.Settings.EnableSkipDetection != true)
             return null;
@@ -355,7 +353,7 @@ public class ViolationDetector
         // 跳步检测：忽略 nextStep 的 from_region 时序约束。用户跳过中间步骤时，
         // 物体没经过起始区域（如没到嘴边），若要求 visitedFrom 会漏报跳步。
         // 只需核心动作意图（物体到达目标区域）即判定"正在做下一步"，从而报跳步。
-        var eval = _conditionEvaluator.EvaluateConditions(nextStep, detections, handResult, ignoreFromRegion: true);
+        var eval = _conditionEvaluator.EvaluateConditions(nextStep, detections, handResult, timestamp, cameraId, ignoreFromRegion: true);
         if (eval.IsPass)
         {
             return new ViolationRecord
@@ -397,32 +395,42 @@ public class ViolationDetector
         return null;
     }
 
-    private bool IsOnCooldown(ViolationRecord violation)
+    private bool IsOnCooldown(ViolationRecord violation, DateTime timestamp)
     {
         var key = $"{violation.Type}_{violation.StepId}";
         if (_violationCooldown.TryGetValue(key, out var lastTime))
         {
-            return (DateTime.Now - lastTime).TotalSeconds < 3; // 3秒冷却期
+            return (timestamp - lastTime).TotalSeconds < 3; // 3秒冷却期
         }
         return false;
     }
 
-    private void SetCooldown(ViolationRecord violation)
+    private void SetCooldown(ViolationRecord violation, DateTime timestamp)
     {
         var key = $"{violation.Type}_{violation.StepId}";
-        _violationCooldown[key] = DateTime.Now;
+        _violationCooldown[key] = timestamp;
     }
 
-    private ZoneDefinition? GetZoneDefinition(string zoneId)
+    public void Reset() => _violationCooldown.Clear();
+
+    private ZoneDefinition? GetZoneDefinition(string zoneId, string cameraId)
     {
-        if (_zones.TryGetValue(zoneId, out var zone))
+        if (_zones.TryGetValue(ZoneKey(cameraId, zoneId), out var zone))
         {
             return zone;
         }
 
+        var matches = _zones.Values
+            .Where(candidate => candidate.ZoneId.Equals(zoneId, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        if (matches.Count == 1)
+            return matches[0];
+
         Console.WriteLine($"[SOP] 警告: 违规检测器未找到区域定义 '{zoneId}'");
         return null;
     }
+
+    private static string ZoneKey(string cameraId, string zoneId) => $"{cameraId}:{zoneId}";
 
     private static bool IsInZone(SKRect objectBox, ZoneDefinition zone)
     {
