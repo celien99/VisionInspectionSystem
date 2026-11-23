@@ -28,11 +28,17 @@ public class SOPWorkflow
 /// <summary>
 /// SOP 步骤定义
 /// </summary>
+public sealed record RequiredMaterial(string Label, string? Zone, float Confidence);
+
 public class SOPStep
 {
     public int StepId { get; set; }
     public string StepName { get; set; } = "";
     public string Description { get; set; } = "";
+    public List<RequiredMaterial> RequiredMaterials { get; } = new();
+    public string? InspectionAnchor { get; set; }
+    public bool NeedsObjectModel => RequiredMaterials.Count > 0 || ViolationRules.Any(r => r.Type is ViolationType.ForbiddenObject or ViolationType.ObjectRemoved or ViolationType.ZoneIntrusion) ||
+        PassConditions.Any(c => c.Type is ConditionType.ObjectPresent or ConditionType.ObjectInZone or ConditionType.ObjectStable or ConditionType.ObjectAbsent or ConditionType.HandNearObject or ConditionType.HandMoveFromTo);
     public int ExpectedDurationSec { get; set; } = 10;
     public int TimeoutSec { get; set; } = 30;
 
@@ -60,7 +66,7 @@ public class SOPStep
     public string? ModelPath { get; set; }
 
     /// <summary>
-    /// Modbus 违规触发配置：该步骤完成后若发生违规，触发功能码 06 写单个寄存器（Y1-Y8）。
+    /// Modbus 违规触发配置：本周期内该步首次记录违规时，触发功能码 06 写单个寄存器（Y1-Y8）。
     /// 由 YAML 的 step.modbus_trigger 节点解析而来；null = 未配置（不触发）。
     /// </summary>
     public ModbusTriggerConfig? ModbusTrigger { get; set; }
@@ -90,6 +96,7 @@ public class ModbusTriggerConfig
 /// </summary>
 public class StepCondition
 {
+    internal bool IsCarryMove => Type == ConditionType.HandMoveFromTo && !Parameters.ContainsKey("Action");
     public ConditionType Type { get; set; }
     public string TargetObject { get; set; } = "";
     public string? ZoneId { get; set; }
@@ -110,7 +117,7 @@ public enum ConditionType
     HandInRegion,       // 指定手进入某区域
     HandNotInRegion,    // 指定手不在某区域
     HandStable,         // 指定手在区域内稳定 N 帧（用于"放置/保持"确认）
-    HandMoveFromTo,     // 指定手从区域 A 移动到区域 B（取料→放料）
+    HandMoveFromTo,     // 手与指定物体的交互（搬运、取料或放料）
     HandNearObject,     // 指定手靠近某目标物体（手-物交互）
     Custom
 }

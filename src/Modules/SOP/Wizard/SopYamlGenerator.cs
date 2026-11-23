@@ -234,6 +234,7 @@ public static class SopYamlGenerator
 
             case "hand_move":
                 det.Method = "hand_move";
+                det.TargetObject = Obj();
                 det.FromRegion = action.GetParam("from_region");
                 det.ToRegion = action.GetParam("to_region");
                 det.Hand = Hand();

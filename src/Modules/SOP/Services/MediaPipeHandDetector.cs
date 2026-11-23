@@ -206,20 +206,19 @@ public class MediaPipeHandDetector : IDisposable
     /// <summary>
     /// 检测手部
     /// </summary>
-    public List<HandPose> DetectHands(SKBitmap image)
+    public List<HandPose> DetectHands(SKBitmap image, bool requireFresh = false)
     {
         DebugLog("DetectHands 开始");
 
         if (_palmSession == null || _landmarkSession == null)
         {
-            DebugLog("模型未加载，返回空");
-            return new List<HandPose>();
+            throw new InvalidOperationException("手部模型未加载");
         }
 
         // 推理跳帧：每隔 _inferenceInterval 帧才跑模型，中间帧复用上一帧平滑结果（降频省算力）。
         // 首帧 _lastSmoothed 为空，强制跑推理；_inferenceInterval=1 时不跳帧。
         _frameCounter++;
-        if (_inferenceInterval > 1 && _lastSmoothed != null && _frameCounter % _inferenceInterval != 0)
+        if (!requireFresh && _inferenceInterval > 1 && _lastSmoothed != null && _frameCounter % _inferenceInterval != 0)
         {
             DebugLog($"跳帧复用上一帧（间隔={_inferenceInterval}，帧计数={_frameCounter}），返回 {_lastSmoothed.Count} 只手");
             return new List<HandPose>(_lastSmoothed);
@@ -331,7 +330,7 @@ public class MediaPipeHandDetector : IDisposable
         catch (Exception ex)
         {
             DebugLog($"检测异常: {ex.Message}");
-            return new List<HandPose>();
+            throw;
         }
         finally
         {
@@ -388,13 +387,12 @@ public class MediaPipeHandDetector : IDisposable
                     float maxDist = Math.Max(cur.BoundingBox.Width, kv.Value.Pose.BoundingBox.Width) * 1.6f + 30f;
                     if (d >= maxDist) continue;
 
-                    // 手型都已知且不一致 → 加巨大偏置，强制不配对（左/右手不会混淆）
-                    float adj = d;
+                    // 手型都已知且不一致 → 不配对（左/右手不会混淆）
                     if (cur.HandType != HandType.Unknown && kv.Value.Pose.HandType != HandType.Unknown
                         && cur.HandType != kv.Value.Pose.HandType)
-                        adj += 1e6f;
+                        continue;
 
-                    pairs.Add((ci, kv.Key, adj));
+                    pairs.Add((ci, kv.Key, d));
                 }
             }
 
@@ -609,85 +607,18 @@ public class MediaPipeHandDetector : IDisposable
             NamedOnnxValue.CreateFromTensor("input", inputTensor)
         };
 
-        IDisposableReadOnlyCollection<DisposableNamedOnnxValue>? results = null;
+        using var results = _palmSession.Run(inputs);
         try
         {
-            results = _palmSession.Run(inputs);
-        }
-        catch (Exception ex)
-        {
-            DebugLog($"手掌检测推理失败: {ex.Message}");
-            return detections;
-        }
-
-        try
-        {
-            // 验证结果
-            if (results == null || results.Count < 2)
-            {
-                DebugLog($"手掌检测结果无效: count={results?.Count}");
-                return detections;
-            }
-
-            // 解析结果（添加安全检查）
-            var boxesResult = results.ElementAtOrDefault(0);
-            var scoresResult = results.ElementAtOrDefault(1);
-
-            if (boxesResult == null || scoresResult == null)
-            {
-                DebugLog("输出张量为null");
-                return detections;
-            }
-
-            // 尝试转换为张量并记录详细信息
-            var boxes = boxesResult.AsTensor<float>();
-            var scores = scoresResult.AsTensor<float>();
-
-            DebugLog($"boxes 是否为null: {boxes == null}, scores 是否为null: {scores == null}");
-
-            if (boxes != null)
-            {
-                DebugLog($"boxes 维度: [{string.Join(",", boxes.Dimensions.ToArray())}]");
-            }
-            if (scores != null)
-            {
-                DebugLog($"scores 维度: [{string.Join(",", scores.Dimensions.ToArray())}]");
-            }
-
-            // 记录输出名称以便调试模型格式
-            DebugLog($"boxesResult.Name={boxesResult.Name}, scoresResult.Name={scoresResult.Name}");
-
-            // 检查是否是特殊的单阶段模型输出 (batch_nums + score_cx_cy_w...)
-            bool isSingleStageModel = boxes == null ||
-                                      boxesResult.Name == "batch_nums" ||
-                                      scoresResult.Name.Contains("score_cx_cy_w") ||
-                                      scoresResult.Name.Contains("output");
-
-            if (isSingleStageModel && scores != null)
-            {
-                DebugLog("检测到单阶段手部检测模型，使用适配的解析逻辑");
-                var result = ParseSingleStagePalmOutput(scores, image.Width, image.Height);
-                // 过滤面部误检测
-                result = FilterFaceDetections(result, image.Width, image.Height);
-                return result;
-            }
-
-            if (boxes == null || scores == null)
-            {
-                DebugLog("张量转换失败 - 尝试获取更多信息...");
-                try
-                {
-                    DebugLog($"boxesResult 类型: {boxesResult.GetType().FullName}");
-                    DebugLog($"scoresResult 类型: {scoresResult.GetType().FullName}");
-                    DebugLog($"boxesResult 名称: {boxesResult.Name}");
-                    DebugLog($"scoresResult 名称: {scoresResult.Name}");
-                }
-                catch (Exception infoEx)
-                {
-                    DebugLog($"获取结果信息失败: {infoEx.Message}");
-                }
-                return detections;
-            }
+            // The bundled postprocessed model exposes an integer batch count and an Nx8 float tensor.
+            // Select its float output by name before attempting to decode a two-stage model.
+            var rows = results.FirstOrDefault(r => r.Name.Contains("score_cx_cy_w", StringComparison.OrdinalIgnoreCase));
+            if (rows != null)
+                return FilterFaceDetections(ParseSingleStagePalmOutput(rows.AsTensor<float>(), image.Width, image.Height), image.Width, image.Height);
+            if (results.Count < 2) throw new InvalidOperationException("手掌模型输出缺少坐标或分数");
+            var boxes = results.First().AsTensor<float>();
+            var scores = results.ElementAt(1).AsTensor<float>();
+            if (boxes == null || scores == null) throw new InvalidOperationException("手掌模型输出类型不匹配");
 
             // 处理检测结果 (标准两阶段模型)
             for (int i = 0; i < scores.Dimensions[1]; i++)
@@ -714,6 +645,7 @@ public class MediaPipeHandDetector : IDisposable
         catch (Exception ex)
         {
             DebugLog($"解析手掌检测结果失败: {ex.Message}");
+            throw;
         }
 
         return detections.OrderByDescending(d => d.Confidence).ToList();
@@ -885,17 +817,7 @@ public class MediaPipeHandDetector : IDisposable
             NamedOnnxValue.CreateFromTensor("input", inputTensor)
         };
 
-        IDisposableReadOnlyCollection<DisposableNamedOnnxValue>? results = null;
-        try
-        {
-            results = _landmarkSession.Run(inputs);
-        }
-        catch (Exception ex)
-        {
-            DebugLog($"关键点检测推理失败: {ex.Message}");
-            return null;
-        }
-
+        using var results = _landmarkSession.Run(inputs);
         try
         {
             // 验证结果
@@ -1099,7 +1021,7 @@ public class MediaPipeHandDetector : IDisposable
         catch (Exception ex)
         {
             DebugLog($"解析关键点检测结果失败: {ex.Message}");
-            return null;
+            throw;
         }
     }
 

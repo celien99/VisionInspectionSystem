@@ -8,7 +8,7 @@ namespace Modules.SOP.Services;
 /// </summary>
 public interface IHandPoseEstimationService
 {
-    Task<HandPoseEstimationResult> DetectHandsAsync(SKBitmap image);
+    Task<HandPoseEstimationResult> DetectHandsAsync(SKBitmap image, bool requireFresh = false);
     bool IsInitialized { get; }
     Task InitializeAsync(HandPoseEstimationConfig config);
     Task ShutdownAsync();

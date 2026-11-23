@@ -126,10 +126,11 @@ sop:
       name: "成品漏放校验"
       timeout: 30
       transitions: []
-      description: "在夹具区停留2秒，校验壳体/密封垫/盖板/螺栓是否全部就位；任一缺失即判漏放。"
+      description: "在夹具区停留2秒，校验壳体/密封垫/盖板/螺栓是否全部就位；超时时，锚点可见且稳定缺件判漏放，证据不足转人工复核。"
       detection:
         method: "time_elapsed"
-        stable_frames: 2
+        duration_ms: 2000
+      inspection_anchor: "part_base"
       required_objects:
         - { object: "part_base",   zone: "fixture_zone", min_confidence: 0.6 }
         - { object: "part_gasket", zone: "fixture_zone", min_confidence: 0.6 }

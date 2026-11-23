@@ -24,6 +24,7 @@ public sealed class CameraFramePipeline : IDisposable
     private readonly Dictionary<string, PendingFrame> _pendingFrames = new();
     private CancellationTokenSource? _inferenceCts;
     private Task? _inferenceTask;
+    private readonly Dictionary<string, int> _sourceNumbers = new();
 
     public CameraFramePipeline(CameraManager cameraManager, Action<CameraFrameEventArgs> renderPreview,
         Func<Dictionary<string, CaptureFrame>, Task> processFrames)
@@ -72,7 +73,8 @@ public sealed class CameraFramePipeline : IDisposable
         {
             if (_inferenceCts == null || _inferenceCts.IsCancellationRequested) return;
             if (_pendingFrames.Remove(cameraId, out var previous)) previous.Dispose();
-            _pendingFrames[cameraId] = new PendingFrame(bitmap.Copy(), timestamp);
+            var number = _sourceNumbers[cameraId] = _sourceNumbers.GetValueOrDefault(cameraId) + 1;
+            _pendingFrames[cameraId] = new PendingFrame(bitmap.Copy(), timestamp, number);
             _inferenceSignal.Writer.TryWrite(true);
         }
     }
@@ -80,7 +82,6 @@ public sealed class CameraFramePipeline : IDisposable
     private async Task RunInferenceAsync(CancellationToken token)
     {
         var latestFrames = new Dictionary<string, PendingFrame>();
-        var frameNumber = 0;
         try
         {
             while (true)
@@ -113,7 +114,7 @@ public sealed class CameraFramePipeline : IDisposable
                 var frames = latestFrames.ToDictionary(pair => pair.Key, pair => new CaptureFrame
                 {
                     CameraId = pair.Key, Image = pair.Value.Bitmap,
-                    Timestamp = pair.Value.Timestamp, FrameNumber = frameNumber++
+                    Timestamp = pair.Value.Timestamp, FrameNumber = pair.Value.Number
                 });
                 if (frames.Count > 0) await _processFrames(frames).ConfigureAwait(false);
             }
@@ -163,8 +164,11 @@ public sealed class CameraFramePipeline : IDisposable
         public SKBitmap Bitmap { get; }
         public DateTime Timestamp { get; }
 
-        public PendingFrame(SKBitmap bitmap, DateTime timestamp)
+        public int Number { get; }
+
+        public PendingFrame(SKBitmap bitmap, DateTime timestamp, int number)
         {
+            Number = number;
             Bitmap = bitmap;
             Timestamp = timestamp;
         }

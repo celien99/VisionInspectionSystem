@@ -234,6 +234,11 @@
                                     <Setter TargetName="BadgeText" Property="Foreground" Value="White"/>
                                     <Setter TargetName="BadgeText" Property="FontWeight" Value="Bold"/>
                                 </DataTrigger>
+                                <DataTrigger Binding="{Binding Status}" Value="{x:Static vm:StepStatus.Interrupted}">
+                                    <Setter TargetName="Card" Property="Background" Value="#FFFBE6"/>
+                                    <Setter TargetName="BadgeText" Property="Text" Value="未完成"/>
+                                    <Setter TargetName="BadgeText" Property="Foreground" Value="#AD6800"/>
+                                </DataTrigger>
                                 <DataTrigger Binding="{Binding Status}" Value="{x:Static vm:StepStatus.Failed}">
                                     <Setter TargetName="Card" Property="Background" Value="#FFF1F0"/>
                                     <Setter TargetName="Card" Property="BorderBrush" Value="#FFA39E"/>

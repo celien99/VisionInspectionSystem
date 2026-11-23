@@ -960,8 +960,15 @@ namespace Desktop.Views
             {
                 Panel.StopTimer();
                 // 将步骤时间轴的耗时统计合并到上方流程卡片
-                Panel.SyncDurations(e.StepHistory);
-                var isPass = !e.HasViolations;
+                Panel.ShowCycleEnd(e);
+                if (e.Outcome is not (SopCycleOutcome.OK or SopCycleOutcome.NG))
+                {
+                    Panel.SetResult(e.Outcome.ToString(), new SolidColorBrush(Colors.DarkOrange));
+                    Panel.SetStatus(e.Reason, new SolidColorBrush(Colors.DarkOrange));
+                    AddLog($"{e.Outcome}：{e.Reason}");
+                    return;
+                }
+                var isPass = e.Outcome == SopCycleOutcome.OK;
 
                 // ⭐ 统计：一个完整周期结束（PASS / NG 都计入循环次数）
                 Panel.CycleCount++;
@@ -984,13 +991,6 @@ namespace Desktop.Views
                     SaveViolationSnapshot(e);
                 }
 
-                // ⭐ 修复：最后一步完成时 SOPStateMachine.CompleteCurrentStep 走 Completed 分支，
-                // 不会触发 StepChanged 事件；这里手动把最后一步 UI 标为 Completed，
-                // 否则步骤 5 会一直显示"进行中"。
-                if (Panel.Steps.Count > 0)
-                {
-                    Panel.SetStepResult(Panel.Steps.Count - 1, isPass);
-                }
             });
         }
 

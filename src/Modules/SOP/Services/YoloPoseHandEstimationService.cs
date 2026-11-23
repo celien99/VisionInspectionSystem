@@ -89,7 +89,7 @@ public class YoloPoseHandEstimationService : IHandPoseEstimationService, IDispos
 
     private static int _callCount = 0;
     
-    public Task<HandPoseEstimationResult> DetectHandsAsync(SKBitmap image)
+    public Task<HandPoseEstimationResult> DetectHandsAsync(SKBitmap image, bool requireFresh = false)
     {
         _callCount++;
         Console.WriteLine($"[YoloPoseHand] DetectHandsAsync 被调用 #{_callCount}");
@@ -97,7 +97,7 @@ public class YoloPoseHandEstimationService : IHandPoseEstimationService, IDispos
         if (_yolo == null || _landmarkSession == null)
         {
             Console.WriteLine($"[YoloPoseHand] 服务未初始化: _yolo={_yolo != null}, _landmarkSession={_landmarkSession != null}");
-            return Task.FromResult(new HandPoseEstimationResult { Hands = new List<HandPose>() });
+            throw new InvalidOperationException("手部模型未加载");
         }
 
         try
@@ -162,8 +162,7 @@ public class YoloPoseHandEstimationService : IHandPoseEstimationService, IDispos
         catch (Exception ex)
         {
             Console.WriteLine($"[YoloPoseHand] 手部检测失败: {ex.Message}");
-            Console.WriteLine($"[YoloPoseHand] 异常堆栈: {ex.StackTrace}");
-            return Task.FromResult(new HandPoseEstimationResult { Hands = new List<HandPose>() });
+            throw;
         }
     }
 
@@ -280,7 +279,7 @@ public class YoloPoseHandEstimationService : IHandPoseEstimationService, IDispos
         catch (Exception ex)
         {
             Console.WriteLine($"[YoloPoseHand] 手部关键点检测失败: {ex.Message}");
-            return null;
+            throw;
         }
     }
 
@@ -343,7 +342,7 @@ public class YoloPoseHandEstimationService : IHandPoseEstimationService, IDispos
         catch (Exception ex)
         {
             Console.WriteLine($"[YoloPoseHand] Landmark推理失败: {ex.Message}");
-            return null;
+            throw;
         }
     }
 

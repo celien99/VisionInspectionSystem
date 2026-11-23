@@ -110,6 +110,16 @@ artifacts/
 
 `--publish` 默认 Release（可用 `--debug` 覆盖），生成依赖 **.NET 8 桌面运行时**的 Windows x64 发布目录，只发布 Desktop 及其依赖。分发整个 `artifacts/publish/Desktop/<EP>/Release/win-x64/`，其中包含 `configs/`、程序与原生依赖；模型按配方放入 `models/` 或 `yolo_models/`，CUDA 目标机还需 NVIDIA 驱动、CUDA 12.x 和 cuDNN 9.x。日常构建继续使用仓库中的配置，避免复制出多份开发配置。
 
+### 桌面端 SOP 判定与回归
+
+桌面端的 `hand_move` 表示持物搬运。每步必须填写 `target_object`（本步物体模型中的类别）、`from_region` 和 `to_region`。已有配方缺少类别时，加载会报告对应步骤，需要补填后再启动。引擎要求同一只手持续接触同一件目标物料，两者均从起点移至终点。`stable_frames` 指连续手物证据的最少帧数。发生遮挡、接触中断或目标歧义后，需要在起点重新获取证据。此步骤记录搬运到达，放手后的到位状态可用后续物料检测确认。
+
+
+`required_objects` 声明每步所需的物料、区域和最低置信度。转向器与手机包装的终检都要求物料在相应 ROI 内连续齐套 2 秒。超时后，若 `inspection_anchor` 可见且同一组物料持续缺失，周期记为 `NG`。锚点缺失或证据不稳定时记为 `Review`，等待人工复核。按配置自动循环的流程会在 `OK` 或 `NG` 后开始下一周期。当前步骤相机超过 `SOPModule:CameraTimeoutMs` 未到新帧会触发 `Fault`，默认 3000 毫秒。人工停止已开始采集的周期记为 `Aborted`。
+
+在仓库根目录运行 `dotnet run --project tests/SopRegression -p:YoloEp=Cpu` 可回归配方、状态机与记录导出。加上 `-- --models` 会用本地 YOLOv8s 和手部 ONNX 模型执行 CPU 空画面推理与类别校验。两类测试都无需连接相机。现场验收需另用已标注的工位视频统计整周期误放行、误报和复核率。
+
+
 其他辅助脚本的用法和输出见 [scripts/README.md](scripts/README.md)。
 
 ### 目录约定（全部可在运行时解析，无需改代码）

@@ -20,6 +20,13 @@ public class SOPStateMachine
     private readonly HashSet<string> _seenObjects = new(StringComparer.OrdinalIgnoreCase);
     private CancellationTokenSource? _autoResetCts;
 
+    private readonly MaterialInspection _inspection = new();
+    private readonly Dictionary<string, DateTime> _captureTimes = new(StringComparer.OrdinalIgnoreCase);
+    internal static readonly TimeSpan MaxEvidenceGap = TimeSpan.FromMilliseconds(500);
+    public string CycleId { get; private set; } = "";
+    public SopCycleOutcome? Outcome { get; private set; }
+    public string OutcomeReason { get; private set; } = "";
+    public DateTime LastCapture { get; private set; }
     public SOPExecutionState CurrentState { get; private set; } = SOPExecutionState.Idle;
     public int CurrentStepId { get; private set; } = 0;
     public DateTime StepStartTime { get; private set; }
@@ -44,11 +51,13 @@ public class SOPStateMachine
     public event EventHandler<ViolationEventArgs>? ViolationDetected;
     public event EventHandler<SOPCompletedEventArgs>? WorkflowCompleted;
     public event EventHandler<StateChangedEventArgs>? StateChanged;
-    /// <summary>单个步骤完成事件；HasViolations 指示该步是否伴随违规，供 Modbus 06 触发判断。</summary>
+    /// <summary>单个步骤完成事件；HasViolations 指示该步是否伴随违规，供界面显示。</summary>
     public event EventHandler<StepCompletedEventArgs>? StepCompleted;
 
-    public SOPStateMachine(IReadOnlyList<ZoneDefinition>? zones = null)
+    private readonly object _syncRoot;
+    public SOPStateMachine(IReadOnlyList<ZoneDefinition>? zones = null, object? syncRoot = null)
     {
+        _syncRoot = syncRoot ?? new object();
         _conditionEvaluator = new StepConditionEvaluator(this, zones);
         _violationDetector = new ViolationDetector(this, _conditionEvaluator, zones);
     }
@@ -65,7 +74,23 @@ public class SOPStateMachine
     public void Start(SOPWorkflow workflow)
     {
         CancelAutoReset();
+        if (workflow.Steps.GroupBy(s => s.StepId).Any(g => g.Count() != 1) || workflow.Steps.Any(s => s.PassConditions.Count == 0))
+            throw new InvalidOperationException("步骤 ID 重复或缺少通过条件");
+        foreach (var step in workflow.Steps)
+        foreach (var condition in step.PassConditions.Where(c => c.Type == ConditionType.HandMoveFromTo))
+            if (string.IsNullOrWhiteSpace(condition.TargetObject))
+                throw new InvalidOperationException($"步骤 {step.StepId} 的手物动作缺少 target_object");
         _workflow = workflow;
+        _historyLength = workflow.Steps.SelectMany(step => step.PassConditions)
+            .Where(c => c.Type == ConditionType.ObjectStable).Select(c => c.StableFrames).DefaultIfEmpty(1).Max();
+        _currentTracks.Clear();
+        _nextTrackId = 0;
+        CycleId = Guid.NewGuid().ToString("N");
+        Outcome = null;
+        OutcomeReason = "";
+        LastCapture = default;
+        _captureTimes.Clear();
+        _inspection.Reset();
         _stepHistory.Clear();
         _violations.Clear();
         _trackedObjects.Clear();
@@ -90,8 +115,20 @@ public class SOPStateMachine
             return;
 
         var currentStep = _workflow.Steps.FirstOrDefault(s => s.StepId == CurrentStepId);
-        if (currentStep == null)
-            return;
+        if (currentStep == null || !currentStep.CameraId.Equals(cameraId, StringComparison.OrdinalIgnoreCase)) return;
+        if (_captureTimes.TryGetValue(cameraId, out var last))
+        {
+            if (timestamp <= last) return;
+            if (timestamp - last > MaxEvidenceGap)
+            {
+                _inspection.Reset();
+                _conditionEvaluator.Reset();
+                _trackedObjects.Clear();
+            }
+        }
+        if (StepStartTime != default && timestamp < StepStartTime) return;
+        _captureTimes[cameraId] = timestamp;
+        LastCapture = timestamp;
 
         if (StepStartTime == default)
             StepStartTime = timestamp;
@@ -100,22 +137,48 @@ public class SOPStateMachine
         UpdateTrackedObjects(detections, timestamp, cameraId);
         foreach (var detection in detections)
         {
-            if (!string.IsNullOrWhiteSpace(detection.ClassName))
+            if (detection.Confidence >= 0.5f && !string.IsNullOrWhiteSpace(detection.ClassName))
                 _seenObjects.Add(ObjectKey(cameraId, detection.ClassName));
         }
 
-        // 检测违规
-        var violations = _violationDetector.DetectViolations(currentStep, detections, handResult, timestamp, cameraId);
-        foreach (var violation in violations)
+        bool materialReady = true;
+        string? materialMessage = null;
+        if (currentStep.RequiredMaterials.Count > 0)
         {
-            RecordViolation(violation);
-            ViolationDetected?.Invoke(this, new ViolationEventArgs(violation));
+            var inspection = _inspection.Observe(currentStep, detections, _conditionEvaluator.Zones, timestamp);
+            materialReady = inspection.Ready;
+            materialMessage = inspection.Message;
+            var deadline = TimeSpan.FromSeconds(currentStep.TimeoutSec);
+            var elapsed = timestamp - StepStartTime;
+            if (currentStep.TimeoutSec > 0 && (elapsed > deadline || elapsed == deadline && !materialReady))
+            {
+                if (inspection.ConfirmedMissing)
+                    EndCycle(SopCycleOutcome.NG, inspection.Message, timestamp, ViolationType.MissingRequiredObject);
+                else
+                    EndCycle(SopCycleOutcome.Review, "终检超时，需要复核：" + inspection.Message, timestamp);
+                return;
+            }
         }
 
         // 评估步骤条件（物体 + 手部姿态）
         LastEvaluatedStepId = currentStep.StepId;
         LastEvaluatedStepName = currentStep.StepName;
         var evaluation = _conditionEvaluator.EvaluateConditions(currentStep, detections, handResult, timestamp, cameraId);
+
+        if (!materialReady)
+        {
+            evaluation.IsPass = false;
+            evaluation.Message = materialMessage!;
+        }
+
+        // 检测违规
+        var violations = _violationDetector.DetectViolations(currentStep, detections, handResult, timestamp, cameraId,
+            checkSkip: materialReady && evaluation.CheckResults.Any(r => !r.IsMet && !r.WaitingForStability));
+        foreach (var violation in violations)
+        {
+            RecordViolation(violation);
+            ViolationDetected?.Invoke(this, new ViolationEventArgs(violation));
+        }
 
         // 黄金数据集录制：只做只读快照，不参与任何判定分支
         LastEvaluation = evaluation;
@@ -138,6 +201,7 @@ public class SOPStateMachine
     /// </summary>
     private static void EmitFailureDebug(SOPStep step, ConditionEvaluationResult evaluation, List<DetectedObject> detections, HandPoseEstimationResult? handResult)
     {
+        if (!LogThrottle.Allow("sop_condition_failure", 4)) return;
         try
         {
             int handCount = handResult?.Hands?.Count ?? 0;
@@ -164,6 +228,13 @@ public class SOPStateMachine
     {
         CancelAutoReset();
         _workflow = null;
+        Outcome = null;
+        OutcomeReason = "";
+        CycleId = "";
+        LastCapture = default;
+        _inspection.Reset();
+        _captureTimes.Clear();
+        _currentTracks.Clear();
         _stepHistory.Clear();
         _violations.Clear();
         _trackedObjects.Clear();
@@ -181,23 +252,19 @@ public class SOPStateMachine
     /// <summary>
     /// 停止工作流
     /// </summary>
-    public void Stop()
-    {
-        CancelAutoReset();
-        ChangeState(SOPExecutionState.Idle);
-        _workflow = null;
-        CurrentStepId = 0;
-        StepStartTime = default;
-        LastEvaluation = null;
-    }
+    public void Stop() => Reset();
 
+    private readonly Dictionary<DetectedObject, TrackedObject> _currentTracks = new();
+    internal TrackedObject? TrackFor(DetectedObject detection) => _currentTracks.GetValueOrDefault(detection);
     private int _nextTrackId = 0;
+    private int _historyLength = 1;
 
     public bool HasSeenObject(string className, string cameraId)
         => _seenObjects.Contains(ObjectKey(cameraId, className));
 
     private void UpdateTrackedObjects(List<DetectedObject> detections, DateTime timestamp, string cameraId)
     {
+        _currentTracks.Clear();
         var matchedKeys = new HashSet<string>();
         var matchedDetections = new HashSet<int>();
 
@@ -227,7 +294,8 @@ public class SOPStateMachine
             if (bestKey != null)
             {
                 // 匹配成功，更新位置
-                _trackedObjects[bestKey].Update(detection.PixelBoundingBox, timestamp);
+                _trackedObjects[bestKey].Update(detection.PixelBoundingBox, timestamp, detection.Confidence);
+                _currentTracks[detection] = _trackedObjects[bestKey];
                 matchedKeys.Add(bestKey);
                 matchedDetections.Add(i);
             }
@@ -241,12 +309,12 @@ public class SOPStateMachine
             var detection = detections[i];
             var labelName = detection.ClassName;
             var newKey = $"{cameraId}_{labelName}_{_nextTrackId++}";
-            _trackedObjects[newKey] = new TrackedObject(cameraId, labelName, detection.PixelBoundingBox, timestamp);
+            _currentTracks[detection] = _trackedObjects[newKey] = new TrackedObject(cameraId, labelName, detection.PixelBoundingBox, timestamp, _historyLength, detection.Confidence);
         }
 
         // 清理过期跟踪（2秒未更新的对象视为离开画面）
         var expired = _trackedObjects
-            .Where(kv => (timestamp - kv.Value.LastUpdate).TotalSeconds > 2)
+            .Where(kv => (kv.Value.CameraId.Equals(cameraId, StringComparison.OrdinalIgnoreCase) && kv.Value.LastUpdate != timestamp) || (timestamp - kv.Value.LastUpdate).TotalSeconds > 2)
             .Select(kv => kv.Key)
             .ToList();
 
@@ -291,42 +359,70 @@ public class SOPStateMachine
             StartTime = StepStartTime,
             EndTime = timestamp,
             Duration = timestamp - StepStartTime,
-            IsPass = true,
+            IsPass = !_violations.Any(v => v.StepId == CurrentStepId),
             StandardDurationSec = currentStep.StandardDurationSec
         };
         _stepHistory.Add(record);
 
-        // ⭐ 该步是否伴随违规（供 Modbus 06 触发判断）
+        // ⭐ 该步是否伴随违规（供界面显示）
         var stepHadViolation = _violations.Any(v => v.StepId == CurrentStepId);
         StepCompleted?.Invoke(this, new StepCompletedEventArgs(currentStep, stepHadViolation));
 
         // 检查是否完成所有步骤
         if (CurrentStepId >= _workflow.Steps.Max(s => s.StepId))
         {
-            ChangeState(SOPExecutionState.Completed);
-            WorkflowCompleted?.Invoke(this, new SOPCompletedEventArgs(_stepHistory, _violations)
-            {
-                WorkflowName = _workflow.Name,
-                WorkflowId = _workflow.Id
-            });
+            EndCycle(_violations.Count == 0 ? SopCycleOutcome.OK : SopCycleOutcome.NG, "", timestamp);
 
-            if (_workflow.Settings.AutoResetOnComplete)
-            {
-                // ⭐ 修复：原版只调用 Reset()，但 Reset() 之后状态变 Idle，ProcessFrame 会因
-                // CurrentState != Running 直接 return，导致即使配了 AutoResetOnComplete
-                // 也不会真的循环。改为先 Reset 清空状态，然后重新 Start 同一 workflow。
-                var workflow = _workflow;
-                var resetCts = new CancellationTokenSource();
-                _autoResetCts = resetCts;
-                _ = AutoResetAsync(workflow, resetCts);
-            }
         }
         else
         {
+            _inspection.Reset();
+            foreach (var track in _trackedObjects.Values) track.ResetHistory();
             var previousStepId = CurrentStepId;
             CurrentStepId = _workflow.Steps.Where(s => s.StepId > CurrentStepId).Min(s => s.StepId);
+            if (!_workflow.Steps.First(s => s.StepId == CurrentStepId).CameraId.Equals(currentStep.CameraId, StringComparison.OrdinalIgnoreCase))
+            {
+                _trackedObjects.Clear();
+                _conditionEvaluator.Reset();
+            }
             StepStartTime = timestamp;
             StepChanged?.Invoke(this, new StepChangedEventArgs(previousStepId, CurrentStepId, _workflow.Steps.FirstOrDefault(s => s.StepId == CurrentStepId)?.StepName ?? ""));
+        }
+    }
+
+    internal void EndCycle(SopCycleOutcome outcome, string reason, DateTime timestamp, ViolationType? violation = null)
+    {
+        if (_workflow == null || CurrentState != SOPExecutionState.Running || Outcome.HasValue) return;
+        Outcome = outcome;
+        OutcomeReason = reason;
+        if (violation is { } type)
+        {
+            var record = new ViolationRecord { StepId = CurrentStepId, Timestamp = timestamp, Type = type, Description = reason };
+            RecordViolation(record);
+            ViolationDetected?.Invoke(this, new ViolationEventArgs(record));
+        }
+        var start = _stepHistory.FirstOrDefault()?.StartTime ?? (StepStartTime == default ? timestamp : StepStartTime);
+        ChangeState(outcome is SopCycleOutcome.OK or SopCycleOutcome.NG ? SOPExecutionState.Completed : SOPExecutionState.Error);
+        var workflow = _workflow;
+        var cycle = CycleId;
+        var step = workflow.Steps.FirstOrDefault(s => s.StepId == CurrentStepId);
+        var interruptedStart = StepStartTime == default ? timestamp : StepStartTime;
+        var interrupted = step != null && _stepHistory.All(s => s.StepId != CurrentStepId) ? new StepExecutionRecord
+        {
+            StepId = step.StepId, StepName = step.StepName, StandardDurationSec = step.StandardDurationSec,
+            StartTime = interruptedStart, EndTime = timestamp < interruptedStart ? interruptedStart : timestamp,
+            Duration = timestamp > interruptedStart ? timestamp - interruptedStart : TimeSpan.Zero
+        } : null;
+        WorkflowCompleted?.Invoke(this, new SOPCompletedEventArgs(_stepHistory, _violations)
+        {
+            WorkflowId = _workflow.Id, WorkflowName = _workflow.Name, CycleId = CycleId, Outcome = outcome,
+            InterruptedStep = interrupted, Reason = reason, FinalStepId = CurrentStepId, StartTime = start, EndTime = timestamp < start ? start : timestamp
+        });
+        if (CurrentState == SOPExecutionState.Completed && workflow.Settings.AutoResetOnComplete && CycleId == cycle)
+        {
+            var resetCts = new CancellationTokenSource();
+            _autoResetCts = resetCts;
+            _ = AutoResetAsync(workflow, resetCts);
         }
     }
 
@@ -347,12 +443,13 @@ public class SOPStateMachine
         try
         {
             await Task.Delay(TimeSpan.FromSeconds(workflow.Settings.ResetDelaySec), resetCts.Token);
-            if (resetCts.IsCancellationRequested || !ReferenceEquals(_autoResetCts, resetCts) ||
-                CurrentState != SOPExecutionState.Completed || !ReferenceEquals(_workflow, workflow))
-                return;
-
-            Reset();
-            Start(workflow);
+            lock (_syncRoot)
+            {
+                if (resetCts.IsCancellationRequested || !ReferenceEquals(_autoResetCts, resetCts) ||
+                    CurrentState != SOPExecutionState.Completed || !ReferenceEquals(_workflow, workflow)) return;
+                Reset();
+                Start(workflow);
+            }
         }
         catch (OperationCanceledException)
         {
@@ -382,6 +479,8 @@ public class SOPStateMachine
 /// <summary>
 /// SOP 执行状态
 /// </summary>
+public enum SopCycleOutcome { OK, NG, Review, Fault, Aborted }
+
 public enum SOPExecutionState
 {
     Idle,
@@ -404,31 +503,44 @@ public class TrackedObject
     public int FrameCount { get; private set; }
     public List<SKRect> PositionHistory { get; } = new();
 
-    public TrackedObject(string cameraId, string className, SKRect boundingBox, DateTime timestamp)
+    private readonly int _historyLength;
+    private readonly List<double> _confidences = new();
+
+    public TrackedObject(string cameraId, string className, SKRect boundingBox, DateTime timestamp, int historyLength = 30, double confidence = 1)
     {
         CameraId = cameraId;
         ClassName = className;
         BoundingBox = boundingBox;
         FirstSeen = timestamp;
         LastUpdate = timestamp;
-        FrameCount = 1;
-        PositionHistory.Add(boundingBox);
+        _historyLength = Math.Max(1, historyLength);
+        Update(boundingBox, timestamp, confidence);
     }
 
-    public void Update(SKRect newBox, DateTime timestamp)
+    internal void ResetHistory()
+    {
+        PositionHistory.Clear();
+        _confidences.Clear();
+    }
+
+    public void Update(SKRect newBox, DateTime timestamp, double confidence = 1)
     {
         BoundingBox = newBox;
         LastUpdate = timestamp;
         FrameCount++;
         PositionHistory.Add(newBox);
-        if (PositionHistory.Count > 30)
+        _confidences.Add(confidence);
+        if (PositionHistory.Count > _historyLength)
+        {
             PositionHistory.RemoveAt(0);
+            _confidences.RemoveAt(0);
+        }
     }
 
-    public bool IsStable(float tolerance)
+    public bool IsStable(float tolerance, int frames = 5, double minConfidence = 0)
     {
-        if (PositionHistory.Count < 5) return false;
-        var recent = PositionHistory.TakeLast(5).ToList();
+        if (PositionHistory.Count < frames || _confidences.TakeLast(frames).Any(c => c < minConfidence)) return false;
+        var recent = PositionHistory.TakeLast(frames).ToList();
         var centerX = recent.Average(r => r.MidX);
         var centerY = recent.Average(r => r.MidY);
         return recent.All(r => Math.Abs(r.MidX - centerX) < tolerance && Math.Abs(r.MidY - centerY) < tolerance);
@@ -492,7 +604,14 @@ public class ViolationEventArgs : EventArgs
     {
         public IReadOnlyList<StepExecutionRecord> StepHistory { get; }
         public IReadOnlyList<ViolationRecord> Violations { get; }
-        public TimeSpan TotalDuration => StepHistory.Last().EndTime - StepHistory.First().StartTime;
+        public DateTime StartTime { get; init; }
+        public DateTime EndTime { get; init; }
+        public string CycleId { get; init; } = "";
+        public SopCycleOutcome Outcome { get; init; }
+        public string Reason { get; init; } = "";
+        public int FinalStepId { get; init; }
+        public StepExecutionRecord? InterruptedStep { get; init; }
+        public TimeSpan TotalDuration => EndTime - StartTime;
         public bool HasViolations => Violations.Count > 0;
 
         /// <summary>本次运行所属的 SOP 流程名称（来自 SOPWorkflow.Name），供运行记录器归类。</summary>

@@ -454,6 +454,7 @@ namespace Desktop.Views
 
             ForbiddenTextBox.Text = string.Join(", ", step.ForbiddenObjects ?? new List<string>());
             MustKeepTextBox.Text = string.Join(", ", step.MustKeep ?? new List<string>());
+            InspectionAnchorTextBox.Text = step.InspectionAnchor ?? "";
             RequiredObjectsTextBox.Text = FormatRequiredObjects(step.RequiredObjects);
             StandardDurationMsTextBox.Text = step.StandardDurationMs.ToString();
 
@@ -518,6 +519,7 @@ namespace Desktop.Views
             ForbiddenTextBox.Text = "";
             MustKeepTextBox.Text = "";
             RequiredObjectsTextBox.Text = "";
+            InspectionAnchorTextBox.Text = "";
             StandardDurationMsTextBox.Text = "";
             // ⭐ 步骤级 Modbus 触发复位为默认
             ModbusTriggerCheckBox.IsChecked = false;
@@ -570,7 +572,8 @@ namespace Desktop.Views
             }
             if (TolerancePanel.Visibility == Visibility.Visible && float.TryParse(ToleranceTextBox.Text, out var tol))
                 d.Tolerance = tol;
-            if (DurationPanel.Visibility == Visibility.Visible && int.TryParse(DurationMsTextBox.Text, out var dur))
+            if (string.IsNullOrWhiteSpace(DurationMsTextBox.Text)) d.DurationMs = null;
+            else if (int.TryParse(DurationMsTextBox.Text, out var dur))
                 d.DurationMs = dur;
             if (float.TryParse(MinConfTextBox.Text, out var conf)) d.MinConfidence = conf;
             if (int.TryParse(StableFramesTextBox.Text, out var sf)) d.StableFrames = sf;
@@ -578,6 +581,7 @@ namespace Desktop.Views
 
             step.ForbiddenObjects = SplitList(ForbiddenTextBox.Text);
             step.MustKeep = SplitList(MustKeepTextBox.Text);
+            step.InspectionAnchor = string.IsNullOrWhiteSpace(InspectionAnchorTextBox.Text) ? null : InspectionAnchorTextBox.Text.Trim();
             step.RequiredObjects = ParseRequiredObjects(RequiredObjectsTextBox.Text);
             step.StandardDurationMs = int.TryParse(StandardDurationMsTextBox.Text, out var sd) ? Math.Max(0, sd) : 0;
 
@@ -1097,13 +1101,13 @@ namespace Desktop.Views
 
             Visibility V(bool visible) => visible ? Visibility.Visible : Visibility.Collapsed;
 
-            TargetObjectPanel.Visibility = V(IsIn(m, "person_present", "object_present", "object_in_zone", "hand_action", "hand_near_object"));
+            TargetObjectPanel.Visibility = V(IsIn(m, "person_present", "object_present", "object_in_zone", "pose_stable", "hand_move", "hand_action", "hand_near_object"));
             HandPanel.Visibility = V(IsIn(m, "hand_in_region", "hand_not_in_region", "hand_stable", "hand_move", "hand_action", "hand_near_object"));
             ActionPanel.Visibility = V(IsIn(m, "hand_action"));
-            RegionPanel.Visibility = V(IsIn(m, "hand_in_region", "hand_not_in_region", "object_in_zone"));
+            RegionPanel.Visibility = V(IsIn(m, "hand_in_region", "hand_not_in_region", "hand_stable", "object_in_zone"));
             FromToPanel.Visibility = V(IsIn(m, "hand_move", "hand_action"));
             TolerancePanel.Visibility = V(IsIn(m, "hand_stable", "hand_near_object", "pose_stable"));
-            DurationPanel.Visibility = V(IsIn(m, "time_elapsed"));
+
         }
 
         private static bool IsIn(string value, params string[] set) => set.Contains(value);
@@ -1151,7 +1155,7 @@ namespace Desktop.Views
                 var line = o.Object ?? "";
                 if (!string.IsNullOrWhiteSpace(o.Zone)) line += "," + o.Zone;
                 if (Math.Abs(o.MinConfidence - 0.5f) > 1e-6)
-                    line += ":" + o.MinConfidence.ToString("0.##");
+                    line += ":" + o.MinConfidence.ToString("R", System.Globalization.CultureInfo.InvariantCulture);
                 sb.AppendLine(line);
             }
             return sb.ToString();
@@ -1166,25 +1170,12 @@ namespace Desktop.Views
                 var line = raw.Trim();
                 if (line.Length == 0) continue;
                 // 格式：物体名[,区域ID][:最小置信度]
-                var parts = line.Split(',', 2);
-                var obj = new SopyamlRequiredObject { Object = parts[0].Trim() };
-                if (parts.Length > 1)
-                {
-                    var rest = parts[1].Trim();
-                    var ci = rest.IndexOf(':');
-                    if (ci >= 0)
-                    {
-                        var zonePart = rest.Substring(0, ci).Trim();
-                        if (zonePart.Length > 0) obj.Zone = zonePart;
-                        var confPart = rest.Substring(ci + 1).Trim();
-                        if (float.TryParse(confPart, out var c)) obj.MinConfidence = c;
-                    }
-                    else
-                    {
-                        obj.Zone = rest;
-                    }
-                }
-                if (string.IsNullOrWhiteSpace(obj.Object)) continue;
+                var fields = line.Split(':', 2);
+                var parts = fields[0].Split(',', 2);
+                var obj = new SopyamlRequiredObject { Object = parts[0].Trim(), Zone = parts.Length > 1 ? parts[1].Trim() : null };
+                if (fields.Length > 1)
+                    obj.MinConfidence = float.TryParse(fields[1].Trim(), System.Globalization.NumberStyles.Float,
+                        System.Globalization.CultureInfo.InvariantCulture, out var value) ? value : -1; // rejected by save validation
                 list.Add(obj);
             }
             return list.Count > 0 ? list : null;

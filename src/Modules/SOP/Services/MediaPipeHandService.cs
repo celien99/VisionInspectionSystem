@@ -22,13 +22,13 @@ public class MediaPipeHandService : IHandPoseEstimationService
         return Task.CompletedTask;
     }
 
-    public Task<HandPoseEstimationResult> DetectHandsAsync(SKBitmap image)
+    public Task<HandPoseEstimationResult> DetectHandsAsync(SKBitmap image, bool requireFresh = false)
     {
         lock (_lock)
         {
             return Task.FromResult(new HandPoseEstimationResult
             {
-                Hands = _detector?.IsInitialized == true ? _detector.DetectHands(image) : new(),
+                Hands = _detector?.IsInitialized == true ? _detector.DetectHands(image, requireFresh) : throw new InvalidOperationException("手部模型未加载"),
                 Timestamp = DateTime.Now
             });
         }

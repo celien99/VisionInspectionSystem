@@ -1061,18 +1061,18 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         System.Windows.Application.Current?.Dispatcher.BeginInvoke(new Action(() =>
         {
             if (_isDisposed) return;
-            var isPass = !e.HasViolations;
+            var isPass = e.Outcome == SopCycleOutcome.OK;
             if (isPass)
             {
                 // 整个流程无违规 → 清空横幅（兜底，正常情况下步骤完成时已清）
                 _overlayRenderer.ClearViolations();
             }
-            SopStatus = isPass ? "✅ SOP 全部通过" : "❌ SOP 检测不通过";
+            SopStatus = isPass ? "✅ SOP 全部通过" : $"{e.Outcome} {e.Reason}";
             Status = isPass
                 ? $"SOP 完成: 全部 {TotalSteps} 步通过"
-                : $"SOP 完成: 有 {e.Violations.Count} 个违规";
-            // 最后一步完成也播放 ok.wav
-            _audioFeedback.PlayOk();
+                : $"SOP {e.Outcome} {e.Reason}（{e.Violations.Count} 条违规）";
+            if (isPass) _audioFeedback.PlayOk();
+            else if (e.Outcome != SopCycleOutcome.Aborted) _audioFeedback.PlayNg();
         }));
     }
 

@@ -73,9 +73,8 @@ sop:
         min_confidence: 0.6
         stable_frames: 3
         description: "手从手机放置区拿起手机"
-      violation_rules:
-        - type: "wrong_hand"
-          description: "使用了不允许的手"
+      # 下列为人工复核项目，原示例未提供可执行判据。
+      # "使用了不允许的手"
     
     # 步骤3: 打电话
     - id: "make_call"
@@ -91,11 +90,9 @@ sop:
         stable_frames: 5
         duration_ms: 1000
         description: "手在耳边区域停留1秒"
-      violation_rules:
-        - type: "hand_leave_early"
-          description: "手过早离开耳边"
-        - type: "wrong_posture"
-          description: "打电话姿势不正确"
+      # 下列为人工复核项目，原示例未提供可执行判据。
+      # "手过早离开耳边"
+      # "打电话姿势不正确"
     
     # 步骤4: 放下手机
     - id: "put_down_phone"
@@ -112,9 +109,8 @@ sop:
         min_confidence: 0.6
         stable_frames: 3
         description: "手将手机放回放置区"
-      violation_rules:
-        - type: "wrong_location"
-          description: "手机放错位置"
+      # 下列为人工复核项目，原示例未提供可执行判据。
+      # "手机放错位置"
     
     # 步骤5: 完成
     - id: "complete"

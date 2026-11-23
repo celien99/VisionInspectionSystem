@@ -42,6 +42,7 @@ sop:
       timeout: 30
       transitions: ["pick_part"]
       description: "等待操作员开始作业"
+      detection: { method: "hand_in_region", hand: "any", region: "part_box" }
       
     - id: "pick_part"
       name: "取壳体"
@@ -106,13 +107,13 @@ sop:
         stable_frames: 10
     
     - id: "check_torque"
-      name: "扭矩值确认"
+      name: "拧紧后等候（演示）"
       timeout: 5
       transitions: ["release"]
-      description: "确认扭矩值在范围内"
+      description: "等候 2 秒。实际扭矩需由工具控制器确认。"
       detection:
         method: "time_elapsed"
-        stable_frames: 2
+        duration_ms: 2000
     
     - id: "release"
       name: "放行"
@@ -131,3 +132,4 @@ sop:
       timeout: 2
       transitions: ["idle"]
       description: "作业完成"
+      detection: { method: "time_elapsed", duration_ms: 0 }

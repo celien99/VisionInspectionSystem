@@ -85,8 +85,8 @@ public partial class SopDashboardWindow : Window
         // ===== KPI =====
         int total = filtered.Count;
         int ok = filtered.Count(r => r.Result == "OK");
-        int ng = total - ok;
-        double okRate = total > 0 ? (double)ok / total * 100 : 0;
+        int ng = filtered.Count(r => r.Result == "NG");
+        double okRate = ok + ng > 0 ? (double)ok / (ok + ng) * 100 : 0;
         double avgTotal = total > 0 ? filtered.Average(r => r.TotalDurationSec) : 0;
 
         var cyclesWithStd = filtered.Where(r => r.Steps.Sum(s => s.StandardDurationSec) > 0).ToList();
@@ -110,7 +110,7 @@ public partial class SopDashboardWindow : Window
             {
                 var stepName = g.First().Rec.Steps.FirstOrDefault(s => s.StepId == g.Key)?.StepName;
                 if (string.IsNullOrWhiteSpace(stepName))
-                    stepName = g.First().Rec.Steps.FirstOrDefault()?.StepName ?? $"步骤{g.Key}";
+                    stepName = g.First().Rec.InterruptedStep is { } stopped && stopped.StepId == g.Key ? stopped.StepName : $"步骤{g.Key}";
                 return new ViolationRankRow
                 {
                     StepId = g.Key,
@@ -237,7 +237,7 @@ public partial class SopDashboardWindow : Window
         try
         {
             WriteCsv(dlg.FileName, filtered);
-            txtStatus.Text = $"已导出 {filtered.Count} 个周期 / {filtered.Sum(r => r.Steps.Count)} 步 → {Path.GetFileName(dlg.FileName)}";
+            txtStatus.Text = $"已导出 {filtered.Count} 个周期 / {filtered.Sum(r => r.Steps.Count + (r.InterruptedStep == null ? 0 : 1))} 步 → {Path.GetFileName(dlg.FileName)}";
         }
         catch (Exception ex)
         {
@@ -276,7 +276,8 @@ public partial class SopDashboardWindow : Window
     /// <summary>单条周期记录是否完整：步骤非空、步骤数与声明一致、各步耗时有效。</summary>
     private bool IsRecordComplete(SopCycleRecord r)
     {
-        if (r.Steps == null || r.Steps.Count == 0) return false;
+        if (r.Steps == null || (r.Steps.Count == 0 && r.InterruptedStep == null)) return false;
+        if (r.InterruptedStep?.DurationSec < 0) return false;
         if (r.StepCount > 0 && r.Steps.Count != r.StepCount) return false;
         if (r.Steps.Any(s => s.DurationSec < 0)) return false;
         return true;
@@ -286,42 +287,14 @@ public partial class SopDashboardWindow : Window
     private void WriteCsv(string path, List<SopCycleRecord> records)
     {
         var sb = new StringBuilder();
-        sb.AppendLine("CycleIndex,CycleTime,Operator,WorkflowName,Result,TotalDurationSec,StepIndex,StepId,StepName,StepDurationSec,StandardDurationSec,ViolationCount,ViolationTypes");
-
-        foreach (var rec in records.OrderBy(r => r.EndTime))
-        {
-            var violationTypes = string.Join("|", rec.Violations.Select(v => v.Type));
-            var op = string.IsNullOrWhiteSpace(rec.Operator) ? "未知用户" : rec.Operator;
-            for (int i = 0; i < rec.Steps.Count; i++)
-            {
-                var s = rec.Steps[i];
-                sb.AppendLine(string.Join(",",
-                    CsvField(rec.CycleIndex.ToString()),
-                    CsvField(rec.EndTime.ToString("yyyy-MM-dd HH:mm:ss")),
-                    CsvField(op),
-                    CsvField(rec.WorkflowName),
-                    CsvField(rec.Result),
-                    CsvField(rec.TotalDurationSec.ToString("F2")),
-                    CsvField((i + 1).ToString()),
-                    CsvField(s.StepId.ToString()),
-                    CsvField(s.StepName),
-                    CsvField(s.DurationSec.ToString("F2")),
-                    CsvField(s.StandardDurationSec.ToString("F2")),
-                    CsvField(rec.Violations.Count.ToString()),
-                    CsvField(violationTypes)));
-            }
-        }
+        sb.AppendLine(SopRunRecorder.CsvHeader);
+        foreach (var record in records.OrderBy(r => r.EndTime))
+            SopRunRecorder.AppendCsvRows(sb, record);
 
         File.WriteAllText(path, sb.ToString(), new UTF8Encoding(true));
     }
 
-    /// <summary>CSV 字段转义：含逗号/引号/换行时用双引号包裹并转义内部引号。</summary>
-    private static string CsvField(string v) =>
-        string.IsNullOrEmpty(v)
-            ? "\"\""
-            : (v.Contains(',') || v.Contains('"') || v.Contains('\n')
-                ? "\"" + v.Replace("\"", "\"\"") + "\""
-                : v);
+
 }
 
 public class ViolationRankRow

@@ -48,6 +48,7 @@ sop:
       timeout: 20
       detection:
         method: "hand_move"          # 手部动作：从 A 区移到 B 区
+        target_object: "phone"
         hand: "right"
         from_region: "part_box"
         to_region: "fixture"

@@ -35,6 +35,7 @@ sop:
       timeout: 15
       detection:
         method: "hand_move"
+        target_object: "phone"
         hand: "right"
         from_region: "phone_tray"
         to_region: "bottom_case_zone"
@@ -45,47 +46,62 @@ sop:
       timeout: 15
       detection:
         method: "hand_move"
+        target_object: "manual"
         hand: "right"
         from_region: "manual_zone"
         to_region: "bottom_case_zone"
 
     - id: "4"
-      name: "放入充电配件"
-      description: "右手从配件位取充电器/线移入装配区"
+      name: "放入充电器"
+      description: "右手从配件位取充电器移入装配区"
       timeout: 20
       detection:
         method: "hand_move"
+        target_object: "charger"
         hand: "right"
         from_region: "accessory_zone"
         to_region: "bottom_case_zone"
 
     - id: "5"
+      name: "放入充电线"
+      timeout: 20
+      detection:
+        method: "hand_move"
+        target_object: "cable"
+        hand: "right"
+        from_region: "accessory_zone"
+        to_region: "bottom_case_zone"
+
+    - id: "6"
       name: "盖上盖"
       description: "右手从上盖存放取上盖移入装配区上方"
       timeout: 20
       detection:
         method: "hand_move"
+        target_object: "case_top"
         hand: "right"
         from_region: "top_case_zone"
         to_region: "bottom_case_zone"
 
-    - id: "6"
+    - id: "7"
       name: "移至成品"
       description: "右手将装配好的手机盒移到成品区"
       timeout: 15
       detection:
         method: "hand_move"
+        target_object: "case_bottom"
         hand: "right"
         from_region: "bottom_case_zone"
         to_region: "finished_zone"
 
-    - id: "7"
+    - id: "8"
       name: "成品校验（漏放检测）"
-      description: "在成品区停留2秒，校验手机/上盖/下盖/说明书/充电器/充电线是否全部就位；任一缺失即判漏放。坐标与区域为占位值，请用 ROI 工具按真机标定 finished_zone。"
+      description: "在成品区停留2秒，校验手机/上盖/下盖/说明书/充电器/充电线是否全部就位；超时时，锚点可见且稳定缺件判漏放，证据不足转人工复核。坐标与区域为占位值，请用 ROI 工具按真机标定 finished_zone。"
       timeout: 20
       detection:
         method: "time_elapsed"
-        stable_frames: 2          # 复用为 RequiredSeconds=2（成品需在画面停留2秒）
+        duration_ms: 2000
+      inspection_anchor: "phone"
       required_objects:
         - { object: "phone",       zone: "finished_zone", min_confidence: 0.5 }
         - { object: "case_top",    zone: "finished_zone", min_confidence: 0.5 }

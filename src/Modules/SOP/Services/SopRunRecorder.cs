@@ -11,15 +11,7 @@ namespace Modules.SOP.Services;
 
 /// <summary>
 /// SOP 运行数据记录器。
-/// 订阅 SOPModule.WorkflowCompleted（每跑完一个完整周期触发一次），把该周期的运行情况落盘到「按天文件」：
-///   - sop_records/sop_run_YYYY-MM-DD.jsonl ：每行一个周期的完整结构化记录（OK/NG、总耗时、每步耗时、违规明细）
-///   - sop_records/sop_run_YYYY-MM-DD.csv  ：长表，每步一行，方便用 Excel/脚本做透视统计
-///
-/// 记录内容满足三类需求：
-///   1) 每个 SOP 当天的运行情况（按 WorkflowName 归类，文件按天切分）
-///   2) 每个周期是 OK 还是 NG（HasViolations 决定）
-///   3) 每个周期的每个步骤用了多少秒（StepHistory 中每步 Duration）
-///
+/// 按日保存周期结论、已完成步骤、未完成的末步及违规明细。JSONL 每周期一条，CSV 每步一行。
 /// 文件位于 <程序基目录>/sop_records/。写入失败仅吞异常，不影响检测主流程。
 /// </summary>
 public class SopRunRecorder
@@ -50,11 +42,8 @@ public class SopRunRecorder
     {
         try
         {
-            if (e.StepHistory == null || e.StepHistory.Count == 0) return;
-
-            var startTime = e.StepHistory.First().StartTime;
-            var endTime = e.StepHistory.Last().EndTime;
-            var result = e.HasViolations ? "NG" : "OK";
+            var startTime = e.StartTime;
+            var endTime = e.EndTime;
 
             var record = new SopCycleRecord
             {
@@ -63,16 +52,14 @@ public class SopRunRecorder
                 WorkflowName = e.WorkflowName,
                 WorkflowId = e.WorkflowId,
                 Operator = e.Operator,
-                Result = result,
+                Result = e.Outcome.ToString(),
+                CycleId = e.CycleId,
+                EndReason = e.Reason,
+                FinalStepId = e.FinalStepId,
                 TotalDurationSec = Math.Round((endTime - startTime).TotalSeconds, 2),
                 StepCount = e.StepHistory.Count,
-                Steps = e.StepHistory.Select(s => new SopStepDuration
-                {
-                    StepId = s.StepId,
-                    StepName = s.StepName,
-                    DurationSec = Math.Round(s.Duration.TotalSeconds, 2),
-                    StandardDurationSec = Math.Round(s.StandardDurationSec, 2)
-                }).ToList(),
+                InterruptedStep = e.InterruptedStep == null ? null : ToDuration(e.InterruptedStep),
+                Steps = e.StepHistory.Select(ToDuration).ToList(),
                 Violations = e.Violations.Select(v => new SopViolationSummary
                 {
                     Type = v.Type.ToString(),
@@ -88,6 +75,12 @@ public class SopRunRecorder
             Debug.WriteLine($"[SOP记录] 周期写入失败: {ex.Message}");
         }
     }
+
+    private static SopStepDuration ToDuration(StepExecutionRecord step) => new()
+    {
+        StepId = step.StepId, StepName = step.StepName,
+        DurationSec = Math.Round(step.Duration.TotalSeconds, 2), StandardDurationSec = Math.Round(step.StandardDurationSec, 2)
+    };
 
     private void AppendRecord(SopCycleRecord record)
     {
@@ -116,41 +109,38 @@ public class SopRunRecorder
 
             // 2) CSV：长表，每步一行（首行不存在或为空时写表头）
             bool csvNew = !File.Exists(csvPath) || new FileInfo(csvPath).Length == 0;
+            // Continue the old schema when appending to an existing day's file.
+            bool extended = csvNew || File.ReadLines(csvPath).First().EndsWith(",EndReason", StringComparison.Ordinal);
             var sb = new StringBuilder();
-            if (csvNew)
-            {
-                sb.AppendLine("CycleIndex,CycleTime,Operator,WorkflowName,Result,TotalDurationSec,StepIndex,StepId,StepName,StepDurationSec,StandardDurationSec,ViolationCount,ViolationTypes");
-            }
-            var violationTypes = string.Join("|", record.Violations.Select(v => v.Type));
-            for (int i = 0; i < record.Steps.Count; i++)
-            {
-                var s = record.Steps[i];
-                sb.AppendLine(string.Join(",",
-                    CsvField(sequence.ToString()),
-                    CsvField(record.EndTime.ToString("yyyy-MM-dd HH:mm:ss")),
-                    CsvField(record.Operator),
-                    CsvField(record.WorkflowName),
-                    CsvField(record.Result),
-                    CsvField(record.TotalDurationSec.ToString("F2")),
-                    CsvField((i + 1).ToString()),
-                    CsvField(s.StepId.ToString()),
-                    CsvField(s.StepName),
-                    CsvField(s.DurationSec.ToString("F2")),
-                    CsvField(s.StandardDurationSec.ToString("F2")),
-                    CsvField(record.Violations.Count.ToString()),
-                    CsvField(violationTypes)));
-            }
+            if (csvNew) sb.AppendLine(CsvHeader);
+            AppendCsvRows(sb, record, extended);
             File.AppendAllText(csvPath, sb.ToString());
         }
     }
 
-    /// <summary>CSV 字段转义：含逗号/引号/换行时用双引号包裹并转义内部引号。</summary>
-    private static string CsvField(string v) =>
-        string.IsNullOrEmpty(v)
-            ? "\"\""
-            : (v.Contains(',') || v.Contains('"') || v.Contains('\n')
-                ? "\"" + v.Replace("\"", "\"\"") + "\""
-                : v);
+    public const string CsvHeader = "CycleIndex,CycleTime,Operator,WorkflowName,Result,TotalDurationSec,StepIndex,StepId,StepName,StepDurationSec,StandardDurationSec,ViolationCount,ViolationTypes,CycleId,StepStatus,EndReason";
+
+    public static void AppendCsvRows(StringBuilder csv, SopCycleRecord record, bool extended = true)
+    {
+        var steps = record.Steps.Cast<SopStepDuration?>().ToList();
+        if (record.InterruptedStep != null || steps.Count == 0) steps.Add(record.InterruptedStep);
+        var violations = string.Join("|", record.Violations.Select(v => v.Type));
+        for (int i = 0; i < steps.Count; i++)
+        {
+            var step = steps[i];
+            var fields = new List<string> {
+                record.CycleIndex.ToString(), record.EndTime.ToString("yyyy-MM-dd HH:mm:ss"), record.Operator,
+                record.WorkflowName, record.Result, Number(record.TotalDurationSec), step == null ? "" : (i + 1).ToString(),
+                step?.StepId.ToString() ?? "", step?.StepName ?? "", Number(step?.DurationSec), Number(step?.StandardDurationSec),
+                record.Violations.Count.ToString(), violations
+            };
+            if (extended) fields.AddRange(new[] { record.CycleId, i < record.Steps.Count ? "Completed" : "Unfinished", record.EndReason });
+            csv.AppendLine(string.Join(",", fields.Select(CsvField)));
+        }
+        static string Number(double? value) => value?.ToString("F2", System.Globalization.CultureInfo.InvariantCulture) ?? "";
+    }
+
+    private static string CsvField(string v) => "\"" + v.Replace("\"", "\"\"") + "\"";
 }
 
 /// <summary>一个完整周期（一次 SOP 跑完）的运行记录。</summary>
@@ -158,6 +148,9 @@ public class SopCycleRecord
 {
     /// <summary>当天第几次运行（从 1 开始，跨重启连续）。</summary>
     public int CycleIndex { get; set; }
+    public string CycleId { get; set; } = "";
+    public int FinalStepId { get; set; }
+    public string EndReason { get; set; } = "";
     public DateTime StartTime { get; set; }
     public DateTime EndTime { get; set; }
     /// <summary>所属 SOP 流程名称。</summary>
@@ -165,10 +158,11 @@ public class SopCycleRecord
     public string WorkflowId { get; set; } = "";
     /// <summary>操作人（登录用户名）；改动前产生的历史数据该字段为空（归为"未知用户"）。</summary>
     public string Operator { get; set; } = "";
-    /// <summary>"OK" 或 "NG"。</summary>
+    /// <summary>OK、NG、Review、Fault 或 Aborted。</summary>
     public string Result { get; set; } = "";
     /// <summary>周期总耗时（秒）。</summary>
     public double TotalDurationSec { get; set; }
+    public SopStepDuration? InterruptedStep { get; set; }
     public int StepCount { get; set; }
     public List<SopStepDuration> Steps { get; set; } = new();
     public List<SopViolationSummary> Violations { get; set; } = new();

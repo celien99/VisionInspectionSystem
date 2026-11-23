@@ -273,12 +273,13 @@ public static class SopActionCatalog
         new SopActionTemplate
         {
             Key = "hand_move",
-            Label = "手从A区移到B区",
+            Label = "持物从A区移到B区",
             Method = "hand_move",
-            Hint = "指定手从区域 A 移动到区域 B。",
-            DefaultStepName = "手移动",
+            Hint = "选择物料类别、起点和终点。引擎跟踪同一只手和同一件物料的连续搬运过程。",
+            DefaultStepName = "搬运物料",
             Params = new List<SopParamSpec>
             {
+                new SopParamSpec("target_object", "搬运物料", SopParamKind.Object, true),
                 new SopParamSpec("from_region", "从区域", SopParamKind.Region, true),
                 new SopParamSpec("to_region", "到区域", SopParamKind.Region, true),
                 new SopParamSpec("hand", "用哪只手", SopParamKind.Hand, false)

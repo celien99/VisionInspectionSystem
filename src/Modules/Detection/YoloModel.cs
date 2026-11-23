@@ -18,7 +18,13 @@ public sealed class YoloModel : IDisposable
 {
     private readonly Yolo _yolo;
 
-    private YoloModel(Yolo yolo) => _yolo = yolo;
+    public IReadOnlySet<string> Labels { get; }
+
+    private YoloModel(Yolo yolo)
+    {
+        _yolo = yolo;
+        Labels = (yolo.OnnxModel?.Labels?.Select(label => label.Name) ?? Enumerable.Empty<string>()).ToHashSet(StringComparer.OrdinalIgnoreCase);
+    }
 
     /// <summary>
     /// 加载模型。失败（文件损坏、CUDA 不可用等）返回 null 并给出原因，由调用方决定降级策略。

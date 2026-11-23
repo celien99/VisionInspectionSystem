@@ -106,12 +106,15 @@ public class SopyamlStep
     /// 任意一项在画面（或指定区域内）缺失即判"漏放"。
     /// 这是通用的数据驱动规则——每个配方声明自己的物料即可跨产品复用。
     /// </summary>
+    [YamlMember(Alias = "inspection_anchor")]
+    public string? InspectionAnchor { get; set; }
+
     [YamlMember(Alias = "required_objects")]
     public List<SopyamlRequiredObject>? RequiredObjects { get; set; }
 
     /// <summary>
     /// Modbus 违规触发配置（功能码 06：写单个寄存器 Y1-Y8）。
-    /// 该步骤完成后若发生违规，写对应输出地址。
+    /// 本周期内该步首次记录违规时，写对应输出地址。
     /// </summary>
     [YamlMember(Alias = "modbus_trigger")]
     public SopyamlModbusTrigger? ModbusTrigger { get; set; }
@@ -221,7 +224,7 @@ public class SopyamlDetection
     public int StableFrames { get; set; } = 5;
 
     [YamlMember(Alias = "duration_ms")]
-    public int DurationMs { get; set; } = 1000;
+    public int? DurationMs { get; set; }
 
     [YamlMember(Alias = "tolerance")]
     public float Tolerance { get; set; } = 20f;
@@ -437,6 +440,7 @@ public static class SOPYamlConverter
                 throw new InvalidOperationException("YAML配置格式错误：缺少'sop'根节点");
             }
 
+            SopRecipeValidation.Validate(config.Sop, yaml, sourcePath);
             return ConvertToWorkflow(config.Sop, sourcePath);
         }
         catch (KeyNotFoundException knfEx)
@@ -486,7 +490,7 @@ public static class SOPYamlConverter
                     Y = region.Y1,
                     Width = region.X2 - region.X1,
                     Height = region.Y2 - region.Y1,
-                    CameraId = string.IsNullOrWhiteSpace(region.Camera) ? "main_camera" : region.Camera
+                    CameraId = string.IsNullOrWhiteSpace(region.Camera) ? "main_camera" : region.Camera.Trim()
                 });
             }
         }
@@ -531,7 +535,7 @@ public static class SOPYamlConverter
             if (yamlStep.StandardDurationMs > 0)
                 standardSec = yamlStep.StandardDurationMs / 1000.0;
             else if (yamlStep.Detection != null)
-                standardSec = yamlStep.Detection.DurationMs / 1000.0;
+                standardSec = (yamlStep.Detection.DurationMs ?? (yamlStep.Detection.Method == "time_elapsed" ? 1000 : 0)) / 1000.0;
             step.StandardDurationSec = standardSec;
 
             // 转换检测条件
@@ -574,35 +578,9 @@ public static class SOPYamlConverter
                 });
             }
 
-            // 转换 required_objects → MissingRequiredObject（漏放）违规规则
-            if (yamlStep.RequiredObjects != null && yamlStep.RequiredObjects.Count > 0)
-            {
-                var requiredList = new List<Dictionary<string, object>>();
-                foreach (var ro in yamlStep.RequiredObjects)
-                {
-                    if (string.IsNullOrWhiteSpace(ro.Object)) continue;
-                    requiredList.Add(new Dictionary<string, object>
-                    {
-                        ["class"] = ro.Object,
-                        ["zone"] = ro.Zone ?? "",
-                        ["min_confidence"] = ro.MinConfidence
-                    });
-                }
-
-                if (requiredList.Count > 0)
-                {
-                    step.ViolationRules.Add(new ViolationRule
-                    {
-                        Type = ViolationType.MissingRequiredObject,
-                        Description = $"漏放校验: {string.Join(", ", yamlStep.RequiredObjects.Where(o => !string.IsNullOrWhiteSpace(o.Object)).Select(o => o.Object))}",
-                        Severity = 3,
-                        Parameters = new Dictionary<string, object>
-                        {
-                            ["RequiredObjects"] = requiredList
-                        }
-                    });
-                }
-            }
+            step.InspectionAnchor = yamlStep.InspectionAnchor;
+            foreach (var item in yamlStep.RequiredObjects ?? new())
+                step.RequiredMaterials.Add(new RequiredMaterial(item.Object, item.Zone, item.MinConfidence));
 
             workflow.Steps.Add(step);
         }
@@ -719,7 +697,10 @@ public static class SOPYamlConverter
             Parameters = new Dictionary<string, object>()
         };
 
-        switch (detection.Method.ToLower())
+        if (detection.DurationMs is int holdMs && detection.Method != "time_elapsed")
+            condition.Parameters["HoldMs"] = holdMs;
+
+        switch (detection.Method.ToLowerInvariant())
         {
             case "hand_in_region":
                 condition.Type = ConditionType.HandInRegion;
@@ -745,6 +726,7 @@ public static class SOPYamlConverter
 
             case "hand_move":
                 condition.Type = ConditionType.HandMoveFromTo;
+                condition.TargetObject = detection.TargetObject?.Trim() ?? "";
                 condition.Parameters["HandSide"] = detection.Hand ?? "right";
                 condition.Parameters["FromRegion"] = detection.FromRegion ?? "";
                 condition.Parameters["ToRegion"] = detection.ToRegion ?? "";
@@ -769,6 +751,7 @@ public static class SOPYamlConverter
                 break;
 
             case "pose_stable":
+                condition.TargetObject = detection.TargetObject ?? "";
                 condition.Type = ConditionType.ObjectStable;
                 condition.Parameters["Tolerance"] = detection.Tolerance;
                 break;
@@ -778,7 +761,7 @@ public static class SOPYamlConverter
                 // ⚠️ 修复：原先误用 detection.StableFrames（默认 5）作为 RequiredSeconds，
                 // 导致 YAML 的 duration_ms 被忽略、最后一步总是等 5 秒。
                 // 改为读取 duration_ms 并换算为秒，真正尊重配置（设 0 即立即通过）。
-                condition.Parameters["RequiredSeconds"] = (double)detection.DurationMs / 1000.0;
+                condition.Parameters["RequiredSeconds"] = (detection.DurationMs ?? 1000) / 1000.0;
                 break;
 
             case "person_present":
@@ -839,13 +822,7 @@ public static class SOPYamlConverter
         var yamlSop = ConvertToYamlSop(workflow);
         var config = new SOPYamlConfig { Sop = yamlSop };
 
-        // 不使用全局命名约定，完全由 [YamlMember(Alias = "...")] 控制字段名，
-        // 避免 CamelCase 把 from_region / stable_frames 等改成 fromRegion / stableFrames。
-        var serializer = new SerializerBuilder()
-            .Build();
-
-        var yaml = serializer.Serialize(config);
-        File.WriteAllText(yamlPath, yaml);
+        SaveFullConfig(yamlPath, config);
     }
 
     /// <summary>
@@ -906,34 +883,10 @@ public static class SOPYamlConverter
                 yamlStep.Detection = ConvertConditionToDetection(step.PassConditions[0]);
             }
 
-            // 转换漏放（MissingRequiredObject）违规规则 → required_objects
-            var missingRule = step.ViolationRules
-                .FirstOrDefault(r => r.Type == ViolationType.MissingRequiredObject);
-            if (missingRule != null &&
-                missingRule.Parameters.TryGetValue("RequiredObjects", out var reqObj) &&
-                reqObj is System.Collections.IEnumerable reqEnum)
-            {
-                var reqList = new List<SopyamlRequiredObject>();
-                foreach (var item in reqEnum)
-                {
-                    if (item is Dictionary<string, object> d)
-                    {
-                        var zoneVal = d.GetValueOrDefault("zone", "")?.ToString();
-                        var mcVal = d.GetValueOrDefault("min_confidence", 0.5f);
-                        float mc = mcVal is float f ? f : Convert.ToSingle(mcVal);
-                        reqList.Add(new SopyamlRequiredObject
-                        {
-                            Object = d.GetValueOrDefault("class", "")?.ToString() ?? "",
-                            Zone = string.IsNullOrEmpty(zoneVal) ? null : zoneVal,
-                            MinConfidence = mc
-                        });
-                    }
-                }
-                if (reqList.Count > 0)
-                {
-                    yamlStep.RequiredObjects = reqList;
-                }
-            }
+            yamlStep.InspectionAnchor = step.InspectionAnchor;
+            if (step.RequiredMaterials.Count > 0)
+                yamlStep.RequiredObjects = step.RequiredMaterials.Select(item => new SopyamlRequiredObject
+                    { Object = item.Label, Zone = item.Zone, MinConfidence = item.Confidence }).ToList();
 
             // ⭐ 回写步骤级 Modbus 违规触发配置（modbus_trigger 节点）
             if (step.ModbusTrigger != null && step.ModbusTrigger.Enabled)
@@ -992,6 +945,9 @@ public static class SOPYamlConverter
             StableFrames = condition.StableFrames
         };
 
+        if (condition.Parameters.TryGetValue("HoldMs", out var holdMs))
+            detection.DurationMs = Convert.ToInt32(holdMs);
+
         switch (condition.Type)
         {
             case ConditionType.ObjectPresent:
@@ -1029,6 +985,7 @@ public static class SOPYamlConverter
 
             case ConditionType.HandStable:
                 detection.Method = "hand_stable";
+                detection.Region = condition.ZoneId;
                 detection.Hand = condition.Parameters.GetValueOrDefault("HandSide", "right")?.ToString();
                 detection.Tolerance = condition.Parameters.GetValueOrDefault("Tolerance", 20f) is float fh ? fh : 20f;
                 break;
@@ -1054,6 +1011,7 @@ public static class SOPYamlConverter
                 {
                     // 普通 hand_move
                     detection.Method = "hand_move";
+                    detection.TargetObject = condition.TargetObject;
                     detection.FromRegion = fromRegion;
                     detection.ToRegion = toRegion;
                 }
@@ -1069,11 +1027,13 @@ public static class SOPYamlConverter
 
             case ConditionType.ObjectStable:
                 detection.Method = "pose_stable";
+                detection.TargetObject = condition.TargetObject;
                 detection.Tolerance = condition.Parameters.GetValueOrDefault("Tolerance", 20f) is float f ? f : 20f;
                 break;
 
             case ConditionType.TimeElapsed:
                 detection.Method = "time_elapsed";
+                detection.DurationMs = (int)Math.Round(1000 * Convert.ToDouble(condition.Parameters.GetValueOrDefault("RequiredSeconds", 1.0)));
                 break;
 
             default:
@@ -1115,37 +1075,29 @@ public static class SOPYamlConverter
         var serializer = new SerializerBuilder()
             .ConfigureDefaultValuesHandling(DefaultValuesHandling.OmitNull | DefaultValuesHandling.OmitEmptyCollections)
             .Build();
-        File.WriteAllText(yamlPath, serializer.Serialize(config));
+        var yaml = serializer.Serialize(config);
+        ParseYaml(yaml, yamlPath);
+        File.WriteAllText(yamlPath, yaml);
     }
 
     /// <summary>
     /// 仅更新 YAML 中的 regions 段（区域标定工具用），其余字段（steps / model / settings 等）原样保留。
-    /// 采用完整 SOPYamlConfig 往返序列化；模型已覆盖 YAML 全部字段，避免信息丢失。
+    /// 保留其他节点并在写入前校验其区域引用。
     /// </summary>
     public static void SaveRegions(string yamlPath, Dictionary<string, SopyamlRegion> regions)
     {
-        SOPYamlConfig config;
-        if (File.Exists(yamlPath))
-        {
-            var yaml = File.ReadAllText(yamlPath);
-            // 不使用全局命名约定，完全由 [YamlMember(Alias = "...")] 控制字段名，
-            // 与 ParseYaml 和序列化器保持一致，避免 snake_case 字段在往返中丢失。
-            var deserializer = new DeserializerBuilder()
-                .IgnoreUnmatchedProperties()
-                .Build();
-            config = deserializer.Deserialize<SOPYamlConfig>(yaml) ?? new SOPYamlConfig();
-        }
-        else
-        {
-            config = new SOPYamlConfig();
-        }
-
-        config.Sop ??= new SopyamlSop();
-        config.Sop.Regions = regions;
-
-        // 不使用全局命名约定，完全由 [YamlMember(Alias = "...")] 控制字段名。
-        var serializer = new SerializerBuilder()
-            .Build();
-        File.WriteAllText(yamlPath, serializer.Serialize(config));
+        // Replace only the regions node so legacy metadata outside this section survives calibration.
+        var doc = new YamlDotNet.RepresentationModel.YamlStream();
+        doc.Load(new StringReader(File.ReadAllText(yamlPath)));
+        var serializer = new SerializerBuilder().ConfigureDefaultValuesHandling(DefaultValuesHandling.OmitNull).Build();
+        var regionDoc = new YamlDotNet.RepresentationModel.YamlStream();
+        regionDoc.Load(new StringReader(serializer.Serialize(regions)));
+        var root = (YamlDotNet.RepresentationModel.YamlMappingNode)doc.Documents[0].RootNode;
+        ((YamlDotNet.RepresentationModel.YamlMappingNode)root.Children["sop"]).Children["regions"] = regionDoc.Documents[0].RootNode;
+        using var writer = new StringWriter();
+        doc.Save(writer, false);
+        var yaml = writer.ToString();
+        ParseYaml(yaml, yamlPath);
+        File.WriteAllText(yamlPath, yaml);
     }
 }

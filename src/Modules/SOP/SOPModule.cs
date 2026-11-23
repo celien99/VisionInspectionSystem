@@ -15,10 +15,19 @@ namespace Modules.SOP;
 /// </summary>
 public class SOPModule : IDetectionModule
 {
+    private readonly TimeProvider _clock;
+    private ITimer? _cameraWatchdog;
+    private long _lastFreshTick;
+    private readonly Dictionary<string, DateTime> _consumedImages = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<int> _signalledSteps = new();
+    public SOPModule() : this(TimeProvider.System) { }
+    public SOPModule(TimeProvider clock) => _clock = clock;
+
     private SOPModuleConfig _config = new();
     private YoloModel? _yolo;
     private SOPStateMachine? _stateMachine;
     private SOPWorkflow? _currentWorkflow;
+    private bool _needsFreshHands;
     private bool _x1TriggerSubscribed;
     private readonly object _lockObject = new();
     private readonly CrossCameraEvaluator _crossEvaluator = new();
@@ -26,6 +35,9 @@ public class SOPModule : IDetectionModule
 
     // 模型动态加载相关
     private string _lastLoadedModelPath = "";
+    private string _recipeModelPath = "";
+    private int _defaultGpuId;
+    private float _defaultIou;
 
     // ⭐ 步骤级多模型缓存：key = 模型路径（YAML step.model），value = 模型适配器。
     // 支持给每个相机/步骤指定不同模型，按需懒加载并缓存复用。
@@ -175,14 +187,14 @@ public class SOPModule : IDetectionModule
             _lastLoadedModelPath = "";
 
             _config.UseGpu = useGpu;
-            LoadYolo(_config.ModelPath, useGpu, _config.GpuId.ToString());
+            LoadYolo(_recipeModelPath, useGpu, _config.GpuId.ToString());
 
             if (_yolo == null)
             {
                 // 目标设备加载失败（最常见：CUDA 不可用）。回退 CPU 保证功能可用。
                 _config.UseGpu = false;
                 _lastLoadedModelPath = "";
-                LoadYolo(_config.ModelPath, false, _config.GpuId.ToString());
+                LoadYolo(_recipeModelPath, false, _config.GpuId.ToString());
                 GpuSwitchFailed?.Invoke(this, EventArgs.Empty);
             }
 
@@ -201,6 +213,9 @@ public class SOPModule : IDetectionModule
             try
             {
                 _config = SOPModuleConfig.FromConfiguration(config);
+                _recipeModelPath = _config.ModelPath;
+                _defaultGpuId = _config.GpuId;
+                _defaultIou = _config.IouThreshold;
 
                 if (!YoloExecutionProviders.IsCudaBuild && _config.UseGpu)
                 {
@@ -214,7 +229,8 @@ public class SOPModule : IDetectionModule
                 InitializeYolo();
 
                 // 初始化状态机（先初始化状态机，确保核心功能可用）
-                _stateMachine = new SOPStateMachine();
+                _stateMachine = new SOPStateMachine(syncRoot: _lockObject);
+                _cameraWatchdog ??= _clock.CreateTimer(CheckCameraHealth, null, TimeSpan.FromMilliseconds(250), TimeSpan.FromMilliseconds(250));
                 SubscribeToStateMachineEvents();
 
                 // 启用 SOP 运行数据记录器：每个周期(OK/NG) + 每步耗时写入按天文件 sop_records/
@@ -445,6 +461,8 @@ public class SOPModule : IDetectionModule
 
         _stateMachine.StepChanged += (s, e) =>
         {
+            _lastFreshTick = _clock.GetTimestamp();
+            if (e.PreviousStepId == 0) _signalledSteps.Clear();
             StepChanged?.Invoke(this, e);
         };
 
@@ -456,6 +474,7 @@ public class SOPModule : IDetectionModule
 
         _stateMachine.ViolationDetected += (s, e) =>
         {
+            if (_signalledSteps.Add(e.Violation.StepId) && GetCurrentStep() is { } step) FireModbusTriggerForStep(step);
             ViolationDetected?.Invoke(this, e);
         };
 
@@ -464,13 +483,6 @@ public class SOPModule : IDetectionModule
             // 注入操作人（登录用户名），供记录器落盘与看板按用户过滤
             e.Operator = _currentOperator;
             WorkflowCompleted?.Invoke(this, e);
-        };
-
-        // ⭐ 步骤完成后若发生违规，触发 Modbus 功能码 06（写单个寄存器 Y1-Y8）
-        _stateMachine.StepCompleted += (s, e) =>
-        {
-            if (e.HasViolations)
-                FireModbusTriggerForStep(e.Step);
         };
 
         // ⭐ X1（寄存器 0）上升沿作为 SOP 采集触发：空闲时启动已加载的工作流。
@@ -531,8 +543,8 @@ public class SOPModule : IDetectionModule
                 if (_stateMachine?.CurrentState != SOPExecutionState.Running)
                 {
                     result.Success = true;
-                    result.ErrorMessage = "SOP未在运行状态态";
-                    result.Level = DefectLevel.Good;
+                    result.ErrorMessage = "SOP 未在运行状态";
+                    UpdateStateMachineResult(result);
                     return Task.FromResult<ModuleResult>(result);
                 }
 
@@ -593,7 +605,17 @@ public class SOPModule : IDetectionModule
         foreach (var (cameraId, frame) in frames)
         {
             var modelPath = cameraModelMap.TryGetValue(cameraId, out var camModel) ? camModel : null;
-            var detections = RunObjectDetectionSafe(frame, modelPath);
+            var detections = RunObjectDetectionSafe(frame, modelPath, out var error);
+            if (error != null)
+            {
+                if (cameraId == stepCamera && step?.NeedsObjectModel == true)
+                {
+                    _stateMachine!.EndCycle(SopCycleOutcome.Fault, error, frame.Timestamp);
+                    UpdateStateMachineResult(result);
+                    return;
+                }
+                continue; // An unavailable detector is not a valid negative observation for monitoring.
+            }
             result.PerCameraDetections[cameraId] = detections;
 
             if (cameraId == "main_camera")
@@ -613,11 +635,25 @@ public class SOPModule : IDetectionModule
             return;
         }
 
+        if (_consumedImages.TryGetValue(stepCamera, out var previous) && handFrame.Timestamp <= previous)
+        {
+            UpdateStateMachineResult(result);
+            return;
+        }
+        _consumedImages[stepCamera] = handFrame.Timestamp;
+        _lastFreshTick = _clock.GetTimestamp();
+        timestamp = handFrame.Timestamp;
         var stateDetections = result.PerCameraDetections.TryGetValue(stepCamera, out var stepDets)
             ? stepDets
             : new List<DetectedObject>();
         var handResult = RunHandPoseDetection(handFrame, result, timestamp, stepCamera);
 
+        if (handResult == null && step?.PassConditions.Any(c => c.Type is ConditionType.HandInRegion or ConditionType.HandNotInRegion or ConditionType.HandStable or ConditionType.HandMoveFromTo or ConditionType.HandNearObject) == true)
+        {
+            _stateMachine!.EndCycle(SopCycleOutcome.Fault, "该步骤需要手部检测，服务未就绪或推理失败", timestamp);
+            UpdateStateMachineResult(result);
+            return;
+        }
         DebugLog($"步骤评估: step={step?.StepName}({stepCamera}) frames=[{string.Join(",", frames.Keys)}] perCam=[{string.Join(",", result.PerCameraDetections.Select(kv => $"{kv.Key}:{kv.Value.Count}"))}] stateDet={stateDetections.Count}");
         _stateMachine?.ProcessFrame(stateDetections, handResult, timestamp, stepCamera);
 
@@ -733,13 +769,15 @@ public class SOPModule : IDetectionModule
     /// 以后换 ONNX Runtime / RKNN 只改这里和各适配器。
     /// </para>
     /// </summary>
-    private List<DetectedObject> RunObjectDetectionSafe(CaptureFrame frame, string? modelPath = null)
+    private List<DetectedObject> RunObjectDetectionSafe(CaptureFrame frame, string? modelPath, out string? error)
     {
+        error = null;
         var detections = new List<DetectedObject>();
         var yolo = GetYoloForModel(modelPath);
         if (yolo == null)
         {
-            DebugLog("YOLO 未初始化，跳过物体检测");
+            error = $"相机 {frame.CameraId} 的物体模型未就绪";
+            DebugLog(error);
             return detections;
         }
 
@@ -750,7 +788,8 @@ public class SOPModule : IDetectionModule
         }
         catch (Exception ex)
         {
-            DebugLog($"YOLO 物体检测失败 ({frame.CameraId}): {ex.Message}");
+            error = $"YOLO 物体检测失败 ({frame.CameraId}): {ex.Message}";
+            DebugLog(error);
         }
         return detections;
     }
@@ -762,9 +801,9 @@ public class SOPModule : IDetectionModule
     /// </summary>
     private YoloModel? GetYoloForModel(string? modelPath)
     {
-        var path = string.IsNullOrWhiteSpace(modelPath) ? _config.ModelPath : modelPath.Trim();
-        if (string.Equals(path, _config.ModelPath, StringComparison.OrdinalIgnoreCase))
+        if (string.IsNullOrWhiteSpace(modelPath) || string.Equals(modelPath.Trim(), _recipeModelPath, StringComparison.OrdinalIgnoreCase))
             return _yolo;
+        var path = modelPath.Trim();
 
         lock (_lockObject)
         {
@@ -838,7 +877,7 @@ public class SOPModule : IDetectionModule
 
         try
         {
-            var handResult = _handPoseService.DetectHandsAsync(frame.Image).GetAwaiter().GetResult();
+            var handResult = _handPoseService.DetectHandsAsync(frame.Image, requireFresh: _needsFreshHands).GetAwaiter().GetResult();
             result.HandPoseResult = handResult;
             // ⭐ 记录手部结果来自哪路相机，供 UI 在该相机画面上绘制手部骨架
             result.HandPoseCameraId = cameraId;
@@ -863,13 +902,17 @@ public class SOPModule : IDetectionModule
         result.CurrentState = _stateMachine.CurrentState;
         result.StepHistory = _stateMachine.StepHistory.ToList();
         result.Violations = _stateMachine.Violations.ToList();
-        result.IsPass = !_stateMachine.Violations.Any();
-        result.Level = result.IsPass ? DefectLevel.Good : DefectLevel.Critical;
+        result.Outcome = _stateMachine.Outcome;
+        result.CycleId = _stateMachine.CycleId;
+        result.OutcomeReason = _stateMachine.OutcomeReason;
+        result.IsPass = _stateMachine.Outcome == SopCycleOutcome.OK;
+        result.Level = result.IsPass ? DefectLevel.Good : (_stateMachine.Outcome.HasValue || result.Violations.Count > 0 ? DefectLevel.Critical : DefectLevel.Minor);
 
         var currentStep = _currentWorkflow?.Steps.FirstOrDefault(s => s.StepId == _stateMachine.CurrentStepId);
         result.StepResults = new StepResults
         {
-            Message = currentStep?.StepName ?? "等待开始",
+            Message = _stateMachine.Outcome is { } outcome ? $"{outcome} {_stateMachine.OutcomeReason}" :
+                (_stateMachine.LastEvaluatedStepId == currentStep?.StepId && _stateMachine.LastEvaluation is { IsPass: false } wait ? $"{currentStep.StepName}：{wait.Message}" : currentStep?.StepName ?? "等待开始"),
             CurrentStep = _stateMachine.CurrentStepId,
             TotalSteps = _currentWorkflow?.Steps.Count ?? 0
         };
@@ -886,7 +929,10 @@ public class SOPModule : IDetectionModule
             if (_stateMachine == null)
                 throw new InvalidOperationException("状态机未初始化");
 
-            _currentWorkflow = workflow;
+            AbortActiveCycle("切换或重启工作流");
+            _stateMachine.Stop();
+            _currentWorkflow = null;
+            _consumedImages.Clear();
             _regionMonitoring.Reset();
             _crossEvaluator.Reset();
 
@@ -898,45 +944,24 @@ public class SOPModule : IDetectionModule
             else
                 Log("警告: 工作作流中没有区域域定义，object_in_zone 条件将无法工作作");
 
-            // 检测查并切换 YOLO 模式型
-            if (workflow.Model != null && !string.IsNullOrWhiteSpace(workflow.Model.Path))
-            {
-                var modelPath = workflow.Model.Path;
-
-                // Resolve relative paths by searching common locations
-                var resolvedPath = ResolveModelPath(modelPath);
-                if (resolvedPath == null)
-                {
-                    var warn = $"工作流模型文件不存在: {modelPath}。\n" +
-                               $"已回退到初始化时加载的通用(COCO)模型，该模型不含本产品专属类别" +
-                               $"(phone/case_top/case_bottom/manual/charger/cable 等)，\n" +
-                               $"因此物体检测、object_present / object_in_zone / hand_near_object / 漏放校验将全部失效。\n" +
-                               $"请先训练专用模型并放到该路径，或修正 YAML 的 model.path。";
-                    Log("警告: " + warn);
-                    ModelWarning?.Invoke(this, warn);
-                }
-                else
-                {
-                    modelPath = resolvedPath;
-
-                    if (modelPath != _lastLoadedModelPath)
-                    {
-                        Log($"切换模式型: {_lastLoadedModelPath} → {modelPath}");
-                        Log($"模式型配置: confidence={workflow.Model.Confidence}, iou={workflow.Model.Iou}, gpu={workflow.Model.UseGpu}");
-
-                        // 同步更新运行时置信度/IoU（本地生效，非配置文件）
-                        _config.ConfidenceThreshold = workflow.Model.Confidence;
-                        _config.IouThreshold = workflow.Model.Iou;
-                        _config.GpuId = workflow.Model.GpuId;
-
-                        LoadYolo(modelPath, workflow.Model.UseGpu, workflow.Model.GpuId.ToString());
-                    }
-                    else
-                    {
-                        Log($"模式型未变化，跳过: {Path.GetFileName(modelPath)}");
-                    }
-                }
-            }
+            // Keep the application default and the workflow default distinct. A step can explicitly
+            // select the application model while its workflow uses a different default.
+            var recipeModel = workflow.Model;
+            _recipeModelPath = string.IsNullOrWhiteSpace(recipeModel?.Path) ? _config.ModelPath : recipeModel.Path;
+            var gpu = recipeModel == null ? _config.UseGpu : YoloExecutionProviders.IsCudaBuild && recipeModel.UseGpu;
+            var device = recipeModel?.GpuId ?? _defaultGpuId;
+            if (gpu != _config.UseGpu || device != _config.GpuId)
+                DisposeAllModels();
+            _config.UseGpu = gpu;
+            _config.GpuId = device;
+            _config.IouThreshold = recipeModel?.Iou ?? _defaultIou;
+            LoadYolo(_recipeModelPath, gpu, device.ToString());
+            bool requiresDefault = workflow.Steps.Any(step => step.NeedsObjectModel && string.IsNullOrWhiteSpace(step.ModelPath)) ||
+                workflow.Monitoring?.Enabled == true || workflow.CrossCamera?.Enabled == true;
+            if (requiresDefault && _yolo == null && ResolveModelPath(_recipeModelPath) == null)
+                throw new InvalidOperationException($"工作流模型文件不存在: {_recipeModelPath}");
+            if (requiresDefault && _yolo == null)
+                throw new InvalidOperationException($"工作流模型加载失败: {_recipeModelPath}");
 
             // P0-3: 全局置信度接线 + 允许步骤 min_confidence 调低生效
             // 有效截断 = min(全局基准置信度, 所有步骤 min_confidence 的最小值)
@@ -955,20 +980,56 @@ public class SOPModule : IDetectionModule
             float minStepConf = workflow.Steps
                 .SelectMany(s => s.PassConditions)
                 .Select(c => c.MinConfidence)
-                .Where(v => v > 0)
+                .Concat(workflow.Steps.SelectMany(s => s.RequiredMaterials).Select(m => m.Confidence))
                 .DefaultIfEmpty(baseConf)
                 .Min();
             _config.ConfidenceThreshold = Math.Min(baseConf, minStepConf);
             Log($"置信度设置: 基准={baseConf:F2} (settings/model), 步骤最低要求={minStepConf:F2} → YOLO截断={_config.ConfidenceThreshold:F2}");
 
+            ValidateStepModels(workflow);
+            _needsFreshHands = workflow.Steps.SelectMany(s => s.PassConditions).Any(c => c.Type is ConditionType.HandInRegion or
+                ConditionType.HandNotInRegion or ConditionType.HandStable or ConditionType.HandMoveFromTo or ConditionType.HandNearObject);
+            _currentWorkflow = workflow;
             _stateMachine.Start(workflow);
         }
+    }
+
+    private void ValidateStepModels(SOPWorkflow workflow)
+    {
+        foreach (var step in workflow.Steps.Where(s => s.NeedsObjectModel))
+        {
+            var detector = GetYoloForModel(step.ModelPath) ?? throw new InvalidOperationException($"步骤 {step.StepId}「{step.StepName}」的物体模型不可用");
+            var labels = step.RequiredMaterials.Select(m => m.Label).Concat(step.PassConditions
+                .Where(c => c.Type is ConditionType.ObjectPresent or ConditionType.ObjectInZone or ConditionType.ObjectStable or ConditionType.ObjectAbsent or ConditionType.HandNearObject or ConditionType.HandMoveFromTo)
+                .Select(c => c.TargetObject)).Concat(step.ViolationRules.SelectMany(r => r.Parameters.Values.OfType<IEnumerable<string>>().SelectMany(v => v)));
+            var missing = labels.Where(l => !string.IsNullOrWhiteSpace(l) && !detector.Labels.Contains(l)).Distinct().ToList();
+            if (missing.Count > 0) throw new InvalidOperationException($"步骤 {step.StepId}「{step.StepName}」模型缺少类别：{string.Join(", ", missing)}");
+        }
+    }
+
+    private void CheckCameraHealth(object? _)
+    {
+        lock (_lockObject)
+        {
+            if (_stateMachine?.CurrentState != SOPExecutionState.Running || GetCurrentStep() is not { } step) return;
+            var elapsed = _clock.GetElapsedTime(_lastFreshTick);
+            if (elapsed.TotalMilliseconds < Math.Max(250, _config.CameraTimeoutMs)) return;
+            var at = _stateMachine.LastCapture == default ? _clock.GetLocalNow().DateTime : _stateMachine.LastCapture + elapsed;
+            _stateMachine.EndCycle(SopCycleOutcome.Fault, $"相机 {step.CameraId} 未收到新帧", at);
+        }
+    }
+
+    private void AbortActiveCycle(string reason)
+    {
+        if (_stateMachine is { CurrentState: SOPExecutionState.Running, LastCapture: var captured } && captured != default && GetCurrentStep() != null)
+            _stateMachine.EndCycle(SopCycleOutcome.Aborted, reason, captured + _clock.GetElapsedTime(_lastFreshTick));
     }
 
     public void StopWorkflow()
     {
         lock (_lockObject)
         {
+            AbortActiveCycle("人工停止或关闭");
             _stateMachine?.Stop();
             _currentWorkflow = null;
             _regionMonitoring.Reset();
@@ -981,6 +1042,7 @@ public class SOPModule : IDetectionModule
         {
             if (_currentWorkflow != null)
             {
+                AbortActiveCycle("人工复位");
                 _stateMachine?.Start(_currentWorkflow);
             }
         }
@@ -1004,9 +1066,11 @@ public class SOPModule : IDetectionModule
                 ModbusService.Instance.X1Trigger -= OnX1Trigger;
                 _x1TriggerSubscribed = false;
             }
+            _cameraWatchdog?.Dispose();
+            _cameraWatchdog = null;
+            StopWorkflow();
             _runRecorder?.Unsubscribe(this);
             _runRecorder = null;
-            StopWorkflow();
             _goldenRecorder?.Dispose();
             _goldenRecorder = null;
             ShutdownHandPoseService();
@@ -1090,6 +1154,7 @@ public class SOPModule : IDetectionModule
 /// </summary>
 public class SOPModuleConfig
 {
+    public int CameraTimeoutMs { get; set; } = 3000;
     public string ModelPath { get; set; } = "yolo_models/yolov8s.onnx";
     public bool UseGpu { get; set; } = true;
 
@@ -1121,6 +1186,9 @@ public class SOPModuleResult : ModuleResult
 {
     public int CurrentStepId { get; set; }
     public SOPExecutionState CurrentState { get; set; }
+    public SopCycleOutcome? Outcome { get; set; }
+    public string CycleId { get; set; } = "";
+    public string OutcomeReason { get; set; } = "";
     public List<StepExecutionRecord> StepHistory { get; set; } = new();
     public List<ViolationRecord> Violations { get; set; } = new();
     public string? RegionAlert { get; set; }

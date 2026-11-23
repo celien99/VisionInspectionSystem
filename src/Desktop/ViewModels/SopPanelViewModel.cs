@@ -84,10 +84,19 @@ public partial class SopPanelViewModel : ObservableObject
         StepProgress = $"{index + 1}/{Steps.Count}";
     }
 
-    public void SetStepResult(int stepIndex, bool success)
+    public void ShowCycleEnd(SOPCompletedEventArgs cycle)
     {
-        if (stepIndex >= 0 && stepIndex < Steps.Count)
-            Steps[stepIndex].Status = success ? StepStatus.Completed : StepStatus.Failed;
+        foreach (var record in cycle.StepHistory)
+        {
+            var step = Steps.FirstOrDefault(s => s.Id == record.StepId.ToString());
+            if (step != null) step.Status = record.IsPass ? StepStatus.Completed : StepStatus.Failed;
+        }
+        if (cycle.InterruptedStep is { } interrupted && Steps.FirstOrDefault(s => s.Id == interrupted.StepId.ToString()) is { } stopped)
+        {
+            stopped.Duration = interrupted.Duration;
+            stopped.Status = cycle.Outcome == SopCycleOutcome.NG ? StepStatus.Failed : StepStatus.Interrupted;
+        }
+        SyncDurations(cycle.StepHistory);
     }
 
     public void SyncDurations(IEnumerable<StepExecutionRecord> history)
@@ -112,4 +121,4 @@ public partial class SOPStepItem : ObservableObject
         ? $"{Duration.TotalMilliseconds:F0}ms" : $"{Duration.TotalSeconds:F1}s";
 }
 
-public enum StepStatus { Pending, Running, Completed, Failed }
+public enum StepStatus { Pending, Running, Completed, Failed, Interrupted }

@@ -33,6 +33,7 @@ sop:
       timeout: 20
       detection:
         method: "hand_move"
+        target_object: "frame"
         hand: "right"
         from_region: "part_box"
         to_region: "fixture"
@@ -46,9 +47,8 @@ sop:
         hand: "right"
         target_object: "pressTool"
         tolerance: 40          # 手-物交互的外扩边距(px)
-      violation_rules:
-        - type: "ForbiddenObject"
-          description: "禁止出现异物"
+      # 下列为人工复核项目，原示例未提供可执行判据。
+      # "禁止出现异物"
 
   model:
     path: "yolo_models/sop_custom_yolov8s.onnx"   # 替换为你的专用模型；未准备好时可先用 yolov8s.onnx（仅COCO类）

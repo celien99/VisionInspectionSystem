@@ -36,7 +36,7 @@ public class ViolationDetector
     /// <summary>
     /// 检测违规
     /// </summary>
-    public List<ViolationRecord> DetectViolations(SOPStep currentStep, List<DetectedObject> detections, HandPoseEstimationResult? handResult, DateTime timestamp, string cameraId = "main_camera")
+    public List<ViolationRecord> DetectViolations(SOPStep currentStep, List<DetectedObject> detections, HandPoseEstimationResult? handResult, DateTime timestamp, string cameraId = "main_camera", bool checkSkip = true)
     {
         var violations = new List<ViolationRecord>();
 
@@ -49,7 +49,6 @@ public class ViolationDetector
                 ViolationType.ObjectRemoved => DetectObjectRemoved(currentStep, detections, timestamp, cameraId),
                 ViolationType.ZoneIntrusion => DetectZoneIntrusion(currentStep, detections, timestamp, cameraId),
                 ViolationType.WrongOrder => DetectWrongOrder(currentStep, timestamp),
-                ViolationType.MissingRequiredObject => DetectMissingRequiredObject(currentStep, detections, timestamp, cameraId),
                 _ => null
             };
 
@@ -73,7 +72,7 @@ public class ViolationDetector
 
         // 全局跳步检测：基于"后续步骤的完整条件是否已满足"判断，比单纯检测物体出现更可靠，
         // 避免把正常的拿/放过程误判为跳步。仅在 EnableSkipDetection 开启、且非第一步时启用。
-        if (_stateMachine.Workflow?.Settings.EnableSkipDetection == true)
+        if (checkSkip && _stateMachine.Workflow?.Settings.EnableSkipDetection == true)
         {
             var minStepId = _stateMachine.Workflow.Steps.Count > 0
                 ? _stateMachine.Workflow.Steps.Min(s => s.StepId)
@@ -202,87 +201,6 @@ public class ViolationDetector
     }
 
     /// <summary>
-    /// 检测漏放 / 缺料：当前步骤声明的必放物料（required_objects）中，若有任意一项在画面
-    /// （或在指定区域内）未以足够置信度出现，即判"漏放"违规。
-    /// 这是通用的数据驱动规则——每个配方在 YAML 中声明自己的必放物料，切换产品即复用同一引擎。
-    /// 防误报：若画面中完全没有任何必放物料出现，视为"成品尚未入框"，暂不判定漏放。
-    /// </summary>
-    private ViolationRecord? DetectMissingRequiredObject(SOPStep step, List<DetectedObject> detections, DateTime timestamp, string cameraId)
-    {
-        var reqRules = step.ViolationRules
-            .Where(r => r.Type == ViolationType.MissingRequiredObject)
-            .ToList();
-        if (reqRules.Count == 0) return null;
-
-        // 汇集本步骤所有必放物料（类别 + 可选区域 + 最小置信度）
-        var required = new List<(string Class, string Zone, float MinConf)>();
-        foreach (var rule in reqRules)
-        {
-            if (!rule.Parameters.TryGetValue("RequiredObjects", out var obj)
-                || obj is not System.Collections.IEnumerable enumerable)
-            {
-                continue;
-            }
-
-            foreach (var item in enumerable)
-            {
-                if (item is Dictionary<string, object> d)
-                {
-                    var cls = (d.GetValueOrDefault("class", "") as string) ?? "";
-                    if (string.IsNullOrWhiteSpace(cls)) continue;
-                    var zone = (d.GetValueOrDefault("zone", "") as string) ?? "";
-                    var mcVal = d.GetValueOrDefault("min_confidence", 0.5f);
-                    float minc = mcVal is float f ? f : Convert.ToSingle(mcVal);
-                    required.Add((cls, zone, minc));
-                }
-                else if (item is string s && !string.IsNullOrWhiteSpace(s))
-                {
-                    required.Add((s, "", 0.5f));
-                }
-            }
-        }
-
-        if (required.Count == 0) return null;
-
-        // 防误报：画面中完全未出现任何必放物料时，视为成品尚未入框，不判漏放
-        var anyPresentAnywhere = detections.Any(d =>
-            required.Any(r => d.ClassName.Equals(r.Class, StringComparison.OrdinalIgnoreCase)
-                              && d.Confidence >= r.MinConf));
-        if (!anyPresentAnywhere) return null;
-
-        // 逐项检查是否漏放
-        var missing = new List<string>();
-        foreach (var (cls, zone, minc) in required)
-        {
-            var matches = detections
-                .Where(d => d.ClassName.Equals(cls, StringComparison.OrdinalIgnoreCase))
-                .Where(d => d.Confidence >= minc);
-
-            if (!string.IsNullOrEmpty(zone))
-            {
-                var z = GetZoneDefinition(zone, cameraId);
-                if (z != null) matches = matches.Where(d => IsInZone(d.PixelBoundingBox, z));
-            }
-
-            if (!matches.Any())
-            {
-                missing.Add(string.IsNullOrEmpty(zone) ? cls : $"{cls}(区域:{zone})");
-            }
-        }
-
-        if (missing.Count == 0) return null;
-
-        return new ViolationRecord
-        {
-            Timestamp = timestamp,
-            Type = ViolationType.MissingRequiredObject,
-            Description = $"漏放：缺少必须放置的物料 {string.Join(", ", missing)}",
-            StepId = step.StepId,
-            Evidence = $"Missing_{string.Join("_", missing)}_{timestamp:HHmmss}"
-        };
-    }
-
-    /// <summary>
     /// 检测区域入侵
     /// </summary>
     private ViolationRecord? DetectZoneIntrusion(SOPStep step, List<DetectedObject> detections, DateTime timestamp, string cameraId)
@@ -344,15 +262,13 @@ public class ViolationDetector
             .OrderBy(s => s.StepId)
             .FirstOrDefault();
 
-        if (nextStep == null) return null;
+        if (nextStep == null || !nextStep.CameraId.Equals(cameraId, StringComparison.OrdinalIgnoreCase) || nextStep.RequiredMaterials.Count > 0) return null;
 
         // 排除纯时间条件步骤（如 complete 的 time_elapsed），否则只要等 1 秒就误报跳步
         if (nextStep.PassConditions.Count == 1 && nextStep.PassConditions[0].Type == ConditionType.TimeElapsed)
             return null;
 
-        // 跳步检测：忽略 nextStep 的 from_region 时序约束。用户跳过中间步骤时，
-        // 物体没经过起始区域（如没到嘴边），若要求 visitedFrom 会漏报跳步。
-        // 只需核心动作意图（物体到达目标区域）即判定"正在做下一步"，从而报跳步。
+        // Read the next step without advancing it. A carry requires its own observed hand/object trajectory.
         var eval = _conditionEvaluator.EvaluateConditions(nextStep, detections, handResult, timestamp, cameraId, ignoreFromRegion: true);
         if (eval.IsPass)
         {

@@ -162,7 +162,7 @@
                                 <ComboBoxItem Content="手在区域内（hand_in_region）" Tag="hand_in_region"/>
                                 <ComboBoxItem Content="手不在区域内（hand_not_in_region）" Tag="hand_not_in_region"/>
                                 <ComboBoxItem Content="手稳定不动（hand_stable）" Tag="hand_stable"/>
-                                <ComboBoxItem Content="手从A区移到B区（hand_move）" Tag="hand_move"/>
+                                <ComboBoxItem Content="持物从A区移到B区（hand_move）" Tag="hand_move"/>
                                 <ComboBoxItem Content="手动作：拿起/放下（hand_action）" Tag="hand_action"/>
                                 <ComboBoxItem Content="手靠近物体（hand_near_object）" Tag="hand_near_object"/>
                                 <ComboBoxItem Content="姿态稳定（pose_stable）" Tag="pose_stable"/>
@@ -203,7 +203,7 @@
                                 <TextBox x:Name="ToleranceTextBox" Style="{StaticResource FieldInput}"/>
                             </StackPanel>
                             <StackPanel x:Name="DurationPanel">
-                                <TextBlock Text="等待时长（duration_ms，毫秒）" Style="{StaticResource FieldLabel}"/>
+                                <TextBlock Text="持续时长（duration_ms，毫秒，可留空）" Style="{StaticResource FieldLabel}"/>
                                 <TextBox x:Name="DurationMsTextBox" Style="{StaticResource FieldInput}"/>
                             </StackPanel>
                             <Grid>
@@ -233,12 +233,15 @@
                             <TextBlock Text="必须保持物体（must_keep，逗号分隔）" Style="{StaticResource FieldLabel}"/>
                             <TextBox x:Name="MustKeepTextBox" Style="{StaticResource FieldInput}"/>
                             <TextBlock Text="必放物料（required_objects，每行一项；格式：物体名[,区域ID][:最小置信度]）" Style="{StaticResource FieldLabel}" Margin="0,8,0,0"/>
-                            <TextBlock Text="示例：cap  或  screw,zone_a  或  cap,zone_b:0.6 —— 最终校验步声明必放物料，任意一项缺失即判漏放（MissingRequiredObject）" Style="{StaticResource HintText}" Margin="0,0,0,4"/>
+                            <TextBlock Text="示例：cap  或  screw,zone_a  或  cap,zone_b:0.6 —— 物料齐套并持续满足条件后通过终检" Style="{StaticResource HintText}" Margin="0,0,0,4"/>
                             <TextBox x:Name="RequiredObjectsTextBox" Height="72" Padding="8,6" TextWrapping="Wrap" AcceptsReturn="True" VerticalScrollBarVisibility="Auto"/>
+
+                            <TextBlock Text="终检锚点（inspection_anchor，填写必放物料名称）" Style="{StaticResource FieldLabel}"/>
+                            <TextBox x:Name="InspectionAnchorTextBox" Style="{StaticResource FieldInput}" ToolTip="超时时，锚点可见且稳定缺件判 NG。锚点不可见或未配置时转人工复核。"/>
 
                             <!-- ⭐ 步骤级 Modbus 违规触发（功能码 06：写单个寄存器 Y1-Y8） -->
                             <TextBlock Text="Modbus 违规触发" Style="{StaticResource SectionHeader}" Margin="0,18,0,5"/>
-                            <TextBlock Text="本步完成后若发生违规，触发功能码 06 写单个寄存器（Y1-Y8）。" Style="{StaticResource HintText}" Margin="0,0,0,6"/>
+                            <TextBlock Text="本周期内该步首次记录违规时，触发功能码 06 写单个寄存器（Y1-Y8）。" Style="{StaticResource HintText}" Margin="0,0,0,6"/>
                             <CheckBox x:Name="ModbusTriggerCheckBox" Content="启用本步 Modbus 触发（modbus_trigger.enabled）"
                                       Checked="ModbusTriggerCheckBox_Changed" Unchecked="ModbusTriggerCheckBox_Changed"/>
                             <Grid x:Name="ModbusTriggerPanel" Margin="0,10,0,0" IsEnabled="False">

@@ -67,26 +67,30 @@ public class StepConditionEvaluator
         string cameraId = "main_camera",
         bool ignoreFromRegion = false)
     {
-        // 先更新手部跨帧跟踪状态（用于稳定/移动判断）
-        UpdateHandTracks(handResult, cameraId);
-        // 同步更新物体跨帧区域访问记录（用于放回等步骤的 from_region 约束）
-        UpdateObjectRegions(detections, cameraId);
-
         // 跳步检测（ViolationDetector.DetectSkipStep）会用同一实例评估"下一步"的意图，
         // 这类对非当前步骤的评估：① 不参与稳定帧门控（跳步是单帧意图判定）；
         // ② 不得清空/污染当前步骤的稳定帧计数——否则每帧互踩清零，计数永远达不到阈值
         //   （2026-09-29 回归修复：喝水配方步骤2卡死 + 跳工序不报警即由此引起）。
-        bool isCurrentStep = _stateMachine == null || step.StepId == _stateMachine.CurrentStepId;
+        bool isCurrentStep = !ignoreFromRegion && step.StepId == _stateMachine.CurrentStepId;
 
         if (isCurrentStep && step.StepId != _lastEvaluatedStepId)
         {
-            _stablePassCounts.Clear();
+            _matches.Clear();
+            _moves.Clear();
+            foreach (var track in _handTracks.Values) track.CenterHistory.Clear();
             _lastEvaluatedStepId = step.StepId;
+        }
+
+        if (isCurrentStep && !ignoreFromRegion)
+        {
+            UpdateHandTracks(handResult, cameraId, step.PassConditions.Where(c => c.Type == ConditionType.HandStable).Select(c => c.StableFrames).DefaultIfEmpty(1).Max());
+            ObserveCarriedObjects(detections, handResult, cameraId, timestamp);
+            ObserveMoves(step, detections, handResult, cameraId);
         }
 
         if (step.PassConditions.Count == 0)
         {
-            return new ConditionEvaluationResult { IsPass = true };
+            return new ConditionEvaluationResult { IsPass = false, Message = "步骤没有通过条件" };
         }
 
         var results = new List<ConditionCheckResult>();
@@ -111,111 +115,68 @@ public class StepConditionEvaluator
             Dbg($"step='{step.StepName}' hands={handSummary} dets={detSummary}");
         }
 
-        int conditionIndex = 0;
+        var nextMatches = new Dictionary<(int Condition, int Hand), (DateTime Since, int Frames)>();
         foreach (var condition in step.PassConditions)
         {
-            var result = CheckCondition(condition, detections, handResult, timestamp, cameraId, ignoreFromRegion);
-            // P0-2：对未自管理帧计数的条件施加通用稳定帧门控（仅对当前步骤生效）
-            if (isCurrentStep)
+            var index = results.Count;
+            var isHand = condition.Type is ConditionType.HandInRegion or ConditionType.HandNotInRegion or
+                ConditionType.HandMoveFromTo or ConditionType.HandStable or ConditionType.HandNearObject;
+            ConditionCheckResult? best = null;
+            if (isHand)
             {
-                ApplyStableFrameGate(step.StepId, conditionIndex, condition, result);
-            }
-            results.Add(result);
-
-            if (!result.IsMet)
-            {
-                return new ConditionEvaluationResult
+                foreach (var hand in MatchingHands(condition, handResult))
                 {
-                    IsPass = false,
-                    FailedCondition = condition,
-                    Message = result.Message,
-                    CheckResults = results
-                };
+                    var candidate = condition.Type == ConditionType.HandNearObject
+                        ? CheckHandNearObject(condition, detections, hand)
+                        : CheckHandCondition(condition, detections, hand, cameraId, timestamp);
+                    Gate(candidate, hand.TrackId);
+                    if (best == null || candidate.IsMet || (!best.IsMet && candidate.WaitingForStability)) best = candidate;
+                }
             }
-            conditionIndex++;
-        }
+            else
+            {
+                best = condition.Type switch
+                {
+                    ConditionType.ObjectPresent => CheckObjectPresent(condition, detections),
+                    ConditionType.ObjectInZone => CheckObjectInZone(condition, detections, cameraId),
+                    ConditionType.ObjectStable => CheckObjectStable(condition, cameraId, timestamp),
+                    ConditionType.ObjectAbsent => CheckObjectAbsent(condition, detections),
+                    ConditionType.SequenceComplete => CheckSequenceComplete(condition),
+                    ConditionType.TimeElapsed => CheckTimeElapsed(condition, timestamp),
+                    _ => new() { Message = $"未知条件类型: {condition.Type}" }
+                };
+                Gate(best, -1);
+            }
+            results.Add(best ?? new() { Message = "未检测到符合条件的手" });
 
+            void Gate(ConditionCheckResult result, int handId)
+            {
+                if (!isCurrentStep || !result.IsMet) return;
+                // Stable / Move / Time have their own motion or temporal criteria.
+                var required = condition.Type is ConditionType.HandStable or ConditionType.ObjectStable or
+                    ConditionType.HandMoveFromTo or ConditionType.TimeElapsed or ConditionType.SequenceComplete ? 1 : condition.StableFrames;
+                var hold = condition.Parameters.GetValueOrDefault("HoldMs") as int? ?? 0;
+                if (required <= 1 && hold == 0) return;
+                var key = (index, handId);
+                var match = _matches.TryGetValue(key, out var prior) ? prior : (Since: timestamp, Frames: 0);
+                nextMatches[key] = (match.Since, ++match.Frames);
+                if (match.Frames < required || (timestamp - match.Since).TotalMilliseconds < hold)
+                {
+                    result.IsMet = false;
+                    result.WaitingForStability = true;
+                    result.Message += $"（连续 {match.Frames}/{required} 帧，要求保持 {hold} ms）";
+                }
+            }
+        }
+        if (isCurrentStep) _matches = nextMatches;
+        var failed = results.FindIndex(r => !r.IsMet);
         return new ConditionEvaluationResult
         {
-            IsPass = true,
-            Message = $"步骤 '{step.StepName}' 所有条件满足",
+            IsPass = failed < 0,
+            FailedCondition = failed < 0 ? null : step.PassConditions[failed],
+            Message = failed < 0 ? $"步骤 '{step.StepName}' 所有条件满足" : results[failed].Message,
             CheckResults = results
         };
-    }
-
-    private ConditionCheckResult CheckCondition(
-        StepCondition condition,
-        List<DetectedObject> detections,
-        HandPoseEstimationResult? handResult,
-        DateTime timestamp,
-        string cameraId,
-        bool ignoreFromRegion = false)
-    {
-        // 手部动作条件分支
-        if (condition.Type == ConditionType.HandInRegion ||
-            condition.Type == ConditionType.HandNotInRegion ||
-            condition.Type == ConditionType.HandStable ||
-            condition.Type == ConditionType.HandMoveFromTo)
-        {
-            return CheckHandCondition(condition, detections, handResult, cameraId, ignoreFromRegion);
-        }
-
-        if (condition.Type == ConditionType.HandNearObject)
-        {
-            return CheckHandNearObject(condition, detections, handResult);
-        }
-
-        // 物体/时间条件分支
-        return condition.Type switch
-        {
-            ConditionType.ObjectPresent => CheckObjectPresent(condition, detections),
-            ConditionType.ObjectInZone => CheckObjectInZone(condition, detections, cameraId),
-            ConditionType.ObjectStable => CheckObjectStable(condition, cameraId),
-            ConditionType.ObjectAbsent => CheckObjectAbsent(condition, detections),
-            ConditionType.SequenceComplete => CheckSequenceComplete(condition),
-            ConditionType.TimeElapsed => CheckTimeElapsed(condition, timestamp),
-            _ => new ConditionCheckResult { IsMet = false, Message = $"未知条件类型: {condition.Type}" }
-        };
-    }
-
-    /// <summary>
-    /// 通用"稳定帧"门控：对非自管理帧计数的条件，要求连续命中 StableFrames 帧才视为满足，
-    /// 避免单帧误检直接放行（工业现场最危险的跳步/漏检来源）。
-    /// HandStable / ObjectStable 内部已含帧计数，跳过以免双重计数。
-    /// </summary>
-    private void ApplyStableFrameGate(int stepId, int conditionIndex, StepCondition condition, ConditionCheckResult result)
-    {
-        // 跳过三类：
-        // ① HandStable / ObjectStable —— 内部已含帧计数，叠加会双重计数；
-        // ② HandMoveFromTo —— 拿起/放下的成功判据是"手握物体且位于区域内"这类瞬时交互，
-        //    物体一离开区域条件即翻回 false，真窗口只有几帧，连续帧门控会漏过
-        //    （曾致喝水配方步骤2无法触发）；
-        // ③ TimeElapsed / SequenceComplete —— 自带时序/完成语义，无需防抖。
-        if (condition.Type == ConditionType.HandStable || condition.Type == ConditionType.ObjectStable ||
-            condition.Type == ConditionType.HandMoveFromTo ||
-            condition.Type == ConditionType.TimeElapsed || condition.Type == ConditionType.SequenceComplete)
-            return;
-
-        int required = condition.StableFrames;
-        if (required <= 1) return; // 无稳定帧要求时保持原有单帧判定语义
-
-        string key = $"{stepId}:{conditionIndex}";
-        if (result.IsMet)
-        {
-            _stablePassCounts.TryGetValue(key, out int count);
-            count++;
-            _stablePassCounts[key] = count;
-            if (count < required)
-            {
-                result.IsMet = false;
-                result.Message += $"（稳定帧门控 {count}/{required}）";
-            }
-        }
-        else
-        {
-            // 条件本身未满足 → 连续计数清零
-            _stablePassCounts[key] = 0;
-        }
     }
 
     #region 手部动作条件评估
@@ -226,22 +187,12 @@ public class StepConditionEvaluator
     private class HandTrackState
     {
         public List<SKPoint> CenterHistory { get; } = new();
-        public HashSet<string> RecentRegions { get; } = new();   // 最近访问过的区域
-        public const int MaxHistory = 30;
+        public System.Runtime.CompilerServices.ConditionalWeakTable<TrackedObject, Dictionary<StepCondition, DateTime>> Carried { get; } = new();
     }
 
     private readonly Dictionary<string, HandTrackState> _handTracks = new(StringComparer.OrdinalIgnoreCase);
 
-    // 物体（按标签）最近访问过的区域记录——用于 HandMoveFromTo 的 from_region 约束。
-    // 例如喝水步骤里判定的是"杯子到达嘴边"（物体而非手），所以 from_region(mouth_region)
-    // 的访问证据应来自物体轨迹，否则放回步骤会卡死在 visitedFrom=false。
-    private readonly Dictionary<string, HashSet<string>> _objectVisitedRegions = new(StringComparer.OrdinalIgnoreCase);
-
-    // 通用"稳定帧"门控：按 (步骤ID, 条件序号) 记录连续命中帧数，
-    // 达到 condition.StableFrames 才放行（P0-2 修复：原 object_present/object_in_zone/
-    // person_present/hand_in_region/hand_not_in_region/hand_move/hand_near_object 单帧命中即过，无防抖）。
-    // HandStable 与 ObjectStable 内部已自行管理帧计数，不再叠加门控。
-    private readonly Dictionary<string, int> _stablePassCounts = new();
+    private Dictionary<(int Condition, int Hand), (DateTime Since, int Frames)> _matches = new();
     private int _lastEvaluatedStepId = -1;
 
     /// <summary>
@@ -250,22 +201,20 @@ public class StepConditionEvaluator
     /// </summary>
     public void Reset()
     {
+        _moves.Clear();
         _handTracks.Clear();
-        _objectVisitedRegions.Clear();
-        _stablePassCounts.Clear();
+        _matches.Clear();
         _lastEvaluatedStepId = -1;
     }
 
     public void ResetStableCounts() => Reset();
 
-    private void UpdateHandTracks(HandPoseEstimationResult? handResult, string cameraId)
+    private void UpdateHandTracks(HandPoseEstimationResult? handResult, string cameraId, int historyLength)
     {
-        if (handResult == null) return;
-
         var alive = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var hand in handResult.Hands)
+        foreach (var hand in UniqueHands(handResult))
         {
-            if (hand.TrackId < 0) continue;
+            if (hand.TrackId < 0 || !hand.IsValidGesture(8)) continue;
             var trackKey = TrackKey(cameraId, hand.TrackId);
             alive.Add(trackKey);
 
@@ -277,86 +226,117 @@ public class StepConditionEvaluator
 
             var center = hand.GetCenter();
             track.CenterHistory.Add(center);
-            if (track.CenterHistory.Count > HandTrackState.MaxHistory)
+            if (track.CenterHistory.Count > historyLength)
                 track.CenterHistory.RemoveAt(0);
 
-            // 记录当前所在的区域
-            foreach (var zone in _zones.Values)
-            {
-                var zoneRect = new SKRect(zone.X, zone.Y, zone.X + zone.Width, zone.Y + zone.Height);
-                if (zoneRect.Contains(center))
-                {
-                    track.RecentRegions.Add(zone.ZoneId);
-                }
-            }
-            if (track.RecentRegions.Count > 20)
-                track.RecentRegions.Remove(track.RecentRegions.First());
         }
 
         // 清理离开画面的手
         foreach (var id in _handTracks.Keys.ToList())
         {
-            if (!alive.Contains(id)) _handTracks.Remove(id);
+            if (id.StartsWith(cameraId + ":", StringComparison.OrdinalIgnoreCase) && !alive.Contains(id)) _handTracks.Remove(id);
         }
     }
 
-    /// <summary>
-    /// 记录每个物体标签最近访问过的区域（用于 from_region 约束）。
-    /// 物体没有稳定 TrackId，按标签聚合即可（同一场景通常只有一种物料）。
-    /// 判定标准与 CheckObjectInZone 的 IsInZone 一致：bbox 与区域相交即记为访问过。
-    /// </summary>
-    private void UpdateObjectRegions(List<DetectedObject> detections, string cameraId)
+    private void ObserveCarriedObjects(List<DetectedObject> detections, HandPoseEstimationResult? hands, string cameraId, DateTime timestamp)
     {
-        foreach (var det in detections)
+        if (hands == null || hands.Hands.Count == 0 || detections.Count == 0 || _stateMachine.Workflow == null) return;
+        // Retain a qualified contact for each putdown condition. A later step can use the
+        // pickup, but loss of either the hand track or the object track breaks the chain.
+        foreach (var step in _stateMachine.Workflow.Steps.Where(s => s.StepId >= _stateMachine.CurrentStepId && s.CameraId.Equals(cameraId, StringComparison.OrdinalIgnoreCase)))
+        foreach (var condition in step.PassConditions.Where(c => c.Type == ConditionType.HandMoveFromTo && !c.IsCarryMove && !string.IsNullOrEmpty(c.TargetObject)))
         {
-            var label = det.ClassName;
-            if (string.IsNullOrEmpty(label)) continue;
-            var objectKey = ObjectKey(cameraId, label);
-            if (!_objectVisitedRegions.TryGetValue(objectKey, out var set))
+            var to = condition.Parameters.GetValueOrDefault("ToRegion") as string;
+            if (string.IsNullOrEmpty(to)) continue;
+            var from = condition.Parameters.GetValueOrDefault("FromRegion") as string;
+            var hasFrom = !string.IsNullOrEmpty(from);
+            var zone = GetZoneDefinition(hasFrom ? from! : to, cameraId);
+            if (zone == null) continue;
+            foreach (var det in detections.Where(d => d.ClassName.Equals(condition.TargetObject, StringComparison.OrdinalIgnoreCase) && d.Confidence >= condition.MinConfidence))
             {
-                set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                _objectVisitedRegions[objectKey] = set;
+                if (IsInZone(det.PixelBoundingBox, zone) != hasFrom || _stateMachine.TrackFor(det) is not { } obj) continue;
+                foreach (var hand in MatchingHands(condition, hands))
+                    if (IsHandHoldingObject(hand, det) && _handTracks.TryGetValue(TrackKey(cameraId, hand.TrackId), out var track))
+                        track.Carried.GetOrCreateValue(obj).TryAdd(condition, timestamp);
             }
-            foreach (var zone in _zones.Values.Where(zone =>
-                string.Equals(zone.CameraId, cameraId, StringComparison.OrdinalIgnoreCase)))
+        }
+    }
+
+    private sealed record MoveEvidence(TrackedObject Object, int Frames, bool Arrived);
+    private Dictionary<(StepCondition, int Hand), MoveEvidence> _moves = new();
+
+    // Rebuild from each fresh frame. An absent/ambiguous contact cannot survive to a later frame.
+    private void ObserveMoves(SOPStep current, List<DetectedObject> detections, HandPoseEstimationResult? hands, string cameraId)
+    {
+        var previous = _moves;
+        _moves = new();
+        if (hands == null || hands.Hands.Count == 0 || detections.Count == 0) return;
+        Observe(current);
+        // Skip-step inspection reads independent evidence for the next step, on its own camera/model.
+        if (_stateMachine.Workflow is not { Settings.EnableSkipDetection: true } workflow) return;
+        var next = workflow.Steps.Where(s => s.StepId > current.StepId).MinBy(s => s.StepId);
+        if (next != null && next.CameraId.Equals(cameraId, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(next.ModelPath, current.ModelPath, StringComparison.OrdinalIgnoreCase)) Observe(next);
+
+        void Observe(SOPStep step)
+        {
+            foreach (var condition in step.PassConditions.Where(c => c.IsCarryMove))
             {
-                var zoneRect = new SKRectI((int)zone.X, (int)zone.Y, (int)(zone.X + zone.Width), (int)(zone.Y + zone.Height));
-                if (det.PixelBoundingBox.IntersectsWith(zoneRect))
+                if (!_zones.TryGetValue(ZoneKey(cameraId, condition.Parameters.GetValueOrDefault("FromRegion") as string ?? ""), out var source) ||
+                    !_zones.TryGetValue(ZoneKey(cameraId, condition.Parameters.GetValueOrDefault("ToRegion") as string ?? ""), out var destination)) continue;
+                var from = new SKRect(source.X, source.Y, source.X + source.Width, source.Y + source.Height);
+                var to = new SKRect(destination.X, destination.Y, destination.X + destination.Width, destination.Y + destination.Height);
+                foreach (var hand in MatchingHands(condition, hands))
                 {
-                    set.Add(zone.ZoneId);
+                    var targets = detections.Where(d => d.ClassName.Equals(condition.TargetObject, StringComparison.OrdinalIgnoreCase) &&
+                        d.Confidence >= condition.MinConfidence && Touches(hand, d)).Take(2).ToArray();
+                    if (targets.Length != 1 || _stateMachine.TrackFor(targets[0]) is not { } obj) continue;
+                    var key = (condition, hand.TrackId);
+                    var center = hand.GetCenter();
+                    var objectCenter = new SKPoint(obj.BoundingBox.MidX, obj.BoundingBox.MidY);
+                    bool atStart = from.Contains(center) && from.Contains(objectCenter) && !to.Contains(center) && !to.Contains(objectCenter);
+                    bool atEnd = to.Contains(center) && to.Contains(objectCenter) && !from.Contains(center) && !from.Contains(objectCenter);
+                    if (previous.TryGetValue(key, out var old) && ReferenceEquals(obj, old.Object))
+                    {
+                        var frames = old.Frames + 1;
+                        // Each center must actually leave A and enter B, even for partially overlapping zones.
+                        bool arrived = atEnd && frames >= Math.Max(2, condition.StableFrames);
+                        _moves[key] = new(obj, frames, arrived);
+                    }
+                    else if (atStart)
+                        _moves[key] = new(obj, 1, false);
                 }
             }
         }
-    }
 
-    /// <summary>
-    /// 根据条件参数选择左手/右手（默认右手）
-    /// </summary>
-    private HandPose? SelectHand(StepCondition condition, HandPoseEstimationResult? handResult)
-    {
-        if (handResult == null || handResult.Hands.Count == 0) return null;
-
-        var handSide = condition.Parameters.GetValueOrDefault("HandSide", "right")?.ToString()?.ToLower() ?? "right";
-        var preferredType = handSide switch
+        static bool Touches(HandPose hand, DetectedObject target)
         {
-            "left" or "左手" => HandType.Left,
-            _ => HandType.Right
-        };
-
-        var chosen = handResult.Hands.FirstOrDefault(h => h.HandType == preferredType && h.IsValidGesture(8))
-                     ?? handResult.Hands.FirstOrDefault(h => h.IsValidGesture(8));
-        return chosen;
-    }
-
-    private ConditionCheckResult CheckHandCondition(StepCondition condition, List<DetectedObject> detections, HandPoseEstimationResult? handResult, string cameraId, bool ignoreFromRegion = false)
-    {
-        var hand = SelectHand(condition, handResult);
-        if (hand == null)
-        {
-            var side = condition.Parameters.GetValueOrDefault("HandSide", "right");
-            return new ConditionCheckResult { IsMet = false, Message = $"未检测到{side}手" };
+            SKRect box = target.PixelBoundingBox;
+            return !box.IsEmpty && hand.Keypoints.Any(p => p.IsValid && p.Type is
+                (HandKeypointType.ThumbTip or HandKeypointType.IndexFingerTip or HandKeypointType.MiddleFingerTip or
+                 HandKeypointType.RingFingerTip or HandKeypointType.PinkyTip or HandKeypointType.MiddleFingerMCP) && box.Contains(p.X, p.Y));
         }
+    }
 
+    // Some backends assign the same left/right ID across people. Ambiguous IDs carry no temporal evidence.
+    private static IEnumerable<HandPose> UniqueHands(HandPoseEstimationResult? result) =>
+        (result?.Hands ?? Enumerable.Empty<HandPose>()).GroupBy(h => h.TrackId)
+            .Where(g => g.Key >= 0 && g.Count() == 1).Select(g => g.First());
+
+    private static IEnumerable<HandPose> MatchingHands(StepCondition condition, HandPoseEstimationResult? handResult)
+    {
+        var side = condition.Parameters.GetValueOrDefault("HandSide", "right")?.ToString()?.ToLowerInvariant();
+        return UniqueHands(handResult).Where(h => h.IsValidGesture(8) && (side switch
+        {
+            "any" => true,
+            "left" or "左手" => h.HandType == HandType.Left,
+            "right" or "右手" => h.HandType == HandType.Right,
+            _ => false
+        }));
+    }
+
+    private ConditionCheckResult CheckHandCondition(StepCondition condition, List<DetectedObject> detections, HandPose hand, string cameraId, DateTime timestamp)
+    {
         var center = hand.GetCenter();
 
         switch (condition.Type)
@@ -399,6 +379,11 @@ public class StepConditionEvaluator
                 float tol = tolerance is float f ? f : Convert.ToSingle(tolerance);
 
                 var recent = track.CenterHistory.TakeLast(condition.StableFrames).ToList();
+                if (!string.IsNullOrEmpty(condition.ZoneId) && GetZoneDefinition(condition.ZoneId, cameraId) is { } region)
+                {
+                    var rect = new SKRect(region.X, region.Y, region.X + region.Width, region.Y + region.Height);
+                    if (recent.Any(point => !rect.Contains(point))) return new() { Message = "等待手部在区域内持续稳定" };
+                }
                 double maxMove = 0;
                 for (int i = 1; i < recent.Count; i++)
                 {
@@ -421,168 +406,23 @@ public class StepConditionEvaluator
                 if (hasFrom && zoneFrom == null) return new ConditionCheckResult { IsMet = false, Message = $"未找到起始区域: {fromRegion}" };
                 if (hasTo && zoneTo == null) return new ConditionCheckResult { IsMet = false, Message = $"未找到目标区域: {toRegion}" };
 
-                var fromRect = zoneFrom != null ? new SKRect(zoneFrom.X, zoneFrom.Y, zoneFrom.X + zoneFrom.Width, zoneFrom.Y + zoneFrom.Height) : SKRect.Empty;
-                var toRect = zoneTo != null ? new SKRect(zoneTo.X, zoneTo.Y, zoneTo.X + zoneTo.Width, zoneTo.Y + zoneTo.Height) : SKRect.Empty;
-
-                bool inFrom = zoneFrom != null && fromRect.Contains(center);
-                bool inTo = zoneTo != null && toRect.Contains(center);
-                // from_region 约束：手或目标物体曾访问过起始区域都算数。
-                // 例如喝水 SOP 里起始区域是 mouth_region，但"喝水"这一步判定的是
-                // "杯子到达嘴边"（物体而非手），手轨迹里可能没有 mouth_region，
-                // 必须借助物体区域访问记录，否则放回步骤会一直卡在 visitedFrom=false。
-                bool visitedFromByHand = _handTracks.TryGetValue(TrackKey(cameraId, hand.TrackId), out var t2)
-                    && t2.RecentRegions.Contains(fromRegion);
-                bool visitedFromByObject = !string.IsNullOrEmpty(condition.TargetObject)
-                    && _objectVisitedRegions.TryGetValue(ObjectKey(cameraId, condition.TargetObject), out var objRegions)
-                    && objRegions.Contains(fromRegion);
-                // 跳步检测(ignoreFromRegion)时忽略 from_region 的历史访问约束——
-                // 跳步场景本就跳过了中间步骤，物体自然没经过起始区域（如没到嘴边），
-                // 若强制要求 visitedFrom 会导致跳步漏报。此处仅放松时序约束，
-                // 主体仍要求"物体到达目标区域(to_region)"这一核心动作意图。
-                bool visitedFrom = hasFrom && (ignoreFromRegion || visitedFromByHand || visitedFromByObject);
-
-                // [DEBUG] HandMoveFromTo 入口摘要：所有输入一目了然
-                Dbg(
-                    $"HandMoveFromTo target='{condition.TargetObject}' minConf={condition.MinConfidence:F2} stableFrames={condition.StableFrames} " +
-                    $"from='{fromRegion}'({(zoneFrom != null ? $"[{zoneFrom.X},{zoneFrom.Y}-{zoneFrom.X + zoneFrom.Width},{zoneFrom.Y + zoneFrom.Height}]" : "null")}) " +
-                    $"to='{toRegion}'({(zoneTo != null ? $"[{zoneTo.X},{zoneTo.Y}-{zoneTo.X + zoneTo.Width},{zoneTo.Y + zoneTo.Height}]" : "null")}) " +
-                    $"hand[{hand.HandType}](center=({center.X:F0},{center.Y:F0}) bbox=[{hand.BoundingBox.Left:F0},{hand.BoundingBox.Top:F0}-{hand.BoundingBox.Right:F0},{hand.BoundingBox.Bottom:F0}] keypoints={hand.Keypoints.Count}) " +
-                    $"inFrom={inFrom} inTo={inTo} visitedFrom={visitedFrom} trackEntries={_handTracks.Count}");
-
-                // ⭐ 目标物体辅助判定：手正拿着 target_object（适用于"拿起/放下"最直接的语义）
-                bool handHoldingTarget = false;
-                DetectedObject? targetObjDebug = null;
-                if (!string.IsNullOrEmpty(condition.TargetObject))
+                if (condition.IsCarryMove)
                 {
-                    var allCandidates = detections
-                        .Where(d => d.ClassName.Equals(condition.TargetObject, StringComparison.OrdinalIgnoreCase))
-                        .ToList();
-                    var targetObj = allCandidates
-                        .Where(d => d.Confidence >= condition.MinConfidence)
-                        .OrderByDescending(d => d.Confidence)
-                        .FirstOrDefault();
-                    targetObjDebug = targetObj;
-
-                    if (allCandidates.Count > 0 && targetObj == null)
-                    {
-                        Dbg(
-                            $"  找到 {allCandidates.Count} 个候选 '{condition.TargetObject}' 但全部低于阈值 " +
-                            $"({condition.MinConfidence:F2})：{string.Join(",", allCandidates.Select(c => $"conf={c.Confidence:F2}"))}");
-                    }
-
-                    if (targetObj != null)
-                    {
-                        handHoldingTarget = IsHandHoldingObject(hand, targetObj, out var intersectDetail);
-                        Dbg(
-                            $"  target_obj '{condition.TargetObject}' conf={targetObj.Confidence:F2} " +
-                            $"bbox=[{targetObj.PixelBoundingBox.Left:F0},{targetObj.PixelBoundingBox.Top:F0}-{targetObj.PixelBoundingBox.Right:F0},{targetObj.PixelBoundingBox.Bottom:F0}] " +
-                            $"handHolding={handHoldingTarget} {intersectDetail}");
-                    }
-                    else if (allCandidates.Count == 0)
-                    {
-                        Dbg($"  本帧未检测到 '{condition.TargetObject}'（detections 里有 {detections.Count} 个其它物体）");
-                    }
+                    bool arrived = _moves.TryGetValue((condition, hand.TrackId), out var evidence) && evidence.Arrived;
+                    return new() { IsMet = arrived, Message = arrived ? $"已将 {condition.TargetObject} 搬至 {toRegion}" : $"等待同一只手连续携带 {condition.TargetObject} 从 {fromRegion} 到 {toRegion}" };
                 }
-
-                if (hasTo)
+                foreach (var obj in detections.Where(d => d.ClassName.Equals(condition.TargetObject, StringComparison.OrdinalIgnoreCase) && d.Confidence >= condition.MinConfidence))
                 {
-                    // 主判据：目标物体（杯子）已到达目标区域（放下的最直接证据）
-                    if (!string.IsNullOrEmpty(condition.TargetObject))
-                    {
-                        var targetObj = detections
-                            .Where(d => d.ClassName.Equals(condition.TargetObject, StringComparison.OrdinalIgnoreCase))
-                            .Where(d => d.Confidence >= condition.MinConfidence)
-                            .OrderByDescending(d => d.Confidence)
-                            .FirstOrDefault();
-
-                        if (targetObj != null)
-                        {
-                            bool objInTo = toRect != SKRect.Empty && IsInZone(targetObj.PixelBoundingBox, zoneTo!);
-                            // 若指定了起始区域，要求手曾访问过起始区域，才能算“从该区域放到目标区域”。
-                            // 否则会出现：杯子本来就在目标区域（如拿起前已在桌面），被误判为“已经放下”。
-                            if (objInTo && (!hasFrom || visitedFrom))
-                            {
-                                return new ConditionCheckResult
-                                {
-                                    IsMet = true,
-                                    Message = $"目标物体 '{condition.TargetObject}' 已到达区域 {toRegion}"
-                                };
-                            }
-                        }
-                    }
-
-                    // 辅助判据：手到达目标区域 且 正握着目标物体（手把杯子放到该区域，
-                    // 而非空手碰一下就判定放回）
-                    if (inTo && (!hasFrom || visitedFrom) && handHoldingTarget)
-                        return new ConditionCheckResult
-                        {
-                            IsMet = true,
-                            Message = $"手部携带 '{condition.TargetObject}' 已到达区域 {toRegion}"
-                        };
-
-                    return new ConditionCheckResult
-                    {
-                        IsMet = false,
-                        Message = hasFrom
-                            ? $"手部/物体尚未从 {fromRegion} 到达 {toRegion}（需携带 '{condition.TargetObject}'）"
-                            : $"'{condition.TargetObject}' 尚未进入目标区域 {toRegion}（需携带杯子）"
-                    };
+                    bool holding = IsHandHoldingObject(hand, obj, out _);
+                    if (!hasTo && holding && (!hasFrom || IsInZone(obj.PixelBoundingBox, zoneFrom!)))
+                        return new ConditionCheckResult { IsMet = true, Message = "已在起始区域握住目标物料" };
+                    if (!hasTo || !IsInZone(obj.PixelBoundingBox, zoneTo!)) continue;
+                    var track = _stateMachine.TrackFor(obj);
+                    if (track != null && _handTracks.TryGetValue(TrackKey(cameraId, hand.TrackId), out var handTrack) &&
+                        handTrack.Carried.TryGetValue(track, out var evidence) && evidence.TryGetValue(condition, out var origin) && origin < timestamp)
+                        return new ConditionCheckResult { IsMet = true, Message = "同一物料已由起点到达目标区" };
                 }
-
-                // 无目标区域：理解为"从起始区域拿起目标物体"（pickup 语义）
-                // ⚠️ 关键约束：目标物体（杯子）必须【当前帧】位于 from_region（cup_table），
-                //   才能判定"从该区域拿起"。禁止从任意地方拿起。
-                //   不能用"会话历史曾访问过 from_region"判断——那会导致上一轮/起始放置后
-                //   永久为 true，从而杯子从任何地方拿都判 OK（from_region 约束失效）。
-                if (hasFrom)
-                {
-                    // 目标物体当前是否位于起始区域（当前帧，非历史）
-                    bool objInFromNow = false;
-                    if (!string.IsNullOrEmpty(condition.TargetObject))
-                    {
-                        var objNow = detections
-                            .Where(d => d.ClassName.Equals(condition.TargetObject, StringComparison.OrdinalIgnoreCase))
-                            .Where(d => d.Confidence >= condition.MinConfidence)
-                            .OrderByDescending(d => d.Confidence)
-                            .FirstOrDefault();
-                        if (objNow != null && zoneFrom != null)
-                            objInFromNow = IsInZone(objNow.PixelBoundingBox, zoneFrom);
-                    }
-
-                    Dbg($"  [pickup] from='{fromRegion}' objInFromNow={objInFromNow} inFrom={inFrom} handHolding={handHoldingTarget}");
-
-                    // 杯子当前必须位于起始区域（或手当前位于起始区域），否则不能算"从该区域拿起"
-                    if (!(objInFromNow || inFrom))
-                    {
-                        return new ConditionCheckResult
-                        {
-                            IsMet = false,
-                            Message = $"'{condition.TargetObject}' 不在区域 {fromRegion}（需从 {fromRegion} 拿起，当前位置不符）"
-                        };
-                    }
-
-                    // 判定：手正握着目标物体（物体被握起）——最直接的"拿起"证据
-                    if (handHoldingTarget)
-                    {
-                        return new ConditionCheckResult
-                        {
-                            IsMet = true,
-                            Message = $"手部已在 {fromRegion} 内拿起 '{condition.TargetObject}'"
-                        };
-                    }
-
-                    return new ConditionCheckResult
-                    {
-                        IsMet = false,
-                        Message = $"手部/物体位于区域 {fromRegion}，但未检测到 '{condition.TargetObject}' 被拿起（杯子需被拿起）"
-                    };
-                }
-
-                // 既无 from 也无 to：只判"手拿着目标物体"
-                if (handHoldingTarget)
-                    return new ConditionCheckResult { IsMet = true, Message = $"手部已拿起 '{condition.TargetObject}'" };
-
-                return new ConditionCheckResult { IsMet = false, Message = "未配置起始/目标区域" };
+                return new ConditionCheckResult { IsMet = false, Message = $"等待连续的手和物料轨迹：{condition.TargetObject}" };
             }
             default:
                 return new ConditionCheckResult { IsMet = false, Message = $"未支持的手部条件: {condition.Type}" };
@@ -592,12 +432,8 @@ public class StepConditionEvaluator
     /// <summary>
     /// 手部靠近目标物体（手-物交互判断）：手的包围盒与目标检测框（外扩 margin）相交
     /// </summary>
-    private ConditionCheckResult CheckHandNearObject(StepCondition condition, List<DetectedObject> detections, HandPoseEstimationResult? handResult)
+    private ConditionCheckResult CheckHandNearObject(StepCondition condition, List<DetectedObject> detections, HandPose hand)
     {
-        var hand = SelectHand(condition, handResult);
-        if (hand == null)
-            return new ConditionCheckResult { IsMet = false, Message = "未检测到目标手" };
-
         var marginValue = condition.Parameters.GetValueOrDefault("Margin", 30f);
         float margin = marginValue is float f ? f : Convert.ToSingle(marginValue);
 
@@ -747,11 +583,11 @@ public class StepConditionEvaluator
     /// <summary>
     /// 检查目标是否稳定
     /// </summary>
-    private ConditionCheckResult CheckObjectStable(StepCondition condition, string cameraId)
+    private ConditionCheckResult CheckObjectStable(StepCondition condition, string cameraId, DateTime timestamp)
     {
         var trackedObjects = _stateMachine.TrackedObjects
             .Where(kv => kv.Value.CameraId.Equals(cameraId, StringComparison.OrdinalIgnoreCase))
-            .Where(kv => kv.Value.ClassName.Equals(condition.TargetObject, StringComparison.OrdinalIgnoreCase))
+            .Where(kv => kv.Value.LastUpdate == timestamp && kv.Value.ClassName.Equals(condition.TargetObject, StringComparison.OrdinalIgnoreCase))
             .Select(kv => kv.Value)
             .ToList();
 
@@ -766,7 +602,7 @@ public class StepConditionEvaluator
 
         var toleranceValue = condition.Parameters.GetValueOrDefault("Tolerance", 20f);
         float tolerance = toleranceValue is float f ? f : Convert.ToSingle(toleranceValue);
-        var stableObjects = trackedObjects.Where(o => o.IsStable(tolerance)).ToList();
+        var stableObjects = trackedObjects.Where(o => o.IsStable(tolerance, condition.StableFrames, condition.MinConfidence)).ToList();
 
         if (stableObjects.Count == 0)
         {
@@ -911,6 +747,7 @@ public class ConditionEvaluationResult
 public class ConditionCheckResult
 {
     public bool IsMet { get; set; }
+    public bool WaitingForStability { get; set; }
     public string Message { get; set; } = "";
     public List<DetectedObject> MatchedObjects { get; set; } = new();
 }
