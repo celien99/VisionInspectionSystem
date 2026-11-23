@@ -201,12 +201,12 @@ public static class SopActionCatalog
             Key = "pickup",
             Label = "拿起某物",
             Method = "hand_action",
-            Hint = "手从指定区域拿起某物体（手离开区域，或手拿着物体离开）。",
+            Hint = "手与同一物体持续接触，一起离开起始区域。",
             DefaultStepName = "拿起",
             Params = new List<SopParamSpec>
             {
                 new SopParamSpec("from_region", "从区域（物体原来放的位置）", SopParamKind.Region, true),
-                new SopParamSpec("target_object", "物体（如 cup）", SopParamKind.Object, false),
+                new SopParamSpec("target_object", "物体（如 cup）", SopParamKind.Object, true),
                 new SopParamSpec("hand", "用哪只手", SopParamKind.Hand, false)
             }
         },
@@ -216,13 +216,13 @@ public static class SopActionCatalog
             Key = "putdown",
             Label = "把某物放到某处",
             Method = "hand_action",
-            Hint = "手把物体从某处（通常先经过上一步）放到目标区域。",
+            Hint = "手携物到达目标区域后松手，物体持续留在目标区域。",
             DefaultStepName = "放回",
             Params = new List<SopParamSpec>
             {
                 new SopParamSpec("from_region", "从区域（上一步的位置，可留空）", SopParamKind.Region, false),
                 new SopParamSpec("to_region", "到区域（要放到的位置）", SopParamKind.Region, true),
-                new SopParamSpec("target_object", "物体（如 cup）", SopParamKind.Object, false),
+                new SopParamSpec("target_object", "物体（如 cup）", SopParamKind.Object, true),
                 new SopParamSpec("hand", "用哪只手", SopParamKind.Hand, false)
             }
         },

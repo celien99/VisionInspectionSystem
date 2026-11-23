@@ -48,7 +48,12 @@ internal static class SopRecipeValidation
                 Require(!string.IsNullOrWhiteSpace(d.FromRegion) && !string.IsNullOrWhiteSpace(d.ToRegion), "hand_move 需要 from_region 和 to_region");
                 Require(!string.Equals(d.FromRegion, d.ToRegion, StringComparison.OrdinalIgnoreCase), "hand_move 的起点和终点必须不同");
             }
-            if (method == "hand_action") Require(d.Action is "pickup" or "putdown" && (d.Action != "putdown" || !string.IsNullOrWhiteSpace(d.ToRegion)), "hand_action 的 action 或 to_region 无效");
+            if (method == "hand_action")
+            {
+                Require(d.Action is "pickup" or "putdown", "hand_action 需要 pickup 或 putdown");
+                if (d.Action == "pickup") Require(!string.IsNullOrWhiteSpace(d.FromRegion) && string.IsNullOrWhiteSpace(d.ToRegion), "pickup 需要 from_region 且不使用 to_region");
+                if (d.Action == "putdown") Require(!string.IsNullOrWhiteSpace(d.ToRegion) && !string.Equals(d.FromRegion, d.ToRegion, StringComparison.OrdinalIgnoreCase), "putdown 需要独立的 to_region");
+            }
             if (d.Hand != null) Require(d.Hand.ToLowerInvariant() is "left" or "right" or "any" or "左手" or "右手", "hand 仅支持 left、right 或 any");
             var camera = string.IsNullOrWhiteSpace(step.Camera) ? "main_camera" : step.Camera.Trim();
             void CheckZone(string? id)

@@ -12,7 +12,7 @@ namespace Modules.SOP.Models;
 public class SOPStateMachine
 {
     private SOPWorkflow? _workflow;
-    private readonly Dictionary<string, TrackedObject> _trackedObjects = new();
+    private Dictionary<string, TrackedObject> _trackedObjects = new();
     private readonly List<StepExecutionRecord> _stepHistory = new();
     private readonly List<ViolationRecord> _violations = new();
     private readonly StepConditionEvaluator _conditionEvaluator;
@@ -69,6 +69,9 @@ public class SOPStateMachine
     {
         _conditionEvaluator.UpdateZones(zones);
         _violationDetector.UpdateZones(zones);
+        _conditionEvaluator.Reset();
+        _trackedObjects.Clear();
+        _inspection.Reset();
     }
 
     public void Start(SOPWorkflow workflow)
@@ -265,63 +268,34 @@ public class SOPStateMachine
     private void UpdateTrackedObjects(List<DetectedObject> detections, DateTime timestamp, string cameraId)
     {
         _currentTracks.Clear();
-        var matchedKeys = new HashSet<string>();
-        var matchedDetections = new HashSet<int>();
-
-        // 第一轮：用 IOU 匹配已有跟踪对象
+        // Compare against the previous frame, before updating any boxes. An ambiguous
+        // association starts a new track rather than extending someone else's evidence.
+        var candidates = detections.Select(d => _trackedObjects.Where(pair =>
+            pair.Value.CameraId.Equals(cameraId, StringComparison.OrdinalIgnoreCase) &&
+            pair.Value.ClassName.Equals(d.ClassName, StringComparison.OrdinalIgnoreCase) &&
+            CalculateIOU(pair.Value.BoundingBox, d.PixelBoundingBox) > 0.3f).Select(pair => pair.Key).ToArray()).ToArray();
+        var claims = candidates.SelectMany(keys => keys).ToLookup(key => key);
+        var fresh = new Dictionary<string, TrackedObject>();
         for (int i = 0; i < detections.Count; i++)
         {
-            var detection = detections[i];
-            var labelName = detection.ClassName;
-
-            string? bestKey = null;
-            float bestIOU = 0.3f; // IOU 阈值，低于此值视为新对象
-
-            foreach (var (key, tracked) in _trackedObjects)
+            var d = detections[i];
+            string key;
+            TrackedObject track;
+            if (candidates[i] is [var prior] && claims[prior].Count() == 1)
             {
-                if (matchedKeys.Contains(key)) continue;
-                if (!tracked.CameraId.Equals(cameraId, StringComparison.OrdinalIgnoreCase)) continue;
-                if (!tracked.ClassName.Equals(labelName, StringComparison.OrdinalIgnoreCase)) continue;
-
-                float iou = CalculateIOU(tracked.BoundingBox, detection.PixelBoundingBox);
-                if (iou > bestIOU)
-                {
-                    bestIOU = iou;
-                    bestKey = key;
-                }
+                key = prior;
+                track = _trackedObjects[key];
+                track.Update(d.PixelBoundingBox, timestamp, d.Confidence);
             }
-
-            if (bestKey != null)
+            else
             {
-                // 匹配成功，更新位置
-                _trackedObjects[bestKey].Update(detection.PixelBoundingBox, timestamp, detection.Confidence);
-                _currentTracks[detection] = _trackedObjects[bestKey];
-                matchedKeys.Add(bestKey);
-                matchedDetections.Add(i);
+                key = $"{cameraId}_{d.ClassName}_{_nextTrackId++}";
+                track = new(cameraId, d.ClassName, d.PixelBoundingBox, timestamp, _historyLength, d.Confidence);
             }
+            fresh.Add(key, track);
+            _currentTracks[d] = track;
         }
-
-        // 第二轮：未匹配的检测结果创建新跟踪
-        for (int i = 0; i < detections.Count; i++)
-        {
-            if (matchedDetections.Contains(i)) continue;
-
-            var detection = detections[i];
-            var labelName = detection.ClassName;
-            var newKey = $"{cameraId}_{labelName}_{_nextTrackId++}";
-            _currentTracks[detection] = _trackedObjects[newKey] = new TrackedObject(cameraId, labelName, detection.PixelBoundingBox, timestamp, _historyLength, detection.Confidence);
-        }
-
-        // 清理过期跟踪（2秒未更新的对象视为离开画面）
-        var expired = _trackedObjects
-            .Where(kv => (kv.Value.CameraId.Equals(cameraId, StringComparison.OrdinalIgnoreCase) && kv.Value.LastUpdate != timestamp) || (timestamp - kv.Value.LastUpdate).TotalSeconds > 2)
-            .Select(kv => kv.Key)
-            .ToList();
-
-        foreach (var key in expired)
-        {
-            _trackedObjects.Remove(key);
-        }
+        _trackedObjects = fresh;
     }
 
     /// <summary>
@@ -377,14 +351,10 @@ public class SOPStateMachine
         else
         {
             _inspection.Reset();
-            foreach (var track in _trackedObjects.Values) track.ResetHistory();
             var previousStepId = CurrentStepId;
             CurrentStepId = _workflow.Steps.Where(s => s.StepId > CurrentStepId).Min(s => s.StepId);
-            if (!_workflow.Steps.First(s => s.StepId == CurrentStepId).CameraId.Equals(currentStep.CameraId, StringComparison.OrdinalIgnoreCase))
-            {
-                _trackedObjects.Clear();
-                _conditionEvaluator.Reset();
-            }
+            _conditionEvaluator.Reset();
+            _trackedObjects.Clear();
             StepStartTime = timestamp;
             StepChanged?.Invoke(this, new StepChangedEventArgs(previousStepId, CurrentStepId, _workflow.Steps.FirstOrDefault(s => s.StepId == CurrentStepId)?.StepName ?? ""));
         }
@@ -517,12 +487,6 @@ public class TrackedObject
         Update(boundingBox, timestamp, confidence);
     }
 
-    internal void ResetHistory()
-    {
-        PositionHistory.Clear();
-        _confidences.Clear();
-    }
-
     public void Update(SKRect newBox, DateTime timestamp, double confidence = 1)
     {
         BoundingBox = newBox;
@@ -537,13 +501,13 @@ public class TrackedObject
         }
     }
 
-    public bool IsStable(float tolerance, int frames = 5, double minConfidence = 0)
+    public bool IsStable(float tolerance, int frames = 5, double minConfidence = 0, ZoneDefinition? zone = null)
     {
         if (PositionHistory.Count < frames || _confidences.TakeLast(frames).Any(c => c < minConfidence)) return false;
         var recent = PositionHistory.TakeLast(frames).ToList();
         var centerX = recent.Average(r => r.MidX);
         var centerY = recent.Average(r => r.MidY);
-        return recent.All(r => Math.Abs(r.MidX - centerX) < tolerance && Math.Abs(r.MidY - centerY) < tolerance);
+        return recent.All(r => (zone == null || zone.ContainsCenter(r)) && Math.Abs(r.MidX - centerX) < tolerance && Math.Abs(r.MidY - centerY) < tolerance);
     }
 }
 

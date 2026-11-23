@@ -1104,7 +1104,7 @@ namespace Desktop.Views
             TargetObjectPanel.Visibility = V(IsIn(m, "person_present", "object_present", "object_in_zone", "pose_stable", "hand_move", "hand_action", "hand_near_object"));
             HandPanel.Visibility = V(IsIn(m, "hand_in_region", "hand_not_in_region", "hand_stable", "hand_move", "hand_action", "hand_near_object"));
             ActionPanel.Visibility = V(IsIn(m, "hand_action"));
-            RegionPanel.Visibility = V(IsIn(m, "hand_in_region", "hand_not_in_region", "hand_stable", "object_in_zone"));
+            RegionPanel.Visibility = V(IsIn(m, "hand_in_region", "hand_not_in_region", "hand_stable", "object_in_zone", "pose_stable"));
             FromToPanel.Visibility = V(IsIn(m, "hand_move", "hand_action"));
             TolerancePanel.Visibility = V(IsIn(m, "hand_stable", "hand_near_object", "pose_stable"));
 

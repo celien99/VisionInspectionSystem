@@ -751,6 +751,7 @@ public static class SOPYamlConverter
                 break;
 
             case "pose_stable":
+                condition.ZoneId = detection.Region;
                 condition.TargetObject = detection.TargetObject ?? "";
                 condition.Type = ConditionType.ObjectStable;
                 condition.Parameters["Tolerance"] = detection.Tolerance;
@@ -772,37 +773,12 @@ public static class SOPYamlConverter
 
             case "hand_action":
             {
-                // 基于手部"取/放"语义转换成 HandMoveFromTo：
-                //  - pickup  ：手曾位于 FromRegion（如手机放置区）且现已离开，
-                //              或检测到手正拿着 target_object 且该物体已离开 FromRegion
-                //  - putdown ：手到达 ToRegion（如手机放置区）
                 condition.Type = ConditionType.HandMoveFromTo;
-                var action = (detection.Action ?? "").ToLowerInvariant();
-                if (action == "pickup")
-                {
-                    condition.Parameters["FromRegion"] = detection.FromRegion ?? "";
-                    condition.Parameters["ToRegion"] = "";
-                    // target_object 辅助判定：手机等物品离开放置区即视为拿起
-                    condition.TargetObject = detection.TargetObject ?? "";
-                }
-                else if (action == "putdown")
-                {
-                    // 保留 FromRegion（如 mouth_region）：要求手曾访问过起始区域，
-                    // 避免"杯子本来就在桌面"被误判为已放下，也避免手空着碰目标区就判定放回。
-                    condition.Parameters["FromRegion"] = detection.FromRegion ?? "";
-                    condition.Parameters["ToRegion"] = detection.ToRegion ?? "";
-                    condition.TargetObject = detection.TargetObject ?? "";
-                }
-                else
-                {
-                    // 未指定/未知 action：退化为普通手移动（from/to 任一即可）
-                    condition.Parameters["FromRegion"] = detection.FromRegion ?? "";
-                    condition.Parameters["ToRegion"] = detection.ToRegion ?? "";
-                    condition.TargetObject = detection.TargetObject ?? "";
-                }
+                condition.TargetObject = detection.TargetObject ?? "";
+                condition.Parameters["Action"] = detection.Action!;
+                condition.Parameters["FromRegion"] = detection.FromRegion ?? "";
+                condition.Parameters["ToRegion"] = detection.ToRegion ?? "";
                 condition.Parameters["HandSide"] = detection.Hand ?? "any";
-                // 保存 action 到 Parameters，供 ConvertConditionToDetection 回读
-                condition.Parameters["Action"] = action;
                 break;
             }
 
@@ -1027,6 +1003,7 @@ public static class SOPYamlConverter
 
             case ConditionType.ObjectStable:
                 detection.Method = "pose_stable";
+                detection.Region = condition.ZoneId;
                 detection.TargetObject = condition.TargetObject;
                 detection.Tolerance = condition.Parameters.GetValueOrDefault("Tolerance", 20f) is float f ? f : 20f;
                 break;

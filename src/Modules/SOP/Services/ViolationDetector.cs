@@ -72,7 +72,7 @@ public class ViolationDetector
 
         // 全局跳步检测：基于"后续步骤的完整条件是否已满足"判断，比单纯检测物体出现更可靠，
         // 避免把正常的拿/放过程误判为跳步。仅在 EnableSkipDetection 开启、且非第一步时启用。
-        if (checkSkip && _stateMachine.Workflow?.Settings.EnableSkipDetection == true)
+        if (_stateMachine.Workflow?.Settings.EnableSkipDetection == true)
         {
             var minStepId = _stateMachine.Workflow.Steps.Count > 0
                 ? _stateMachine.Workflow.Steps.Min(s => s.StepId)
@@ -80,7 +80,7 @@ public class ViolationDetector
             if (currentStep.StepId > minStepId)
             {
                 var skip = DetectSkipStep(currentStep, detections, handResult, timestamp, cameraId);
-                if (skip != null && !IsOnCooldown(skip, timestamp))
+                if (checkSkip && skip != null && !IsOnCooldown(skip, timestamp))
                 {
                     violations.Add(skip);
                     SetCooldown(skip, timestamp);
@@ -227,7 +227,7 @@ public class ViolationDetector
                 var intrusions = detections
                     .Where(d => d.ClassName.Equals(forbiddenClass, StringComparison.OrdinalIgnoreCase))
                     .Where(d => d.Confidence >= 0.5f)
-                    .Where(d => IsInZone(d.PixelBoundingBox, zone))
+                    .Where(d => IntersectsZone(d.PixelBoundingBox, zone))
                     .ToList();
 
                 if (intrusions.Count > 0)
@@ -262,14 +262,15 @@ public class ViolationDetector
             .OrderBy(s => s.StepId)
             .FirstOrDefault();
 
-        if (nextStep == null || !nextStep.CameraId.Equals(cameraId, StringComparison.OrdinalIgnoreCase) || nextStep.RequiredMaterials.Count > 0) return null;
+        if (nextStep == null || !nextStep.CameraId.Equals(cameraId, StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(nextStep.ModelPath, step.ModelPath, StringComparison.OrdinalIgnoreCase) || nextStep.RequiredMaterials.Count > 0) return null;
 
         // 排除纯时间条件步骤（如 complete 的 time_elapsed），否则只要等 1 秒就误报跳步
         if (nextStep.PassConditions.Count == 1 && nextStep.PassConditions[0].Type == ConditionType.TimeElapsed)
             return null;
 
         // Read the next step without advancing it. A carry requires its own observed hand/object trajectory.
-        var eval = _conditionEvaluator.EvaluateConditions(nextStep, detections, handResult, timestamp, cameraId, ignoreFromRegion: true);
+        var eval = _conditionEvaluator.EvaluateConditions(nextStep, detections, handResult, timestamp, cameraId);
         if (eval.IsPass)
         {
             return new ViolationRecord
@@ -330,25 +331,11 @@ public class ViolationDetector
     public void Reset() => _violationCooldown.Clear();
 
     private ZoneDefinition? GetZoneDefinition(string zoneId, string cameraId)
-    {
-        if (_zones.TryGetValue(ZoneKey(cameraId, zoneId), out var zone))
-        {
-            return zone;
-        }
-
-        var matches = _zones.Values
-            .Where(candidate => candidate.ZoneId.Equals(zoneId, StringComparison.OrdinalIgnoreCase))
-            .ToList();
-        if (matches.Count == 1)
-            return matches[0];
-
-        Console.WriteLine($"[SOP] 警告: 违规检测器未找到区域定义 '{zoneId}'");
-        return null;
-    }
+        => _zones.GetValueOrDefault(ZoneKey(cameraId, zoneId));
 
     private static string ZoneKey(string cameraId, string zoneId) => $"{cameraId}:{zoneId}";
 
-    private static bool IsInZone(SKRect objectBox, ZoneDefinition zone)
+    private static bool IntersectsZone(SKRect objectBox, ZoneDefinition zone)
     {
         var zoneBox = new SKRect(zone.X, zone.Y, zone.X + zone.Width, zone.Y + zone.Height);
         return objectBox.IntersectsWith(zoneBox);

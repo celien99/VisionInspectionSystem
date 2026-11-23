@@ -216,7 +216,10 @@ for(int i=0;i<4;i++) Frame(stationary,i*40,new(){Obj("part",8,18),Obj("part",95,
 Check(stationary.Outcome == null,"two unmoved parts cannot substitute for a transfer");
 var moved=Start(SOPYamlConverter.ParseYaml(transfer));
 for(int x=8;x<95;x+=4) Frame(moved,(x-8)*8,new(){Obj("part",x,18,10)},Hand(x,18));
-Check(moved.Outcome == SopCycleOutcome.OK,"one gripped, tracked part reaches destination");
+Check(moved.Outcome == null, "putdown requires release even after a complete carry");
+for (int i = 0; i < 5; i++) Frame(moved, 720 + 40*i, new(){Obj("part",92,18,10)}, Hand(120,18));
+Check(moved.Outcome == SopCycleOutcome.OK, "same part remains at destination after visible release");
+EvidenceRegression.Run(Check);
 var uncertainPickup = Start(SOPYamlConverter.ParseYaml(transfer));
 for (int x = 8; x < 95; x += 4)
 {

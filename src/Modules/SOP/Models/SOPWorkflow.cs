@@ -96,7 +96,6 @@ public class ModbusTriggerConfig
 /// </summary>
 public class StepCondition
 {
-    internal bool IsCarryMove => Type == ConditionType.HandMoveFromTo && !Parameters.ContainsKey("Action");
     public ConditionType Type { get; set; }
     public string TargetObject { get; set; } = "";
     public string? ZoneId { get; set; }
@@ -176,6 +175,9 @@ public class ZoneDefinition
     public float Y { get; set; }
     public float Width { get; set; }
     public float Height { get; set; }
+
+    internal bool Contains(SkiaSharp.SKPoint p) => p.X >= X && p.X < X + Width && p.Y >= Y && p.Y < Y + Height;
+    internal bool ContainsCenter(SkiaSharp.SKRect box) => !box.IsEmpty && Contains(new(box.MidX, box.MidY));
 
     /// <summary>区域所属相机 ID（缺省主相机；跨相机规则按 (CameraId, ZoneId) 匹配）</summary>
     public string CameraId { get; set; } = "main_camera";
